@@ -43,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "modem-ipc",
  "phone-rules",
+ "sms",
  "wlfw",
 ]
 
@@ -57,6 +58,10 @@ dependencies = [
 
 [[package]]
 name = "phone-rules"
+version = "0.1.0"
+
+[[package]]
+name = "sms"
 version = "0.1.0"
 
 [[package]]

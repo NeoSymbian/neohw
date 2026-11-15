@@ -67,24 +67,8 @@ impl List {
         if !digits.is_empty() && emergency::check(&digits, None).is_some() {
             return None;
         }
-        let rule = |prefix: bool| {
-            self.rules
-                .iter()
-                .filter(|r| r.calls && r.prefix == prefix)
-                .any(|r| {
-                    if prefix {
-                        let p = number::digits(&r.number);
-                        !p.is_empty() && digits.starts_with(&p)
-                    } else {
-                        number::matches(n, &r.number)
-                    }
-                })
-        };
-        if rule(false) {
-            return Some(why::NUMBER);
-        }
-        if rule(true) {
-            return Some(why::PREFIX);
+        if let Some(why) = self.check_rules(n, |r| r.calls) {
+            return Some(why);
         }
         let hidden = digits.is_empty()
             || matches!(pres, presentation::RESTRICTED | presentation::UNAVAILABLE);
@@ -95,6 +79,42 @@ impl List {
             return Some(why::UNKNOWN);
         }
         None
+    }
+
+    /// Why an SMS from `n` (a number or an alphanumeric sender) is blocked: the number and prefix rules marked for
+    /// messages. The private and unknown switches are for calls only: senders like bank codes and operator names
+    /// aren't contacts.
+    pub fn check_message(&self, n: &str) -> Option<u8> {
+        let digits = number::digits(n);
+        if digits.is_empty() || emergency::check(&digits, None).is_some() {
+            return None;
+        }
+        self.check_rules(n, |r| r.messages)
+    }
+
+    /// The number rules, then the prefix rules, of those `kind` picks.
+    fn check_rules(&self, n: &str, kind: impl Fn(&Rule) -> bool) -> Option<u8> {
+        let digits = number::digits(n);
+        let rule = |prefix: bool| {
+            self.rules
+                .iter()
+                .filter(|r| kind(r) && r.prefix == prefix)
+                .any(|r| {
+                    if prefix {
+                        let p = number::digits(&r.number);
+                        !p.is_empty() && digits.starts_with(&p)
+                    } else {
+                        number::matches(n, &r.number)
+                    }
+                })
+        };
+        if rule(false) {
+            Some(why::NUMBER)
+        } else if rule(true) {
+            Some(why::PREFIX)
+        } else {
+            None
+        }
     }
 
     /// Replace the known hashes (sorted, deduplicated, capped at [`MAX_KNOWN`]).
@@ -223,6 +243,24 @@ mod tests {
         assert_eq!(list.check_call("+37455000000", 0), Some(why::UNKNOWN));
         list.private = false;
         assert_eq!(list.check_call("", presentation::RESTRICTED), None);
+    }
+
+    #[test]
+    fn messages_use_only_rules_marked_for_them() {
+        let mut list = List {
+            rules: alloc::vec![rule("+374 28 123456", false), rule("+1 900", true)],
+            private: true,
+            unknown: true,
+            ..List::default()
+        };
+        assert_eq!(list.check_message("+374 28 123456"), Some(why::NUMBER));
+        assert_eq!(list.check_message("+19005550101"), Some(why::PREFIX));
+        // the switches are for calls: an unknown number or an operator name still gets through
+        assert_eq!(list.check_message("+37455000000"), None);
+        assert_eq!(list.check_message("Ucom"), None);
+        list.rules[1].messages = false;
+        assert_eq!(list.check_message("+19005550101"), None);
+        assert_eq!(list.check_call("+19005550101", 0), Some(why::PREFIX));
     }
 
     #[test]

@@ -322,6 +322,9 @@ struct Daemon {
     haptic_error: i32,
     /// a failed ringtone preparation is retried from here (ms)
     ring_retry_at: u64,
+    /// a new message's tone plays until here (ms), its second buzz comes here (0 = none)
+    sms_tone_until: u64,
+    sms_buzz_at: u64,
 }
 
 impl Daemon {
@@ -468,6 +471,21 @@ impl Daemon {
         }
     }
 
+    /// sms.db, when the messages changed (C9); then what waited for it (acknowledgements, deletions in the modem).
+    fn save_sms(&mut self) {
+        let Some(m) = &mut self.modem else { return };
+        if m.sms.dirty {
+            m.sms.dirty = false;
+            if let Err(e) = Self::save_private("sms.db", &m.sms.encode()) {
+                // not acknowledged: the network sends it again
+                dprintln!("[modemd] sms.db not saved ({})", e);
+                m.sms.dirty = true;
+                return;
+            }
+        }
+        m.sms_saved(&mut Hal);
+    }
+
     /// block.db: the blocklist with the known-number hashes (phone_rules::block, "NBL1").
     fn save_block(&self) -> i32 {
         let Some(m) = &self.modem else {
@@ -497,6 +515,7 @@ impl Daemon {
         self.adsp.step();
         self.run();
         self.save_log();
+        self.save_sms();
         match self.phase {
             Phase::Ipa => {
                 match ipa_firmware() {
@@ -935,6 +954,48 @@ impl Daemon {
                 }
             }
         }
+        // a new message (C9): two short buzzes and/or a short tone, never during a call or while it rings
+        if modem.sms.alert {
+            modem.sms.alert = false;
+            let mode = modem.sms.settings.alert;
+            if !talking
+                && !ringing
+                && !modem.status.airplane
+                && mode != modem_ipc::sms::ALERT_SILENT
+            {
+                let r = hal_io(
+                    HAPTIC,
+                    Io {
+                        a: 150,
+                        b: 60,
+                        ..Io::default()
+                    },
+                )
+                .0;
+                if r < 0 {
+                    dprintln!("[modemd] message vibration failed ({})", r);
+                }
+                self.sms_buzz_at = now + 300;
+                if mode == modem_ipc::sms::ALERT_TONE_VIBRATE
+                    && !modem.status.ring.silent
+                    && modem.status.ring.volume > 0
+                {
+                    self.sms_tone_until = now + 800;
+                }
+            }
+        }
+        if self.sms_buzz_at != 0 && now >= self.sms_buzz_at {
+            self.sms_buzz_at = 0;
+            let _ = hal_io(
+                HAPTIC,
+                Io {
+                    a: 150,
+                    b: 60,
+                    ..Io::default()
+                },
+            );
+        }
+        let chime = now < self.sms_tone_until && !talking && !modem.status.airplane;
         // a minute of a *running* modem earns new recovery attempts: run() also runs while a failing modem boots,
         // and counting that time reset the attempts and escalated to stopping the ADSP (froze the phone 2026-11-12)
         if running {
@@ -949,11 +1010,13 @@ impl Daemon {
             self.audio.test = None;
         }
         self.audio.ring = modem.status.ring;
-        let ring_wanted = ringing
+        // the message tone is the start of the ringtone, cut short
+        let ring_wanted = (ringing
             && !talking
             && !modem.status.airplane
             && !modem.status.ring.silent
-            && modem.status.ring.volume > 0;
+            && modem.status.ring.volume > 0)
+            || chime;
         let ring_ready = if ring_wanted
             && self.audio.apr.is() == Mode::Off
             && self.audio.apr.idle()
@@ -1146,6 +1209,10 @@ impl Service for Daemon {
                 | op::BLOCK_GET
                 | op::BLOCK_SET
                 | op::KNOWN_SET
+                | op::SMS_SEND
+                | op::SMS_READ
+                | op::SMS_EDIT
+                | op::SMS_SETTINGS
         ) && !matches!(self.phase, Phase::Running)
             && !(audio_op && matches!(self.adsp, adsp::Adsp::Up))
         {
@@ -1408,6 +1475,67 @@ impl Service for Daemon {
                     }
                 }
             }
+            // SMS (v2.3)
+            op::SMS_SEND => {
+                let read = |i: usize, max: usize| {
+                    msg.des_len(i).and_then(|n| {
+                        if n <= max {
+                            msg.read8_vec(i)
+                        } else {
+                            Err(err::KERR_ARGUMENT)
+                        }
+                    })
+                };
+                match (
+                    &mut self.modem,
+                    read(0, 32),
+                    read(1, modem_ipc::sms::MAX_TEXT),
+                ) {
+                    (None, _, _) => NOT_READY,
+                    (_, Err(e), _) | (_, _, Err(e)) => e,
+                    (Some(m), Ok(to), Ok(text)) => {
+                        match (core::str::from_utf8(&to), core::str::from_utf8(&text)) {
+                            (Ok(to), Ok(text)) => m
+                                .sms_send(&mut Hal, to, text)
+                                .map_or_else(|e| e, |id| id.min(i32::MAX as u32) as i32),
+                            _ => err::KERR_ARGUMENT,
+                        }
+                    }
+                }
+            }
+            op::SMS_READ => match (&self.modem, msg.des_max_len(0)) {
+                (Some(m), Ok(room)) => {
+                    let mut b = vec![0u8; room.min(64 * 1024)];
+                    match m.sms.read(msg.int(1) as u32, msg.int(2), &mut b) {
+                        Ok(n) => msg.write8(0, &b[..n], 0).map_or_else(|e| e, |_| 0),
+                        Err(e) => e,
+                    }
+                }
+                (None, _) => NOT_READY,
+                (_, Err(e)) => e,
+            },
+            op::SMS_EDIT => self.modem.as_mut().map_or(NOT_READY, |m| {
+                m.sms_edit(&mut Hal, msg.int(0), msg.int(1) as u32)
+                    .err()
+                    .unwrap_or(0)
+            }),
+            op::SMS_SETTINGS => match &mut self.modem {
+                None => NOT_READY,
+                Some(m) if msg.int(0) == 0 => msg
+                    .write8(1, &m.sms.settings.to_bytes(), 0)
+                    .map_or_else(|e| e, |_| 0),
+                Some(m) => match msg
+                    .read8_vec(1)
+                    .ok()
+                    .and_then(|b| modem_ipc::SmsSettings::from_bytes(&b))
+                {
+                    Some(s) => {
+                        m.sms_settings(&mut Hal, s);
+                        0
+                    }
+                    None => err::KERR_ARGUMENT,
+                },
+            },
             _ => err::KERR_NOT_SUPPORTED,
         };
         if r == 0 && matches!(msg.function(), op::ANSWER | op::HANGUP) {
@@ -1482,6 +1610,8 @@ fn main() -> i32 {
         audio_seen: None,
         haptic_error: 0,
         ring_retry_at: 0,
+        sms_tone_until: 0,
+        sms_buzz_at: 0,
     };
     // Ordinary C: settings only; modem EFS remains RAM-backed (G4).
     if let Ok(fs) = e32::fs::Fs::connect() {
@@ -1520,6 +1650,28 @@ fn main() -> i32 {
             if let Some(mut log) = modem_proto::calllog::CallLog::decode(&b[..n]) {
                 log.days = m.log.days;
                 m.log = log;
+            }
+        }
+        // the messages (C9): a missing or unreadable sms.db starts empty; what was being sent has failed
+        if let Some(m) = &mut d.modem
+            && let Ok(f) = e32::fs::File::open(
+                &fs,
+                "C:\\private\\e0003001\\sms.db",
+                e32::fs::mode::READ | e32::fs::mode::SHARE_READERS_ONLY,
+            )
+        {
+            let size = f.size().unwrap_or(0).clamp(0, 4 << 20) as usize;
+            let mut b = vec![0u8; size];
+            let n = f.read_at(0, &mut b).unwrap_or(0);
+            match modem_proto::messages::Store::decode(&b[..n]) {
+                Some(mut store) => {
+                    store.restarted();
+                    m.sms = store;
+                }
+                None if n > 0 => {
+                    dprintln!("[modemd] sms.db unreadable ({} bytes): starting empty", n)
+                }
+                None => {}
             }
         }
         // the blocklist (v2.2): a missing or unreadable block.db blocks nothing

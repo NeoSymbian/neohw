@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "sms"
+description = "SMS PDUs (3GPP TS 23.040, 23.038): GSM 7-bit and UCS-2 text, SMS-SUBMIT, SMS-DELIVER, SMS-STATUS-REPORT, part counting"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false

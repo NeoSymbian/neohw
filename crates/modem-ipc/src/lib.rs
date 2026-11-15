@@ -16,6 +16,11 @@
 //!   des8 in arg 0, [`op::BLOCK_SET`] replaces it from arg 0, [`op::KNOWN_SET`] replaces the contact-number hashes
 //!   (u32 LE each, `phone_rules::block::known_key`) from arg 0. A blocked call is rejected as busy before it rings and
 //!   logged as [`log::BLOCKED`] with [`LogEntry::why`].
+//! - SMS (C9, v2.3): MODEMD receives, keeps and sends the messages ([`SmsEntry`], [`sms`]). [`op::SMS_SEND`] queues
+//!   one text to one number; [`op::SMS_READ`] writes the records changed since a revision; [`op::SMS_EDIT`] marks
+//!   read, deletes, retries; [`op::SMS_SETTINGS`] gets or sets [`SmsSettings`]. [`Status::sms_revision`] changes with
+//!   every change, [`Status::sms_unread`] counts the unread ones. Blocked senders' messages are kept as
+//!   [`sms::BLOCKED`] (7 days) and never alert.
 //!
 //! Each op completes with KErrNone or an error: KErrNotReady (-18) without a modem/call to act on, KErrArgument (-6)
 //! for a number it refuses.
@@ -23,7 +28,7 @@
 
 pub const NAME: &str = "NeoModem";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (2, 2, 0);
+pub const VERSION: (i8, i8, i16) = (2, 3, 0);
 
 pub mod op {
     pub const STATUS: i32 = 1;
@@ -61,6 +66,184 @@ pub mod op {
     pub const BLOCK_SET: i32 = 22;
     /// arg0 des8: known-number hashes, u32 LE each.
     pub const KNOWN_SET: i32 = 23;
+    /// arg0 des8: the recipient (digits, an optional leading +); arg1 des8: the text (UTF-8, at most
+    /// [`super::sms::MAX_TEXT`] bytes). Completes with the new message's id (> 0), or KErrArgument (-6) for a number
+    /// or text it can't send (more than 10 parts).
+    pub const SMS_SEND: i32 = 24;
+    /// arg0 writable des8; arg1 the revision the client has (0 = everything); arg2 [`super::sms`] `READ_*`. Writes
+    /// the records changed since that revision, oldest change first, as many as fit (whole [`super::SmsEntry`]s).
+    /// KErrNotFound (-1): deletions since then are forgotten, read again from 0.
+    pub const SMS_READ: i32 = 25;
+    /// arg0 [`super::sms`] `EDIT_*`; arg1 the message id (any message of the thread for the thread edits).
+    pub const SMS_EDIT: i32 = 26;
+    /// arg0 0 = get, 1 = set; arg1 des8 [`super::SmsSettings`] (written on get, read on set).
+    pub const SMS_SETTINGS: i32 = 27;
+}
+
+/// SMS (C9): [`SmsEntry::state`], the [`op::SMS_READ`] modes, the [`op::SMS_EDIT`] actions, [`SmsSettings::alert`].
+pub mod sms {
+    pub const UNREAD: u8 = 1;
+    pub const READ: u8 = 2;
+    pub const SENDING: u8 = 3;
+    pub const SENT: u8 = 4;
+    /// the network's status report said so ([`super::SmsEntry::done_utc`])
+    pub const DELIVERED: u8 = 5;
+    pub const FAILED: u8 = 6;
+    /// from a sender the blocklist matched ([`super::SmsEntry::why`]): kept 7 days, never alerts
+    pub const BLOCKED: u8 = 7;
+    /// deleted: only the id and revision are left, so clients drop their copy
+    pub const DELETED: u8 = 8;
+
+    /// the records changed since arg1
+    pub const READ_CHANGES: i32 = 0;
+    /// only the newest unread message (the shade's line)
+    pub const READ_NEWEST_UNREAD: i32 = 1;
+
+    pub const EDIT_READ: i32 = 1;
+    /// every message with that message's number
+    pub const EDIT_THREAD_READ: i32 = 2;
+    pub const EDIT_DELETE: i32 = 3;
+    pub const EDIT_DELETE_THREAD: i32 = 4;
+    /// send a failed message again
+    pub const EDIT_RETRY: i32 = 5;
+    /// every blocked message (the id is ignored)
+    pub const EDIT_DELETE_BLOCKED: i32 = 6;
+    /// every message read (the id is ignored)
+    pub const EDIT_ALL_READ: i32 = 7;
+
+    pub const ALERT_TONE_VIBRATE: u8 = 0;
+    pub const ALERT_VIBRATE: u8 = 1;
+    pub const ALERT_SILENT: u8 = 2;
+
+    /// the longest text (UTF-8 bytes): 10 parts of 67 UCS-2 units, 4 bytes each at worst
+    pub const MAX_TEXT: usize = 2680;
+    /// a buffer [`super::op::SMS_READ`] always makes progress with
+    pub const READ_ROOM: usize = 16 * 1024;
+}
+
+/// One message as [`op::SMS_READ`] sends it: [`SmsEntry::HEAD`] bytes, the text's length (u16 LE), the text.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct SmsEntry {
+    /// never 0; grows with every message
+    pub id: u32,
+    /// the store revision it last changed at
+    pub rev: u32,
+    /// received (the service centre's time) or written: UTC, Unix milliseconds
+    pub utc: i64,
+    /// sent: when the status report said delivered; 0 otherwise
+    pub done_utc: i64,
+    /// [`sms`] state
+    pub state: u8,
+    /// why a [`sms::BLOCKED`] message was blocked (`phone_rules::block::why`)
+    pub why: u8,
+    /// the SMS it took
+    pub parts: u8,
+    pub unicode: bool,
+    pub incoming: bool,
+    /// the other side: digits with an optional +, or an alphanumeric sender
+    pub number: Text,
+}
+
+impl SmsEntry {
+    pub const HEAD: usize = 4 + 4 + 8 + 8 + 5 + 33;
+
+    /// This entry and `text` into `out`; the bytes written, or `None` if it doesn't fit.
+    pub fn write(&self, text: &str, out: &mut [u8]) -> Option<usize> {
+        let t = &text.as_bytes()[..text.len().min(sms::MAX_TEXT)];
+        let n = Self::HEAD + 2 + t.len();
+        let b = out.get_mut(..n)?;
+        b[..4].copy_from_slice(&self.id.to_le_bytes());
+        b[4..8].copy_from_slice(&self.rev.to_le_bytes());
+        b[8..16].copy_from_slice(&self.utc.to_le_bytes());
+        b[16..24].copy_from_slice(&self.done_utc.to_le_bytes());
+        b[24..29].copy_from_slice(&[
+            self.state,
+            self.why,
+            self.parts,
+            self.unicode as u8,
+            self.incoming as u8,
+        ]);
+        b[29] = self.number.len;
+        b[30..62].copy_from_slice(&self.number.buf);
+        b[62..64].copy_from_slice(&(t.len() as u16).to_le_bytes());
+        b[64..].copy_from_slice(t);
+        Some(n)
+    }
+
+    /// One entry from the front of `b`: it, its text, the bytes it took.
+    pub fn read(b: &[u8]) -> Option<(Self, &str, usize)> {
+        let h = b.get(..Self::HEAD + 2)?;
+        let len = h[29];
+        let mut buf = [0; TEXT];
+        buf.copy_from_slice(&h[30..62]);
+        if usize::from(len) > TEXT || core::str::from_utf8(&buf[..usize::from(len)]).is_err() {
+            return None;
+        }
+        let n = usize::from(u16::from_le_bytes([h[62], h[63]]));
+        let text = core::str::from_utf8(b.get(Self::HEAD + 2..Self::HEAD + 2 + n)?).ok()?;
+        let e = Self {
+            id: u32::from_le_bytes(h[..4].try_into().ok()?),
+            rev: u32::from_le_bytes(h[4..8].try_into().ok()?),
+            utc: i64::from_le_bytes(h[8..16].try_into().ok()?),
+            done_utc: i64::from_le_bytes(h[16..24].try_into().ok()?),
+            state: h[24],
+            why: h[25],
+            parts: h[26],
+            unicode: h[27] != 0,
+            incoming: h[28] != 0,
+            number: Text { len, buf },
+        };
+        Some((e, text, Self::HEAD + 2 + n))
+    }
+}
+
+/// [`op::SMS_SETTINGS`]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SmsSettings {
+    /// ask the network for a status report on each message sent (✓✓)
+    pub reports: bool,
+    /// [`sms`] `ALERT_*`
+    pub alert: u8,
+    /// the message centre, from the SIM (empty while unknown); setting it writes the modem's
+    pub smsc: Text,
+}
+
+impl Default for SmsSettings {
+    fn default() -> Self {
+        Self {
+            reports: true,
+            alert: sms::ALERT_TONE_VIBRATE,
+            smsc: Text::default(),
+        }
+    }
+}
+
+impl SmsSettings {
+    pub const SIZE: usize = 2 + 33;
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0] = self.reports as u8;
+        b[1] = self.alert;
+        b[2] = self.smsc.len;
+        b[3..].copy_from_slice(&self.smsc.buf);
+        b
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        let b = b.get(..Self::SIZE)?;
+        let len = b[2];
+        let mut buf = [0; TEXT];
+        buf.copy_from_slice(&b[3..]);
+        if usize::from(len) > TEXT || core::str::from_utf8(&buf[..usize::from(len)]).is_err() {
+            return None;
+        }
+        Some(Self {
+            reports: b[0] != 0,
+            alert: b[1],
+            smsc: Text { len, buf },
+        })
+    }
 }
 
 /// The largest encoded blocklist (`phone_rules::block`: 100 rules of up to 32 bytes).
@@ -343,14 +526,21 @@ pub struct Status {
     pub log_revision: u32,
     /// Call waiting on the network as far as we know ([`waiting`] states, v2.1).
     pub waiting: u8,
+    /// Changes whenever a message does (v2.3): read the changes with [`op::SMS_READ`].
+    pub sms_revision: u32,
+    /// Unread messages (blocked ones never count), and from how many senders.
+    pub sms_unread: u16,
+    pub sms_senders: u8,
 }
 
 /// v2.1's tail: the calls' presentations, the log revision, call waiting, the selected call's presentation.
 const V21: usize = MAX_CALLS + 4 + 1 + 1;
 const TAIL: usize = 110 + MAX_CALLS * 36;
+/// v2.3's tail: the SMS revision, the unread count and senders.
+const V23: usize = 4 + 2 + 1;
 
 impl Status {
-    pub const SIZE: usize = 110 + MAX_CALLS * 36 + V21;
+    pub const SIZE: usize = 110 + MAX_CALLS * 36 + V21 + V23;
 
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
@@ -403,6 +593,10 @@ impl Status {
         b[at..at + 4].copy_from_slice(&self.log_revision.to_le_bytes());
         b[at + 4] = self.waiting;
         b[at + 5] = self.call.presentation;
+        let at = TAIL + V21;
+        b[at..at + 4].copy_from_slice(&self.sms_revision.to_le_bytes());
+        b[at + 4..at + 6].copy_from_slice(&self.sms_unread.to_le_bytes());
+        b[at + 6] = self.sms_senders;
         b
     }
 
@@ -476,6 +670,9 @@ impl Status {
                 b[TAIL + MAX_CALLS..TAIL + MAX_CALLS + 4].try_into().ok()?,
             ),
             waiting: b[TAIL + MAX_CALLS + 4],
+            sms_revision: u32::from_le_bytes(b[TAIL + V21..TAIL + V21 + 4].try_into().ok()?),
+            sms_unread: u16::from_le_bytes([b[TAIL + V21 + 4], b[TAIL + V21 + 5]]),
+            sms_senders: b[TAIL + V21 + 6],
         })
     }
 }
@@ -538,6 +735,9 @@ mod tests {
             },
             log_revision: 41,
             waiting: waiting::ON,
+            sms_revision: 77,
+            sms_unread: 3,
+            sms_senders: 2,
             ..Default::default()
         };
         s.calls.len = 2;
@@ -563,6 +763,33 @@ mod tests {
         bytes[97] = 2;
         bytes[113] = 33;
         assert!(Status::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn sms_entry_and_settings_round_trip() {
+        let e = SmsEntry {
+            id: 9,
+            rev: 31,
+            utc: 1_794_722_700_000,
+            done_utc: 1_794_722_702_000,
+            state: sms::DELIVERED,
+            why: 0,
+            parts: 2,
+            unicode: true,
+            incoming: false,
+            number: Text::new("+37491234567"),
+        };
+        let mut buf = [0u8; 200];
+        let n = e.write("Բարև", &mut buf).unwrap();
+        assert_eq!(n, SmsEntry::HEAD + 2 + 8);
+        assert_eq!(SmsEntry::read(&buf[..n]), Some((e, "Բարև", n)));
+        assert_eq!(SmsEntry::read(&buf[..n - 1]), None);
+        assert_eq!(e.write("Բարև", &mut buf[..n - 1]), None);
+        let s = SmsSettings {
+            smsc: Text::new("+37495980150"),
+            ..SmsSettings::default()
+        };
+        assert_eq!(SmsSettings::from_bytes(&s.to_bytes()), Some(s));
     }
 
     #[test]

@@ -8,11 +8,13 @@
 extern crate alloc;
 
 pub use phone_rules;
+pub use sms;
 
 pub mod apr;
 pub mod calllog;
 pub mod ipa;
 pub mod locator;
+pub mod messages;
 pub mod nas;
 pub mod qmi;
 pub mod qrtr;
@@ -23,6 +25,7 @@ pub mod ssctl;
 pub mod tftp;
 pub mod uim;
 pub mod voice;
+pub mod wms;
 /// the Wi-Fi firmware's control service client (NeoSymbian/neolink `wlfw`)
 pub use wlfw;
 
@@ -98,14 +101,18 @@ const UIM: u32 = 11;
 const NAS: u32 = nas::SERVICE;
 const VOICE: u32 = voice::SERVICE;
 const IPA: u32 = ipa::SERVICE;
+const WMS: u32 = wms::SERVICE;
 /// Our QMI clients: (service, our port)
-const CLIENTS: [(u32, u32); 5] = [
+const CLIENTS: [(u32, u32); 6] = [
     (DMS, 0x20),
     (UIM, 0x21),
     (NAS, 0x22),
     (VOICE, 0x23),
     (IPA, 0x24),
+    (WMS, 0x27),
 ];
+/// A part with the modem this long without an answer has failed.
+const SMS_SEND_MS: u64 = 60_000;
 const DMS_GET_REVISION: u16 = 0x23;
 const DMS_GET_IDS: u16 = 0x25;
 const DMS_SET_OPERATING_MODE: u16 = 0x2e;
@@ -208,8 +215,28 @@ pub struct Modem {
     rejecting: Option<u8>,
     /// Incoming calls rejected before they ring (modem_ipc::op::BLOCK_SET, KNOWN_SET); MODEMD keeps it in block.db.
     pub block: phone_rules::block::List,
+    /// The messages (C9); MODEMD saves them when `sms.dirty`, then calls [`Modem::sms_saved`].
+    pub sms: messages::Store,
+    /// what waits until the store is saved: acknowledgements, deletions from the modem's storage
+    sms_after_save: Vec<AfterSave>,
+    /// messages to send: (id, TPDUs, the next part); one part is with the modem at a time
+    sms_out: Vec<(u32, Vec<Vec<u8>>, usize)>,
+    /// that part: (id, txn, last part, since)
+    sms_in_flight: Option<(u32, u16, bool, u64)>,
+    /// Raw Read requests (txn, storage, index) and List Messages requests (txn, storage)
+    sms_reads: Vec<(u16, u8, u32)>,
+    sms_lists: Vec<(u16, u8)>,
     response_seen: bool,
     heartbeat_at: u64,
+}
+
+/// What waits until the messages are saved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterSave {
+    /// acknowledge a transfer-route message (its transaction)
+    Ack(u32),
+    /// delete a message the modem stored (storage, index)
+    Delete(u8, u32),
 }
 
 /// (type, our port, destination, payload)
@@ -309,6 +336,12 @@ impl Modem {
             waiting_request: 0,
             rejecting: None,
             block: phone_rules::block::List::default(),
+            sms: messages::Store::default(),
+            sms_after_save: Vec::new(),
+            sms_out: Vec::new(),
+            sms_in_flight: None,
+            sms_reads: Vec::new(),
+            sms_lists: Vec::new(),
             response_seen: false,
             heartbeat_at: 0,
             ipa_up: false,
@@ -505,6 +538,30 @@ impl Modem {
             }
             VOICE => {
                 self.request_must(p, VOICE, voice::INDICATION_REGISTER, &voice::INDICATIONS);
+            }
+            WMS => {
+                self.request_must(p, WMS, wms::SET_EVENT_REPORT, &wms::EVENT_REPORT);
+                self.request_must(
+                    p,
+                    WMS,
+                    wms::SET_ROUTES,
+                    &[(0x01, &wms::routes()), (0x10, &[1])],
+                );
+                self.request(p, WMS, wms::GET_SMSC, &[]);
+                // what the modem kept while nobody listened: read it, save it, then delete it there
+                for storage in [wms::STORAGE_UIM, wms::STORAGE_NV] {
+                    for tag in [wms::TAG_MT_NOT_READ, wms::TAG_MT_READ] {
+                        if let Some(txn) = self.wms_request(
+                            p,
+                            wms::LIST_MESSAGES,
+                            &[(0x01, &[storage]), (0x11, &[tag]), (0x12, &wms::MODE)],
+                        ) {
+                            self.sms_lists.push((txn, storage));
+                        }
+                    }
+                }
+                self.sms_in_flight = None;
+                self.send_next_sms(p);
             }
             _ if self.ipa_up => {
                 // the modem's IPA server (0x31 instance 2): where IPA's tables are. It must arrive: without it the
@@ -760,6 +817,174 @@ impl Modem {
         }
     }
 
+    /// A WMS request; its transaction once sent.
+    fn wms_request(&mut self, p: &mut dyn Platform, id: u16, tlvs: &[(u8, &[u8])]) -> Option<u16> {
+        self.request(p, WMS, id, tlvs).then(|| {
+            self.clients
+                .iter()
+                .find(|c| c.service == WMS)
+                .map_or(0, |c| c.txn)
+        })
+    }
+
+    fn read_stored(&mut self, p: &mut dyn Platform, storage: u8, index: u32) {
+        if let Some(txn) = self.wms_request(
+            p,
+            wms::RAW_READ,
+            &[(0x01, &wms::location(storage, index)), (0x10, &wms::MODE)],
+        ) {
+            self.sms_reads.push((txn, storage, index));
+        }
+    }
+
+    /// An incoming TPDU: a message (blocked or not) or a status report.
+    fn sms_incoming(&mut self, p: &mut dyn Platform, tpdu: &[u8]) {
+        let utc = p.utc_ms();
+        match sms::parse(tpdu) {
+            Some(sms::Tpdu::Deliver(d)) => {
+                let why = self.block.check_message(&d.from);
+                let part = d.concat.map(|c| (c.seq, c.total));
+                match self.sms.receive(d, why, utc) {
+                    Some(id) => p.log(format_args!(
+                        "wms: message {id} received{}",
+                        if why.is_some() { " (blocked)" } else { "" }
+                    )),
+                    None => p.log(format_args!("wms: part {:?} received", part)),
+                }
+            }
+            Some(sms::Tpdu::Status(r)) => {
+                p.log(format_args!(
+                    "wms: status report {:#x} for reference {}",
+                    r.status, r.mr
+                ));
+                self.sms.report(&r, utc);
+            }
+            None => p.log(format_args!(
+                "wms: a TPDU of {} bytes didn't parse",
+                tpdu.len()
+            )),
+        }
+        self.sms_status();
+    }
+
+    /// Status.sms_* from the store.
+    fn sms_status(&mut self) {
+        self.status.sms_revision = self.sms.rev;
+        (self.status.sms_unread, self.status.sms_senders) = self.sms.unread();
+    }
+
+    /// The next part to the modem, if none is with it.
+    fn send_next_sms(&mut self, p: &mut dyn Platform) {
+        if self.sms_in_flight.is_some() {
+            return;
+        }
+        let Some((id, pdus, next)) = self.sms_out.first() else {
+            return;
+        };
+        let (id, last) = (*id, *next + 1 == pdus.len());
+        let raw = wms::raw_send(&pdus[*next]);
+        if let Some(txn) = self.wms_request(p, wms::RAW_SEND, &[(0x01, &raw)]) {
+            self.sms_in_flight = Some((id, txn, last, self.now));
+        }
+    }
+
+    fn sms_sent(&mut self, p: &mut dyn Platform, m: &qmi::Msg) {
+        let Some((id, txn, last, _)) = self.sms_in_flight else {
+            return;
+        };
+        if txn != m.txn {
+            return;
+        }
+        self.sms_in_flight = None;
+        self.sms.sent(id, wms::sent_reference(m).unwrap_or(0), last);
+        if let Some(front) = self.sms_out.first_mut() {
+            front.2 += 1;
+            if front.2 >= front.1.len() {
+                self.sms_out.remove(0);
+            }
+        }
+        if last {
+            p.log(format_args!("wms: message {id} sent"));
+        }
+        self.sms_status();
+        self.send_next_sms(p);
+    }
+
+    fn sms_send_failed(&mut self, p: &mut dyn Platform, id: u32) {
+        p.log(format_args!("wms: message {id} not sent"));
+        self.sms_in_flight = None;
+        self.sms_out.retain(|o| o.0 != id);
+        self.sms.failed(id);
+        self.sms_status();
+        self.send_next_sms(p);
+    }
+
+    /// modem_ipc::op::SMS_SEND: the new message's id. It waits in the queue while the modem isn't up.
+    pub fn sms_send(&mut self, p: &mut dyn Platform, to: &str, text: &str) -> Result<u32, i32> {
+        if text.len() > modem_ipc::sms::MAX_TEXT {
+            return Err(KERR_ARGUMENT);
+        }
+        let utc = p.utc_ms();
+        let (id, pdus) = self.sms.send(to, text, utc).map_err(|_| KERR_ARGUMENT)?;
+        self.sms_out.push((id, pdus, 0));
+        self.sms_status();
+        self.send_next_sms(p);
+        Ok(id)
+    }
+
+    /// modem_ipc::op::SMS_EDIT.
+    pub fn sms_edit(&mut self, p: &mut dyn Platform, action: i32, id: u32) -> Result<(), i32> {
+        if action == modem_ipc::sms::EDIT_RETRY {
+            let pdus = self.sms.retry(id).ok_or(KERR_NOT_READY)?;
+            self.sms_out.push((id, pdus, 0));
+            self.send_next_sms(p);
+        } else if !self.sms.edit(action, id) {
+            return Err(KERR_NOT_READY);
+        }
+        self.sms_status();
+        Ok(())
+    }
+
+    /// modem_ipc::op::SMS_SETTINGS set: a new message centre goes to the modem.
+    pub fn sms_settings(&mut self, p: &mut dyn Platform, s: modem_ipc::SmsSettings) {
+        let smsc = s.smsc.as_str();
+        if !smsc.is_empty() && smsc != self.sms.settings.smsc.as_str() {
+            let (digits, toa) = wms::set_smsc(smsc);
+            let mut addr = alloc::vec![digits.len() as u8];
+            addr.extend_from_slice(&digits);
+            let mut ty = alloc::vec![toa.len() as u8];
+            ty.extend_from_slice(toa);
+            self.request(p, WMS, wms::SET_SMSC, &[(0x01, &addr), (0x10, &ty)]);
+        }
+        self.sms.settings.reports = s.reports;
+        self.sms.settings.alert = s.alert;
+        self.sms.dirty = true;
+    }
+
+    /// MODEMD saved the messages (or had nothing to save): now acknowledge them to the network and delete what the
+    /// modem had stored.
+    pub fn sms_saved(&mut self, p: &mut dyn Platform) {
+        for a in core::mem::take(&mut self.sms_after_save) {
+            match a {
+                AfterSave::Ack(txn) => {
+                    self.request_must(p, WMS, wms::SEND_ACK, &[(0x01, &wms::ack(txn))]);
+                }
+                AfterSave::Delete(storage, index) => {
+                    self.request(
+                        p,
+                        WMS,
+                        wms::DELETE,
+                        &[
+                            (0x01, &[storage]),
+                            (0x10, &index.to_le_bytes()),
+                            (0x12, &wms::MODE),
+                        ],
+                    );
+                }
+            }
+        }
+    }
+
     pub fn manage(&mut self, p: &mut dyn Platform, action: i32, id: u8) -> Result<(), i32> {
         use modem_ipc::manage;
         let c = self.target(id).ok_or(KERR_NOT_READY)?;
@@ -862,7 +1087,14 @@ impl Modem {
         // the modem's calls are gone with it: log them as ended now
         self.log.observe(&[], self.now, 0);
         let (log, clir) = (core::mem::take(&mut self.log), self.clir);
+        // the messages and the queue stay; the part with the old modem goes again (acks for it are moot)
+        let (sms, sms_out) = (
+            core::mem::take(&mut self.sms),
+            core::mem::take(&mut self.sms_out),
+        );
         *self = Self::with_rmtfs(rmtfs);
+        self.sms = sms;
+        self.sms_out = sms_out;
         self.log = log;
         self.clir = clir;
         self.trace = trace;
@@ -877,6 +1109,7 @@ impl Modem {
         self.status.ring = old.ring;
         self.status.missed = old.missed;
         self.status.log_revision = old.log_revision.wrapping_add(1);
+        self.sms_status();
         self.status.generation = old.generation.wrapping_add(1);
         self.status.revision = old.revision;
         self.servers = retained;
@@ -932,6 +1165,16 @@ impl Modem {
             self.flush(p);
         }
         self.call_watch(p, now_ms);
+        if let Some((id, _, _, since)) = self.sms_in_flight
+            && now_ms.saturating_sub(since) >= SMS_SEND_MS
+        {
+            p.log(format_args!("wms: message {id} got no answer"));
+            self.sms_send_failed(p, id);
+        }
+        let utc = p.utc_ms();
+        if self.sms.expire(utc) {
+            self.sms_status();
+        }
         if self.ipa_init_due && now_ms.saturating_sub(self.ipa_init_at) >= 2000 {
             self.ipa_init_at = now_ms; // every 2 s until it goes out (a refused send takes up to 2 s)
             self.ipa_init_due = !self.init_driver(p);
@@ -1516,6 +1759,16 @@ impl Modem {
                 p.log(format_args!("voice: busy reject refused; ending call {id}"));
                 self.request(p, VOICE, voice::END, &[(1, &[id])]);
             }
+            if (service, m.id) == (WMS, wms::RAW_SEND)
+                && let Some((id, txn, _, _)) = self.sms_in_flight
+                && txn == m.txn
+            {
+                self.sms_send_failed(p, id);
+            }
+            if service == WMS {
+                self.sms_reads.retain(|r| r.0 != m.txn);
+                self.sms_lists.retain(|r| r.0 != m.txn);
+            }
             return;
         };
         match (service, m.id) {
@@ -1555,6 +1808,34 @@ impl Modem {
                 self.ipa_complete(p);
             }
             (VOICE, voice::MANAGE_CALLS) => self.rejecting = None,
+            (WMS, wms::RAW_SEND) => self.sms_sent(p, m),
+            (WMS, wms::LIST_MESSAGES) => {
+                let Some(k) = self.sms_lists.iter().position(|r| r.0 == m.txn) else {
+                    return;
+                };
+                let (_, storage) = self.sms_lists.remove(k);
+                for index in wms::listed(m) {
+                    self.read_stored(p, storage, index);
+                }
+            }
+            (WMS, wms::RAW_READ) => {
+                let Some(k) = self.sms_reads.iter().position(|r| r.0 == m.txn) else {
+                    return;
+                };
+                let (_, storage, index) = self.sms_reads.remove(k);
+                if let Some(raw) = wms::read_raw(m) {
+                    self.sms_incoming(p, &raw);
+                }
+                self.sms_after_save.push(AfterSave::Delete(storage, index));
+            }
+            (WMS, wms::GET_SMSC) => {
+                if let Some(n) = wms::smsc(m) {
+                    self.sms.settings.smsc = Text::new(&n);
+                }
+            }
+            (WMS, wms::SET_SMSC) => {
+                self.request(p, WMS, wms::GET_SMSC, &[]);
+            }
             (VOICE, voice::GET_CALL_WAITING) => {
                 let on = m.u8(0x10).is_some_and(|c| c & voice::CLASS_VOICE != 0);
                 self.status.waiting = if on {
@@ -1587,6 +1868,23 @@ impl Modem {
             (NAS, nas::SIGNAL_INFO_IND) => self.signal(m),
             (NAS, nas::NETWORK_TIME_IND) => self.network_time(p, m),
             (UIM, uim::STATUS_IND) => self.card_status(p, m),
+            (WMS, wms::EVENT_REPORT_IND) => match wms::event(m) {
+                Some(wms::Event::Transfer { ack, txn, tpdu }) => {
+                    if !tpdu.is_empty() {
+                        self.sms_incoming(p, &tpdu);
+                    }
+                    if ack {
+                        self.sms_after_save.push(AfterSave::Ack(txn));
+                    }
+                }
+                Some(wms::Event::Stored { storage, index }) => self.read_stored(p, storage, index),
+                None => {}
+            },
+            (WMS, wms::SMSC_IND) => {
+                if let Some(n) = wms::smsc(m) {
+                    self.sms.settings.smsc = Text::new(&n);
+                }
+            }
             (VOICE, voice::ALL_CALL_STATUS_IND) => {
                 let Some(calls) = voice::all_calls(m) else {
                     return;
@@ -3311,5 +3609,174 @@ mod tests {
         assert!(!m.radio_failed);
         m.handle(&mut f, &ns(VOICE, 77));
         assert!(m.servers.iter().any(|s| s.node == MODEM_NODE));
+    }
+
+    // C9: SMS over QMI WMS
+    /// SMS-DELIVER "Hi" from +37491234567.
+    fn deliver_hi(from_digits: &[u8], toa: u8, ndigits: u8) -> Vec<u8> {
+        let mut p = alloc::vec![0x04, ndigits, toa];
+        p.extend_from_slice(from_digits);
+        p.extend_from_slice(&[
+            0x00, 0x00, 0x62, 0x11, 0x51, 0x01, 0x50, 0x00, 0x61, 2, 0xC8, 0x34,
+        ]);
+        p
+    }
+
+    fn transfer(txn: u32, tpdu: &[u8]) -> Vec<u8> {
+        let mut t = alloc::vec![0];
+        t.extend_from_slice(&txn.to_le_bytes());
+        t.push(6);
+        t.extend_from_slice(&(tpdu.len() as u16).to_le_bytes());
+        t.extend_from_slice(tpdu);
+        from_modem(
+            qrtr::TYPE_DATA,
+            88,
+            0x27,
+            &qmi::Builder::new(qmi::INDICATION, 9, wms::EVENT_REPORT_IND)
+                .tlv(0x11, &t)
+                .finish(),
+        )
+    }
+
+    const HI_FROM: [u8; 6] = [0x73, 0x94, 0x21, 0x43, 0x65, 0xF7];
+
+    #[test]
+    fn wms_comes_up_and_drains_storage() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(WMS, 88));
+        let ids: Vec<u16> = f.sent.iter().map(|p| req(p).2).collect();
+        assert_eq!(
+            ids,
+            [
+                wms::SET_EVENT_REPORT,
+                wms::SET_ROUTES,
+                wms::GET_SMSC,
+                wms::LIST_MESSAGES,
+                wms::LIST_MESSAGES,
+                wms::LIST_MESSAGES,
+                wms::LIST_MESSAGES
+            ]
+        );
+        // the first list (UIM, not read) has index 3: it is read, saved, then deleted
+        let (_, _, _, txn) = req(&f.sent[3]);
+        let list = ok(txn, wms::LIST_MESSAGES)
+            .tlv(1, &[1, 0, 0, 0, 3, 0, 0, 0, 1])
+            .finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 88, 0x27, &list));
+        let (_, _, id, txn) = req(f.sent.last().unwrap());
+        assert_eq!(
+            (id, sent_tlv(&f, 1)),
+            (wms::RAW_READ, alloc::vec![0, 3, 0, 0, 0])
+        );
+        let tpdu = deliver_hi(&HI_FROM, 0x91, 11);
+        let mut raw = alloc::vec![1, 6];
+        raw.extend_from_slice(&(tpdu.len() as u16 + 1).to_le_bytes());
+        raw.push(0); // stored messages may carry the SMSC address
+        raw.extend_from_slice(&tpdu);
+        let read = ok(txn, wms::RAW_READ).tlv(1, &raw).finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 88, 0x27, &read));
+        assert_eq!(m.status.sms_unread, 1);
+        assert_ne!(
+            req(f.sent.last().unwrap()).2,
+            wms::DELETE,
+            "not before the store is saved"
+        );
+        m.sms_saved(&mut f);
+        assert_eq!(req(f.sent.last().unwrap()).2, wms::DELETE);
+    }
+
+    #[test]
+    fn incoming_message_is_acked_only_after_saving() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(WMS, 88));
+        let before = m.status.sms_revision;
+        m.handle(&mut f, &transfer(5, &deliver_hi(&HI_FROM, 0x91, 11)));
+        assert!(m.sms.dirty && m.sms.alert);
+        assert_ne!(m.status.sms_revision, before);
+        assert_eq!((m.status.sms_unread, m.status.sms_senders), (1, 1));
+        let msg = m.sms.messages.last().unwrap();
+        assert_eq!(
+            (msg.entry.number.as_str(), msg.text.as_str()),
+            ("+37491234567", "Hi")
+        );
+        assert_ne!(req(f.sent.last().unwrap()).2, wms::SEND_ACK);
+        m.sms_saved(&mut f);
+        assert_eq!(req(f.sent.last().unwrap()).2, wms::SEND_ACK);
+        assert_eq!(sent_tlv(&f, 1), wms::ack(5));
+    }
+
+    #[test]
+    fn blocked_sender_is_kept_without_alert() {
+        use phone_rules::block::Rule;
+        let (mut m, mut f) = (modem(), fake());
+        m.block.rules.push(Rule {
+            prefix: true,
+            calls: false,
+            messages: true,
+            number: String::from("+374 91"),
+        });
+        m.handle(&mut f, &ns(WMS, 88));
+        m.handle(&mut f, &transfer(6, &deliver_hi(&HI_FROM, 0x91, 11)));
+        assert!(!m.sms.alert);
+        assert_eq!(m.status.sms_unread, 0);
+        assert_eq!(m.sms.messages[0].entry.state, modem_ipc::sms::BLOCKED);
+        m.sms_saved(&mut f);
+        assert_eq!(
+            req(f.sent.last().unwrap()).2,
+            wms::SEND_ACK,
+            "the network still gets its ack"
+        );
+    }
+
+    #[test]
+    fn send_then_delivery_report() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(WMS, 88));
+        let id = m.sms_send(&mut f, "+37491234567", "Hi").unwrap();
+        let (_, _, msg, txn) = req(f.sent.last().unwrap());
+        assert_eq!(msg, wms::RAW_SEND);
+        let raw = sent_tlv(&f, 1);
+        assert_eq!(
+            &raw[..4],
+            &[6, raw.len() as u8 - 3, 0, 0],
+            "format, length, empty SMSC"
+        );
+        assert_eq!(raw[4] & 0x23, 0x21, "SMS-SUBMIT asking for a report");
+        let sent = ok(txn, wms::RAW_SEND).tlv(1, &[42, 0]).finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 88, 0x27, &sent));
+        assert_eq!(m.sms.messages[0].entry.state, modem_ipc::sms::SENT);
+        // SMS-STATUS-REPORT for reference 42: delivered
+        let mut r = alloc::vec![0x06, 42, 11, 0x91];
+        r.extend_from_slice(&HI_FROM);
+        r.extend_from_slice(&[0x62, 0x11, 0x51, 0x01, 0x50, 0x00, 0x61]);
+        r.extend_from_slice(&[0x62, 0x11, 0x51, 0x01, 0x50, 0x20, 0x61]);
+        r.push(0);
+        m.handle(&mut f, &transfer(7, &r));
+        let e = m.sms.messages[0].entry;
+        assert_eq!((e.id, e.state), (id, modem_ipc::sms::DELIVERED));
+        assert_eq!(m.status.sms_unread, 0);
+    }
+
+    #[test]
+    fn a_refused_send_fails_and_can_be_retried() {
+        let (mut m, mut f) = (modem(), fake());
+        assert_eq!(m.sms_send(&mut f, "+1 555 abc", "x"), Err(KERR_ARGUMENT));
+        // queued while WMS isn't up, sent once it is
+        let id = m.sms_send(&mut f, "+37491234567", "x").unwrap();
+        assert!(f.sent.is_empty());
+        m.handle(&mut f, &ns(WMS, 88));
+        let (_, _, msg, txn) = req(f.sent.last().unwrap());
+        assert_eq!(msg, wms::RAW_SEND);
+        let refused = qmi::Builder::new(qmi::RESPONSE, txn, wms::RAW_SEND)
+            .result(0x30)
+            .finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 88, 0x27, &refused));
+        assert_eq!(m.sms.messages[0].entry.state, modem_ipc::sms::FAILED);
+        m.sms_edit(&mut f, modem_ipc::sms::EDIT_RETRY, id).unwrap();
+        assert_eq!(req(f.sent.last().unwrap()).2, wms::RAW_SEND);
+        assert_eq!(m.sms.messages[0].entry.state, modem_ipc::sms::SENDING);
+        // no answer for a minute: failed again
+        m.tick(&mut f, 61_000);
+        assert_eq!(m.sms.messages[0].entry.state, modem_ipc::sms::FAILED);
     }
 }
