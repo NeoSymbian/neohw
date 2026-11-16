@@ -226,6 +226,9 @@ pub struct Modem {
     /// Raw Read requests (txn, storage, index) and List Messages requests (txn, storage)
     sms_reads: Vec<(u16, u8, u32)>,
     sms_lists: Vec<(u16, u8)>,
+    /// the SMSC was read (and storage listed) once the SIM's subscription was ready; until then `tick` asks again
+    sms_ready: bool,
+    sms_retry_at: u64,
     response_seen: bool,
     heartbeat_at: u64,
 }
@@ -342,6 +345,8 @@ impl Modem {
             sms_in_flight: None,
             sms_reads: Vec::new(),
             sms_lists: Vec::new(),
+            sms_ready: false,
+            sms_retry_at: 0,
             response_seen: false,
             heartbeat_at: 0,
             ipa_up: false,
@@ -547,19 +552,7 @@ impl Modem {
                     wms::SET_ROUTES,
                     &[(0x01, &wms::routes()), (0x10, &[1])],
                 );
-                self.request(p, WMS, wms::GET_SMSC, &[]);
-                // what the modem kept while nobody listened: read it, save it, then delete it there
-                for storage in [wms::STORAGE_UIM, wms::STORAGE_NV] {
-                    for tag in [wms::TAG_MT_NOT_READ, wms::TAG_MT_READ] {
-                        if let Some(txn) = self.wms_request(
-                            p,
-                            wms::LIST_MESSAGES,
-                            &[(0x01, &[storage]), (0x11, &[tag]), (0x12, &wms::MODE)],
-                        ) {
-                            self.sms_lists.push((txn, storage));
-                        }
-                    }
-                }
+                self.sms_start_reads(p);
                 self.sms_in_flight = None;
                 self.send_next_sms(p);
             }
@@ -813,6 +806,24 @@ impl Modem {
                 self.rejecting = Some(c.id);
             } else {
                 self.request(p, VOICE, voice::END, &[(1, &[c.id])]);
+            }
+        }
+    }
+
+    /// The SMSC, and what the modem kept while nobody listened (read it, save it, then delete it there). Before the
+    /// SIM's subscription is ready they fail (52 not provisioned, 47; phone 2026-11-16): `tick` asks again.
+    fn sms_start_reads(&mut self, p: &mut dyn Platform) {
+        self.sms_retry_at = self.now.saturating_add(10_000);
+        self.request(p, WMS, wms::GET_SMSC, &[]);
+        for storage in [wms::STORAGE_UIM, wms::STORAGE_NV] {
+            for tag in [wms::TAG_MT_NOT_READ, wms::TAG_MT_READ] {
+                if let Some(txn) = self.wms_request(
+                    p,
+                    wms::LIST_MESSAGES,
+                    &[(0x01, &[storage]), (0x11, &[tag]), (0x12, &wms::MODE)],
+                ) {
+                    self.sms_lists.push((txn, storage));
+                }
             }
         }
     }
@@ -1170,6 +1181,17 @@ impl Modem {
         {
             p.log(format_args!("wms: message {id} got no answer"));
             self.sms_send_failed(p, id);
+        }
+        let registered = matches!(
+            self.status.reg,
+            modem_ipc::reg::HOME | modem_ipc::reg::ROAMING
+        );
+        if !self.sms_ready
+            && registered
+            && now_ms >= self.sms_retry_at
+            && self.clients.iter().any(|c| c.service == WMS)
+        {
+            self.sms_start_reads(p);
         }
         let utc = p.utc_ms();
         if self.sms.expire(utc) {
@@ -1829,6 +1851,7 @@ impl Modem {
                 self.sms_after_save.push(AfterSave::Delete(storage, index));
             }
             (WMS, wms::GET_SMSC) => {
+                self.sms_ready = true;
                 if let Some(n) = wms::smsc(m) {
                     self.sms.settings.smsc = Text::new(&n);
                 }
@@ -3683,6 +3706,42 @@ mod tests {
         );
         m.sms_saved(&mut f);
         assert_eq!(req(f.sent.last().unwrap()).2, wms::DELETE);
+    }
+
+    #[test]
+    fn smsc_and_storage_asked_again_once_registered() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(WMS, 88));
+        let (_, _, _, txn) = req(&f.sent[2]);
+        let refused = qmi::Builder::new(qmi::RESPONSE, txn, wms::GET_SMSC)
+            .result(52)
+            .finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 88, 0x27, &refused));
+        let n = f.sent.len();
+        m.tick(&mut f, 20_000);
+        assert!(
+            f.sent[n..].iter().all(|p| req(p).2 != wms::GET_SMSC),
+            "not before registration"
+        );
+        m.status.reg = modem_ipc::reg::HOME;
+        m.tick(&mut f, 21_000);
+        let at = n + f.sent[n..]
+            .iter()
+            .position(|p| req(p).2 == wms::GET_SMSC)
+            .expect("asked again");
+        let (_, _, _, txn) = req(&f.sent[at]);
+        let mut t = b"145".to_vec();
+        t.push(4);
+        t.extend_from_slice(b"+374");
+        let answer = ok(txn, wms::GET_SMSC).tlv(1, &t).finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 88, 0x27, &answer));
+        assert_eq!(m.sms.settings.smsc.as_str(), "+374");
+        let n = f.sent.len();
+        m.tick(&mut f, 60_000);
+        assert!(
+            f.sent[n..].iter().all(|p| req(p).2 != wms::GET_SMSC),
+            "not again once it worked"
+        );
     }
 
     #[test]
