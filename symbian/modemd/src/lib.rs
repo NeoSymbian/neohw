@@ -335,6 +335,9 @@ struct Daemon {
     sound: sound::Sound,
     /// the last amp protection poll (ms)
     amps_checked: u64,
+    /// the last jack poll (ms), and whether the codecs were probed for it
+    jack_checked: u64,
+    jack_probed: bool,
 }
 
 impl Daemon {
@@ -791,7 +794,7 @@ impl Daemon {
                 let r = adsp::audio(6, self.sound.mic as u32);
                 dprintln!("[modemd] media: mic DMIC{} -> {}", self.sound.mic + 1, r);
             }
-            if playing {
+            if playing && !a.apr.jack_is() {
                 let r = adsp::audio(3, a.media_route);
                 let v = adsp::audio(4, u32::from(a.media_volume));
                 dprintln!(
@@ -800,6 +803,25 @@ impl Daemon {
                     a.media_volume,
                     r,
                     v
+                );
+            }
+        }
+        // the 3.5 mm jack (A8): the kernel debounces the PM660L's detection; media follows the headphones
+        if up && now >= self.jack_checked + 250 {
+            self.jack_checked = now;
+            if !self.jack_probed {
+                self.jack_probed = true;
+                let r = adsp::audio(0, 0);
+                dprintln!("[modemd] audio: codecs probed for the jack -> {}", r);
+            }
+            let j = adsp::audio(8, 0);
+            if j >= 0 && (j & 1 != 0) != a.apr.jack {
+                a.apr.jack = j & 1 != 0;
+                dprintln!(
+                    "[modemd] audio: headphones {} ({:#x}: {})",
+                    if a.apr.jack { "in" } else { "out" },
+                    j,
+                    if j & 2 != 0 { "headset mic" } else { "no mic" }
                 );
             }
         }
@@ -1736,6 +1758,8 @@ fn main() -> i32 {
         sms_buzz_at: 0,
         sound: sound::Sound::new(),
         amps_checked: 0,
+        jack_checked: 0,
+        jack_probed: false,
     };
     // Ordinary C: settings only; modem EFS remains RAM-backed (G4).
     if let Ok(fs) = e32::fs::Fs::connect() {

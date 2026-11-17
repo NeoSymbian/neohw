@@ -324,6 +324,8 @@ pub struct CallAudio {
     pub media_volume: u8,
     /// recording reads logged so far (the first few, for bring-up)
     rec_logged: u32,
+    /// the kernel's headphone path (op 9) is on: it goes off before the codecs (the ADSP's MCLK feeds it)
+    jack_on: bool,
 }
 
 impl CallAudio {
@@ -339,6 +341,7 @@ impl CallAudio {
             media_route: 1,
             media_volume: 7,
             rec_logged: 0,
+            jack_on: false,
         }
     }
 
@@ -362,8 +365,22 @@ impl CallAudio {
         use modem_proto::apr::{self, MEDIA_PERIOD};
         let mut pcm = [0i16; MEDIA_PERIOD / 2];
         let mut bytes = [0u8; MEDIA_PERIOD];
+        // on headphones the amps' volume does nothing: the media volume scales the PCM (the amps' -30..0 dB in 3 dB
+        // steps, Q15)
+        const GAIN: [i32; 11] = [
+            1036, 1464, 2068, 2920, 4125, 5827, 8231, 11627, 16423, 23198, 32767,
+        ];
+        let gain = self
+            .apr
+            .jack_is()
+            .then(|| GAIN[usize::from(self.media_volume.min(10))]);
         while let Some(slot) = self.apr.media_slot() {
             fill(&mut pcm);
+            if let Some(g) = gain {
+                for s in pcm.iter_mut() {
+                    *s = ((i32::from(*s) * g) >> 15) as i16;
+                }
+            }
             for (b, s) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(pcm) {
                 *b = s.to_le_bytes();
             }
@@ -496,10 +513,20 @@ impl CallAudio {
                             r
                         } else if mute < 0 {
                             mute
+                        } else if self.apr.jack_is() {
+                            // headphones: the mic on, both amps off (route 3), then the jack's path (op 9)
+                            let r = audio(1, 3);
+                            let j = audio(9, 1);
+                            self.jack_on = j >= 0;
+                            if r < 0 { r } else { j }
                         } else {
                             audio(1, self.route())
                         }
                     } else {
+                        if core::mem::take(&mut self.jack_on) {
+                            let j = audio(9, 0);
+                            dprintln!("[modemd] audio: headphones off -> {}", j);
+                        }
                         audio(2, 0)
                     };
                     dprintln!(
@@ -604,6 +631,7 @@ impl CallAudio {
         match self.apr.is() {
             Mode::Test => self.test.unwrap_or(true) as u32,
             Mode::Ring => 1,
+            Mode::Media | Mode::Duplex if self.apr.jack_is() => 3,
             Mode::Media | Mode::Duplex => self.media_route,
             _ => self.speaker as u32,
         }

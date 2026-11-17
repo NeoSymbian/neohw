@@ -148,6 +148,13 @@ const DESTROY_SESSION: u32 = 0x0001_003c;
 /// The ports: PRIMARY_TDM_TX_0 (the mic, RT5514) and SECONDARY_TDM_RX_0 (the amps), (AFE index, port id, clock id)
 pub const MIC: (u16, u16, u32) = (25, 0x9001, 0x200);
 pub const SPK: (u16, u16, u32) = (40, 0x9010, 0x202);
+/// The 3.5 mm jack (A8): headphones on INT0 MI2S RX (port 0x102e, bit clock 0x10f, 48 kHz x 16 x 2 = 1.536 MHz),
+/// the internal codec's 9.6 MHz MCLK (0x305, a service clock). Linux q6afe.c / q6afe-dai.c facts; the bonito DTB's
+/// dai 0x89 and clock 0x33.
+pub const HPH: (u16, u16, u32) = (0x89, 0x102e, 0x10f);
+const MCLK: (u16, u16, u32) = (0x33, 0, 0x305);
+const I2S_BCLK_HZ: u32 = 1_536_000;
+const MCLK_HZ: u32 = 9_600_000;
 const BCLK_HZ: u32 = 6_144_000; // 48 kHz x 8 slots x 16 bits
 /// VoiceMMode1: our APR port for the voice sessions, and the modem's session name
 const VOICE_PATH: u16 = 6;
@@ -254,6 +261,36 @@ pub fn afe_clock(port: (u16, u16, u32), on: bool) -> Vec<u8> {
     le32(&mut pl, 12 + d.len() as u32);
     pl.extend_from_slice(&param(0x0001_028f, 0x0001_0290, &d)); // after the u32 size: lsw, msw, handle, module...
     packet(SVC_AFE, 0, 0, port.0 as u32, AFE_SVC_SET_PARAM, &pl)
+}
+
+/// AFE CLOCK_SET for an I2S port's bit clock or the codec's MCLK: `hz`, attribute 1 (COUPLE_NO), root 0.
+pub fn afe_clock_hz(port: (u16, u16, u32), hz: u32, on: bool) -> Vec<u8> {
+    let mut d = Vec::new();
+    le32(&mut d, 1);
+    le32(&mut d, port.2);
+    le32(&mut d, if on { hz } else { 0 });
+    le16(&mut d, 1);
+    le16(&mut d, 0);
+    le32(&mut d, on as u32);
+    let mut pl = Vec::new();
+    le32(&mut pl, 12 + d.len() as u32);
+    pl.extend_from_slice(&param(0x0001_028f, 0x0001_0290, &d));
+    packet(SVC_AFE, 0, 0, port.0 as u32, AFE_SVC_SET_PARAM, &pl)
+}
+
+/// AFE I2S config: 16 bits, SD0, stereo, word select from the ADSP, 48 kHz, PCM; padded to the port-config union
+/// (36 bytes) as Linux.
+pub fn afe_i2s_config(port: (u16, u16, u32)) -> Vec<u8> {
+    let mut d = Vec::new();
+    le32(&mut d, 1);
+    for x in [16u16, 1, 1, 1] {
+        le16(&mut d, x);
+    }
+    le32(&mut d, 48_000);
+    le16(&mut d, 0);
+    le16(&mut d, 0);
+    d.resize(36, 0);
+    afe_port_param(port, 0x0001_020c, 0x0001_020d, &d)
 }
 
 fn afe_port_param(port: (u16, u16, u32), module: u32, id: u32, data: &[u8]) -> Vec<u8> {
@@ -406,6 +443,9 @@ enum Cmd {
     AsmClose,
     AsmUnmap,
     AdmClose,
+    /// a clock at a frequency (the jack's MCLK and bit clock), on or off
+    ClockHz((u16, u16, u32), u32, bool),
+    I2sConfig((u16, u16, u32)),
     AsmOpenRead,
     AsmEncCfg,
     AdmOpenTx,
@@ -482,6 +522,10 @@ pub struct Audio {
     recorded: Vec<(usize, u32, u32, u32)>,
     /// unmatched stream events logged (bounded)
     unmatched: u32,
+    /// headphones are plugged in: media goes to the jack (the daemon sets it; a change restarts media)
+    pub jack: bool,
+    /// the running media path's output is the jack
+    jack_is: bool,
 }
 
 impl Audio {
@@ -532,10 +576,25 @@ impl Audio {
         self.slots.iter().position(Option::is_none)
     }
 
+    /// The port media plays on: the jack's while headphones are in (Ring and calls stay on the TDM amps).
+    fn out(&self) -> (u16, u16, u32) {
+        if matches!(self.is, Mode::Media | Mode::Duplex) && self.jack_is {
+            HPH
+        } else {
+            SPK
+        }
+    }
+
+    /// The running media path plays on the jack.
+    pub fn jack_is(&self) -> bool {
+        self.jack_is && matches!(self.is, Mode::Media | Mode::Duplex)
+    }
+
     /// Media (or media and recording) runs and is staying.
     fn streaming(&self) -> bool {
         matches!(self.is, Mode::Media | Mode::Duplex)
             && self.want == self.is
+            && self.jack == self.jack_is
             && self.idle()
             && !self.broken
     }
@@ -783,17 +842,18 @@ impl Audio {
                     // the mic's port first, as a call
                     q.extend([Clock(MIC), TdmConfig(MIC), SlotMap(MIC), Port(MIC, true)]);
                 }
-                q.extend([
-                    Clock(SPK),
-                    TdmConfig(SPK),
-                    SlotMap(SPK),
-                    Port(SPK, true),
-                    AsmMap,
-                    AsmOpen,
-                    AsmFormat,
-                    AdmOpen,
-                    AdmRoute,
-                ]);
+                self.jack_is = self.jack;
+                if self.jack {
+                    q.extend([
+                        ClockHz(MCLK, MCLK_HZ, true),
+                        ClockHz(HPH, I2S_BCLK_HZ, true),
+                        I2sConfig(HPH),
+                        Port(HPH, true),
+                    ]);
+                } else {
+                    q.extend([Clock(SPK), TdmConfig(SPK), SlotMap(SPK), Port(SPK, true)]);
+                }
+                q.extend([AsmMap, AsmOpen, AsmFormat, AdmOpen, AdmRoute]);
                 if m == Mode::Duplex {
                     q.extend([AsmOpenRead, AsmEncCfg, AdmOpenTx, AdmRouteTx]);
                 }
@@ -843,19 +903,35 @@ impl Audio {
                 Port(SPK, false),
                 Port(MIC, false),
             ]),
-            Mode::Duplex => q.extend([
-                AsmPause,
-                AsmPauseRead,
-                AsmClose,
-                AsmCloseRead,
-                AsmUnmap,
-                AdmClose,
-                AdmCloseTx,
-                Codecs(false),
-                Port(SPK, false),
-                Port(MIC, false),
-            ]),
-            Mode::Ring | Mode::Media => q.extend([
+            Mode::Media | Mode::Duplex => {
+                let duplex = self.is == Mode::Duplex;
+                q.push(AsmPause);
+                if duplex {
+                    q.push(AsmPauseRead);
+                }
+                q.push(AsmClose);
+                if duplex {
+                    q.push(AsmCloseRead);
+                }
+                q.extend([AsmUnmap, AdmClose]);
+                if duplex {
+                    q.push(AdmCloseTx);
+                }
+                q.push(Codecs(false));
+                if self.jack_is {
+                    q.extend([
+                        Port(HPH, false),
+                        ClockHz(HPH, I2S_BCLK_HZ, false),
+                        ClockHz(MCLK, MCLK_HZ, false),
+                    ]);
+                } else {
+                    q.push(Port(SPK, false));
+                }
+                if duplex {
+                    q.push(Port(MIC, false));
+                }
+            }
+            Mode::Ring => q.extend([
                 AsmPause,
                 AsmClose,
                 AsmUnmap,
@@ -949,16 +1025,23 @@ impl Audio {
                 packet(SVC_ASM, RING_PORT, RING_PORT, 1, ASM_FMT, &v)
             }
             AdmOpen => {
+                let out = self.out();
+                // the jack's port is stereo: the COPP takes FL and FR (the ADSP spreads the mono stream)
+                let (ch, map): (u16, [u8; 8]) = if out == HPH {
+                    (2, [1, 2, 0, 0, 0, 0, 0, 0])
+                } else {
+                    (1, [3, 0, 0, 0, 0, 0, 0, 0])
+                };
                 let mut v = Vec::new();
-                for h in [0u16, 1, SPK.1, 0] {
+                for h in [0u16, 1, out.1, 0] {
                     v.extend_from_slice(&h.to_le_bytes());
                 }
                 v.extend_from_slice(&0x10312u32.to_le_bytes()); // ADM NULL_COPP_TOPOLOGY (no effects)
-                v.extend_from_slice(&1u16.to_le_bytes());
+                v.extend_from_slice(&ch.to_le_bytes());
                 v.extend_from_slice(&16u16.to_le_bytes());
                 v.extend_from_slice(&48_000u32.to_le_bytes());
-                v.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
-                packet(SVC_ADM, SPK.1, SPK.1, u32::from(SPK.0) << 16, ADM_OPEN, &v)
+                v.extend_from_slice(&map);
+                packet(SVC_ADM, out.1, out.1, u32::from(out.0) << 16, ADM_OPEN, &v)
             }
             AdmRoute => {
                 let mut v = Vec::new();
@@ -999,9 +1082,9 @@ impl Audio {
             ),
             AdmClose => packet(
                 SVC_ADM,
-                SPK.1,
+                self.out().1,
                 self.copp,
-                u32::from(SPK.0) << 16,
+                u32::from(self.out().0) << 16,
                 ADM_CLOSE,
                 &[],
             ),
@@ -1064,6 +1147,8 @@ impl Audio {
                 ADM_CLOSE,
                 &[],
             ),
+            ClockHz(p, hz, on) => afe_clock_hz(p, hz, on),
+            I2sConfig(p) => afe_i2s_config(p),
             Codecs(_) | Publish => Vec::new(),
         }
     }
@@ -1090,7 +1175,9 @@ impl Audio {
                 return Out::Nothing;
             }
         }
-        if self.idle() && self.want != self.is {
+        // headphones in or out while media runs: stop it, and it starts again on the other port
+        let replug = matches!(self.is, Mode::Media | Mode::Duplex) && self.jack != self.jack_is;
+        if self.idle() && (self.want != self.is || replug) {
             if self.is == Mode::Off {
                 log(format_args!("apr: starting {:?}", self.want));
                 self.begin(self.want);
@@ -2105,5 +2192,78 @@ mod tests {
         a.handle(&refused, &mut |_| {});
         assert_eq!(a.media_in_flight(), 0);
         assert_eq!(a.poll(900, &mut |_| {}), Out::Complete(41, 5));
+    }
+
+    /// Drive `a` with the scripted ADSP from `t0` for 200 ms of fake time; the packets sent.
+    fn run_packets(a: &mut Audio, t0: u64) -> Vec<Vec<u8>> {
+        let mut sent = Vec::new();
+        for now in t0..t0 + 200 {
+            match a.poll(now, &mut |_| {}) {
+                Out::Send(p) => {
+                    ring_response(a, &p);
+                    sent.push(p);
+                }
+                Out::Codecs(_) => a.codecs_done(true, &mut |_| {}),
+                _ => {}
+            }
+        }
+        sent
+    }
+
+    fn opcode(p: &[u8]) -> u32 {
+        u32::from_le_bytes(p[16..20].try_into().unwrap())
+    }
+
+    #[test]
+    fn media_on_headphones_uses_the_jack_port_and_its_clocks() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            jack: true,
+            ..Default::default()
+        };
+        a.set(Mode::Media);
+        let sent = run_packets(&mut a, 0);
+        assert!(a.running() && a.jack_is());
+        // MCLK 9.6 MHz, then the bit clock, the I2S config, the port's start
+        let clocks: Vec<&Vec<u8>> = sent
+            .iter()
+            .filter(|p| opcode(p) == AFE_SVC_SET_PARAM)
+            .collect();
+        assert_eq!(clocks[0], &afe_clock_hz(MCLK, MCLK_HZ, true));
+        assert_eq!(clocks[1], &afe_clock_hz(HPH, I2S_BCLK_HZ, true));
+        assert!(sent.contains(&afe_i2s_config(HPH)));
+        assert!(sent.contains(&afe_start(HPH, true)));
+        assert!(!sent.contains(&afe_start(SPK, true)));
+        let adm = sent.iter().find(|p| opcode(p) == ADM_OPEN).unwrap();
+        assert_eq!(u16::from_le_bytes(adm[24..26].try_into().unwrap()), HPH.1);
+        assert_eq!(
+            u16::from_le_bytes(adm[32..34].try_into().unwrap()),
+            2,
+            "stereo COPP"
+        );
+        // the I2S config's payload: 36 bytes after the param header
+        assert_eq!(afe_i2s_config(HPH).len(), HDR + 4 + 24 + 36);
+        // unplugged: media stops on the jack (port, bit clock, MCLK off) and starts again on the amps
+        a.jack = false;
+        assert_eq!(a.media_slot(), None);
+        let sent = run_packets(&mut a, 300);
+        let stop = sent
+            .iter()
+            .position(|p| *p == afe_start(HPH, false))
+            .unwrap();
+        let bclk_off = sent
+            .iter()
+            .position(|p| *p == afe_clock_hz(HPH, I2S_BCLK_HZ, false))
+            .unwrap();
+        let mclk_off = sent
+            .iter()
+            .position(|p| *p == afe_clock_hz(MCLK, MCLK_HZ, false))
+            .unwrap();
+        let spk = sent
+            .iter()
+            .position(|p| *p == afe_start(SPK, true))
+            .unwrap();
+        assert!(stop < bclk_off && bclk_off < mclk_off && mclk_off < spk);
+        assert!(a.running() && !a.jack_is());
     }
 }
