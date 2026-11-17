@@ -322,6 +322,8 @@ pub struct CallAudio {
     /// NeoAudio's media: the kernel route (0 earpiece, 1 both amps, 2 bottom) and amp volume 0..=10
     pub media_route: u32,
     pub media_volume: u8,
+    /// recording reads logged so far (the first few, for bring-up)
+    rec_logged: u32,
 }
 
 impl CallAudio {
@@ -336,6 +338,7 @@ impl CallAudio {
             ring_loaded: false,
             media_route: 1,
             media_volume: 7,
+            rec_logged: 0,
         }
     }
 
@@ -548,6 +551,10 @@ impl CallAudio {
                 dprintln!("[modemd] rec: copy out slot {} -> {}", slot, r);
                 continue;
             }
+            if self.rec_logged < 8 {
+                self.rec_logged += 1;
+                dprintln!("[modemd] rec: slot {} gave {} bytes", slot, n);
+            }
             mic.extend(
                 bytes[..n as usize]
                     .as_chunks::<2>()
@@ -572,6 +579,16 @@ impl CallAudio {
                 break;
             }
             let p = self.apr.rec_read(slot, info.b, info.buf);
+            if self.rec_logged < 4 {
+                self.rec_logged += 1;
+                dprintln!(
+                    "[modemd] rec: read slot {} at +{:#x} ticket {} generation {}",
+                    slot,
+                    off,
+                    info.b,
+                    info.buf
+                );
+            }
             if let Err(e) = send(RING_APR, &p) {
                 dprintln!("[modemd] rec: read slot {} not sent ({})", slot, e);
                 self.apr.rec_unsent(slot);

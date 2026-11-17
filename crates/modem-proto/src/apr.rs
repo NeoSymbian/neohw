@@ -55,7 +55,7 @@ pub const REC_OFFSET: u32 = 0x34000;
 const REC_PORT: u16 = 0x0201;
 // Wire facts: Linux sound/soc/qcom/qdsp6/q6asm.c (open read v3, the PCM encoder config block, read v2, read done v2)
 const ASM_OPEN_READ: u32 = 0x10db4;
-const ASM_READ: u32 = 0x10db5;
+const ASM_READ: u32 = 0x10dac; // ASM_DATA_CMD_READ_V2 (WRITE_V2 is 0x10dab); 0x10db5 is unsupported (status 3)
 const ASM_READ_DONE: u32 = 0x10d9a;
 const ASM_ENCDEC: u32 = 0x10c10;
 const ASM_ENC_CFG_PCM: u32 = 0x10da3;
@@ -480,6 +480,8 @@ pub struct Audio {
     rec: [Option<(u32, u32)>; MEDIA_SLOTS],
     /// recorded buffers it gave back: (slot, ticket, generation, bytes), for the daemon to release and copy out
     recorded: Vec<(usize, u32, u32, u32)>,
+    /// unmatched stream events logged (bounded)
+    unmatched: u32,
 }
 
 impl Audio {
@@ -581,6 +583,37 @@ impl Audio {
     /// Buffers the ADSP filled: (slot, ticket, generation, bytes). Release each ticket, then copy the bytes out.
     pub fn take_recorded(&mut self) -> Vec<(usize, u32, u32, u32)> {
         core::mem::take(&mut self.recorded)
+    }
+
+    /// An error answer to one of our READs or WRITEs (by its token): release that buffer. False if it is not one.
+    fn stream_refused(&mut self, r: &Rsp) -> bool {
+        let Some((op, status)) = r.result() else {
+            return false;
+        };
+        if status == 0 || !matches!(op, ASM_READ | ASM_WRITE) {
+            return false;
+        }
+        if op == ASM_READ
+            && let Some(i) =
+                (0..MEDIA_SLOTS).find(|&i| self.rec[i].is_some_and(|(t, _)| t == r.token))
+        {
+            let (t, g) = self.rec[i].take().unwrap();
+            self.recorded.push((i, t, g, 0));
+            return self.unmatched_log_left();
+        }
+        if op == ASM_WRITE
+            && let Some(i) =
+                (0..MEDIA_SLOTS).find(|&i| self.slots[i].is_some_and(|(t, _)| t == r.token))
+        {
+            self.releases.push(self.slots[i].take().unwrap());
+            return self.unmatched_log_left();
+        }
+        false
+    }
+
+    /// Whether a refused buffer should also be logged (the first few): false = logged below by the caller.
+    fn unmatched_log_left(&self) -> bool {
+        self.unmatched >= 20
     }
 
     /// A READ_DONE for one of the read buffers: {status, address (2 words), handle, size, offset, ...}.
@@ -1152,6 +1185,36 @@ impl Audio {
         }
         if r.svc == SVC_ASM && r.opcode == ASM_READ_DONE && self.read_done(&r) {
             return;
+        }
+        // a READ or WRITE the ADSP refused: its buffer is given back now (as 0 bytes), never left the ADSP's
+        if r.svc == SVC_ASM && self.stream_refused(&r) {
+            return;
+        }
+        // what the streams did not take: read events, errors for a READ or WRITE (they are not queue commands)
+        if r.svc == SVC_ASM
+            && (r.opcode == ASM_READ_DONE
+                || r.result()
+                    .is_some_and(|(o, s)| s != 0 && matches!(o, ASM_READ | ASM_WRITE)))
+            && self.unmatched < 20
+        {
+            self.unmatched += 1;
+            let w = |i: usize| {
+                r.payload
+                    .get(i..i + 4)
+                    .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+            };
+            log(format_args!(
+                "apr: unmatched ASM {:#x} port {:#x} token {:#x}: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                r.opcode,
+                r.src_port,
+                r.token,
+                w(0),
+                w(4),
+                w(8),
+                w(12),
+                w(16),
+                w(20)
+            ));
         }
         let Some((op, _)) = self.waiting else {
             return; // an event, or a late answer
@@ -2016,5 +2079,31 @@ mod tests {
     fn read_buffers_fit_after_the_media_periods() {
         assert!(REC_OFFSET as usize >= MEDIA_OFFSET as usize + MEDIA_SLOTS * MEDIA_PERIOD);
         assert!(REC_OFFSET as usize + MEDIA_SLOTS * MEDIA_PERIOD <= RING_REGION as usize);
+    }
+
+    #[test]
+    fn a_refused_read_or_write_gives_its_buffer_back() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 5,
+            ..Default::default()
+        };
+        start(&mut a, Mode::Duplex);
+        let read = a.rec_read(3, 40, 5);
+        assert_eq!(
+            u32::from_le_bytes(read[16..20].try_into().unwrap()),
+            0x10dac
+        );
+        let mut refused = ack(&read, 0, 3); // status 3: unsupported
+        refused[4] = SVC_ASM;
+        a.handle(&refused, &mut |_| {});
+        assert_eq!(a.take_recorded(), alloc::vec![(3, 40, 5, 0)]);
+        assert_eq!(a.rec_in_flight(), 0);
+        let write = a.media_write(1, 41, 5);
+        let mut refused = ack(&write, 0, 1);
+        refused[4] = SVC_ASM;
+        a.handle(&refused, &mut |_| {});
+        assert_eq!(a.media_in_flight(), 0);
+        assert_eq!(a.poll(900, &mut |_| {}), Out::Complete(41, 5));
     }
 }
