@@ -317,6 +317,8 @@ struct Daemon {
     haptic_at: u64,
     healthy_since: u64,
     alert_dismissed: Option<u8>,
+    /// the call Silence quietened (op::SILENCE): no tone or vibration until it stops ringing; the settings stay
+    silenced: Option<u8>,
     waiting_alert: Option<u8>,
     audio_seen: Option<(Mode, Mode, bool)>,
     haptic_error: i32,
@@ -405,6 +407,7 @@ impl Daemon {
         }
         self.audio.apr.set(Mode::Off);
         self.alert_dismissed = None;
+        self.silenced = None;
         self.waiting_alert = None;
         let _ = adsp::audio(2, 0);
         self.phase = Phase::Recover {
@@ -903,8 +906,22 @@ impl Daemon {
         {
             self.alert_dismissed = None;
         }
+        if self.silenced.is_some_and(|id| {
+            !modem.status.calls.as_slice().iter().any(|c| {
+                c.id == id
+                    && matches!(
+                        c.state,
+                        modem_ipc::call::INCOMING | modem_ipc::call::WAITING
+                    )
+            })
+        }) {
+            self.silenced = None;
+        }
         let ringing = modem.status.calls.as_slice().iter().any(|c| {
-            c.incoming && c.state == modem_ipc::call::INCOMING && self.alert_dismissed != Some(c.id)
+            c.incoming
+                && c.state == modem_ipc::call::INCOMING
+                && self.alert_dismissed != Some(c.id)
+                && self.silenced != Some(c.id)
         });
         let now = time::millis();
         if ringing && !talking && !modem.status.airplane && modem.status.ring.vibrate {
@@ -1220,7 +1237,9 @@ impl Service for Daemon {
             return;
         }
         let target = msg.int(0);
-        if matches!(msg.function(), op::ANSWER | op::HANGUP) && !(0..=255).contains(&target) {
+        if matches!(msg.function(), op::ANSWER | op::HANGUP | op::SILENCE)
+            && !(0..=255).contains(&target)
+        {
             msg.complete(err::KERR_ARGUMENT);
             return;
         }
@@ -1263,6 +1282,8 @@ impl Service for Daemon {
                 }
                 r
             }
+            // only the call's alert goes quiet (below); the ring settings stay
+            op::SILENCE => self.modem.as_ref().map_or(NOT_READY, |_| err::KERR_NONE),
             op::ANSWER => self.modem.as_mut().map_or(NOT_READY, |m| {
                 m.answer_call(&mut Hal, target as u8)
                     .err()
@@ -1538,7 +1559,16 @@ impl Service for Daemon {
             },
             _ => err::KERR_NOT_SUPPORTED,
         };
-        if r == 0 && matches!(msg.function(), op::ANSWER | op::HANGUP) {
+        if r == 0 && msg.function() == op::SILENCE {
+            self.silenced = self.modem.as_ref().map(|m| {
+                if target == 0 {
+                    m.status.call.id
+                } else {
+                    target as u8
+                }
+            });
+        }
+        if r == 0 && matches!(msg.function(), op::ANSWER | op::HANGUP | op::SILENCE) {
             self.alert_dismissed = self.modem.as_ref().map(|m| {
                 if target == 0 {
                     m.status.call.id
@@ -1548,7 +1578,7 @@ impl Service for Daemon {
             });
             let haptic = hal_io(HAPTIC, Io::default()).0;
             dprintln!(
-                "[modemd t={}ms] answered/ended vibration stop -> {}",
+                "[modemd t={}ms] answered/ended/silenced vibration stop -> {}",
                 time::millis(),
                 haptic
             );
@@ -1606,6 +1636,7 @@ fn main() -> i32 {
         haptic_at: 0,
         healthy_since: 0,
         alert_dismissed: None,
+        silenced: None,
         waiting_alert: None,
         audio_seen: None,
         haptic_error: 0,

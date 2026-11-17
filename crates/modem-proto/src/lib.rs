@@ -1315,6 +1315,7 @@ impl Modem {
             incoming: false,
             number: Text::new(number),
             presentation: 0,
+            ..Call::default()
         };
         p.log(format_args!("voice: dial {}{}", prefix, mask(number)));
         Ok(())
@@ -1807,6 +1808,7 @@ impl Modem {
             }
             (DMS, DMS_GET_IDS) => {
                 self.imei = text(m.tlv(0x11));
+                self.status.imei = Text::new(self.imei.as_deref().unwrap_or(""));
                 p.log(format_args!(
                     "dms: IMEI {}",
                     self.imei.as_deref().map(mask).unwrap_or_default()
@@ -1926,15 +1928,26 @@ impl Modem {
                         (self.status.call.id == c.id || self.status.call.id == 0)
                             .then_some(self.status.call)
                     });
+                    // an indication without the numbers TLV keeps the number and how it was presented (a
+                    // private caller stays private)
+                    let (number, presentation) = match &c.number {
+                        Some(n) => (Text::new(n), c.presentation),
+                        None => previous.map_or((Text::default(), c.presentation), |x| {
+                            (x.number, x.presentation)
+                        }),
+                    };
+                    let up = matches!(c.state, call::CONVERSATION | call::HOLD);
                     next.entries[i] = Call {
                         id: c.id,
                         state: c.state,
                         incoming: c.incoming,
-                        number: c.number.map_or_else(
-                            || previous.map_or(Text::default(), |x| x.number),
-                            |n| Text::new(&n),
-                        ),
-                        presentation: c.presentation,
+                        number,
+                        presentation,
+                        multiparty: c.multiparty,
+                        since: match previous.map_or(0, |x| x.since) {
+                            0 if up => self.now.max(1),
+                            s => s,
+                        },
                     };
                     if previous.is_none_or(|old| (old.id, old.state) != (c.id, c.state)) {
                         p.log(format_args!(
@@ -3202,6 +3215,40 @@ mod tests {
                 .tlv(0x10, &r)
                 .finish(),
         )
+    }
+
+    // 2.6: a private caller stays private when an update has no numbers TLV; the connect time is MODEMD's and kept;
+    // the conference flag comes through
+    #[test]
+    fn private_stays_private_since_and_multiparty() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.now = 4_000;
+        m.handle(
+            &mut f,
+            &call_ind_numbered(&[1, 1, 2, 0, 2, 3, 0, 0], &[(1, 1, "")]),
+        );
+        let c = *m.status.calls.find(1).unwrap();
+        assert_eq!((c.presentation, c.since), (1, 0));
+        m.now = 9_000;
+        m.handle(&mut f, &call_ind(&[1, 1, 3, 0, 2, 3, 0, 0]));
+        let c = *m.status.calls.find(1).unwrap();
+        assert_eq!(
+            (c.state, c.presentation, c.since),
+            (call::CONVERSATION, 1, 9_000)
+        );
+        m.now = 20_000;
+        // a second call joins: both multiparty; call 1 keeps its connect time
+        m.handle(
+            &mut f,
+            &call_ind(&[2, 1, 3, 0, 2, 3, 1, 0, 2, 3, 0, 1, 3, 1, 0]),
+        );
+        let (a, b) = (
+            *m.status.calls.find(1).unwrap(),
+            *m.status.calls.find(2).unwrap(),
+        );
+        assert_eq!((a.since, a.multiparty, a.presentation), (9_000, true, 1));
+        assert_eq!((b.since, b.multiparty), (20_000, true));
     }
 
     #[test]

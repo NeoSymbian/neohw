@@ -247,6 +247,7 @@ mod tests {
             incoming,
             number: Text::new(number),
             presentation: 0,
+            ..Call::default()
         }
     }
 

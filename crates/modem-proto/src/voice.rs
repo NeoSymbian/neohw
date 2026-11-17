@@ -39,6 +39,8 @@ pub struct CallInfo {
     pub number: Option<String>,
     /// QmiVoicePresentation of the number (0 allowed, 1 restricted, 2 unavailable, 4 payphone)
     pub presentation: u8,
+    /// part of a conference (the call record's multiparty byte)
+    pub multiparty: bool,
 }
 
 /// TLV 0x01 = a count, then 7 bytes per call {id, state, type, direction, mode, multipart, als}; TLV 0x10 = the
@@ -65,6 +67,7 @@ pub fn all_calls(m: &Msg) -> Option<alloc::vec::Vec<CallInfo>> {
             incoming: c[3] == 2,
             number: None,
             presentation: 0,
+            multiparty: c[5] != 0,
         });
     }
     if let Some(r) = m.tlv(0x10) {
@@ -136,6 +139,13 @@ mod tests {
             (c.state, c.incoming, c.number),
             (call::ALERTING, false, None)
         );
+    }
+
+    #[test]
+    fn multiparty_byte() {
+        let b = ind(&[2, 1, 3, 0, 2, 3, 1, 0, 2, 3, 0, 1, 3, 0, 0], None);
+        let c = all_calls(&Msg::parse(&b).unwrap()).unwrap();
+        assert_eq!((c[0].multiparty, c[1].multiparty), (true, false));
     }
 
     #[test]

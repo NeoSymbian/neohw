@@ -21,6 +21,9 @@
 //!   read, deletes, retries; [`op::SMS_SETTINGS`] gets or sets [`SmsSettings`]. [`Status::sms_revision`] changes with
 //!   every change, [`Status::sms_unread`] counts the unread ones. Blocked senders' messages are kept as
 //!   [`sms::BLOCKED`] (7 days) and never alert.
+//! - v2.6: each [`Call`] says whether it is part of a conference ([`Call::multiparty`]) and when it connected
+//!   ([`Call::since`], MODEMD's tick clock, so every app shows the same timer); [`Status::imei`]; [`op::SILENCE`]
+//!   quietens one ringing call without touching the ring settings.
 //!
 //! Each op completes with KErrNone or an error: KErrNotReady (-18) without a modem/call to act on, KErrArgument (-6)
 //! for a number it refuses.
@@ -28,7 +31,7 @@
 
 pub const NAME: &str = "NeoModem";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (2, 5, 0);
+pub const VERSION: (i8, i8, i16) = (2, 6, 0);
 
 pub mod op {
     pub const STATUS: i32 = 1;
@@ -79,6 +82,9 @@ pub mod op {
     pub const SMS_EDIT: i32 = 26;
     /// arg0 0 = get, 1 = set; arg1 des8 [`super::SmsSettings`] (written on get, read on set).
     pub const SMS_SETTINGS: i32 = 27;
+    /// (2.6) arg0 call ID (0 = primary): stop ringing and vibrating for that call only (Silence). The ring settings
+    /// stay as they are.
+    pub const SILENCE: i32 = 28;
 }
 
 /// SMS (C9): [`SmsEntry::state`], the [`op::SMS_READ`] modes, the [`op::SMS_EDIT`] actions, [`SmsSettings::alert`].
@@ -493,6 +499,11 @@ pub struct Call {
     pub number: Text,
     /// the network's presentation of `number` (phone_rules::caller::presentation; 0 allowed)
     pub presentation: u8,
+    /// (2.6) part of a conference (the network's multiparty flag)
+    pub multiparty: bool,
+    /// (2.6) when it connected, in MODEMD's `e32::time::millis()` (the kernel tick clock every process shares); 0:
+    /// not yet. A call's timer is `millis() - since`, the same in every app.
+    pub since: u64,
 }
 
 /// The call's audio (C6): what the in-call buttons show.
@@ -553,6 +564,8 @@ pub struct Status {
     /// Unread messages (blocked ones never count), and from how many senders.
     pub sms_unread: u16,
     pub sms_senders: u8,
+    /// (2.6) the IMEI (empty until the modem reports it); `*#06#` shows it. Never log it whole.
+    pub imei: Text,
 }
 
 /// v2.1's tail: the calls' presentations, the log revision, call waiting, the selected call's presentation.
@@ -560,9 +573,11 @@ const V21: usize = MAX_CALLS + 4 + 1 + 1;
 const TAIL: usize = 110 + MAX_CALLS * 36;
 /// v2.3's tail: the SMS revision, the unread count and senders.
 const V23: usize = 4 + 2 + 1;
+/// v2.6's tail: per call (then the selected call) a flags byte (bit 0: multiparty) and `since` (u64 LE); the IMEI.
+const V26: usize = (MAX_CALLS + 1) * 9 + 1 + TEXT;
 
 impl Status {
-    pub const SIZE: usize = 110 + MAX_CALLS * 36 + V21 + V23;
+    pub const SIZE: usize = 110 + MAX_CALLS * 36 + V21 + V23 + V26;
 
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
@@ -619,6 +634,16 @@ impl Status {
         b[at..at + 4].copy_from_slice(&self.sms_revision.to_le_bytes());
         b[at + 4..at + 6].copy_from_slice(&self.sms_unread.to_le_bytes());
         b[at + 6] = self.sms_senders;
+        let at = TAIL + V21 + V23;
+        let calls = self.calls.as_slice().iter().enumerate();
+        for (i, c) in calls.chain(core::iter::once((MAX_CALLS, &self.call))) {
+            let at = at + i * 9;
+            b[at] = c.multiparty as u8;
+            b[at + 1..at + 9].copy_from_slice(&c.since.to_le_bytes());
+        }
+        let at = at + (MAX_CALLS + 1) * 9;
+        b[at] = self.imei.len;
+        b[at + 1..at + 1 + TEXT].copy_from_slice(&self.imei.buf);
         b
     }
 
@@ -630,6 +655,14 @@ impl Status {
             buf.copy_from_slice(&b[at + 1..at + 33]);
             (len <= 32 && core::str::from_utf8(&buf[..usize::from(len.min(32))]).is_ok())
                 .then_some(Text { len, buf })
+        };
+        let v26 = TAIL + V21 + V23;
+        let flags = |i: usize| -> Option<(bool, u64)> {
+            let at = v26 + i * 9;
+            Some((
+                b[at] & 1 != 0,
+                u64::from_le_bytes(b[at + 1..at + 9].try_into().ok()?),
+            ))
         };
         let mut calls = Calls {
             len: b[97],
@@ -646,6 +679,8 @@ impl Status {
                 incoming: b[at + 2] != 0,
                 number: text(at + 3)?,
                 presentation: b[TAIL + i],
+                multiparty: flags(i)?.0,
+                since: flags(i)?.1,
             };
         }
         Some(Self {
@@ -661,6 +696,8 @@ impl Status {
                 incoming: b[7] != 0,
                 number: text(41)?,
                 presentation: b[TAIL + MAX_CALLS + 5],
+                multiparty: flags(MAX_CALLS)?.0,
+                since: flags(MAX_CALLS)?.1,
             },
             audio: Audio {
                 on: b[74] != 0,
@@ -695,6 +732,7 @@ impl Status {
             sms_revision: u32::from_le_bytes(b[TAIL + V21..TAIL + V21 + 4].try_into().ok()?),
             sms_unread: u16::from_le_bytes([b[TAIL + V21 + 4], b[TAIL + V21 + 5]]),
             sms_senders: b[TAIL + V21 + 6],
+            imei: text(v26 + (MAX_CALLS + 1) * 9)?,
         })
     }
 }
@@ -718,6 +756,7 @@ mod tests {
                 incoming: true,
                 number: Text::new("+37400000012"),
                 presentation: 0,
+                ..Call::default()
             },
             audio: Audio {
                 on: true,
@@ -769,6 +808,8 @@ mod tests {
             incoming: false,
             number: Text::new("+37400000001"),
             presentation: 0,
+            multiparty: true,
+            since: 1_234_567_890_123,
         };
         s.calls.entries[1] = Call {
             id: 2,
@@ -776,8 +817,10 @@ mod tests {
             incoming: true,
             number: Text::new("+37400000002"),
             presentation: 1,
+            ..Call::default()
         };
-        s.call = s.calls.entries[1];
+        s.call = s.calls.entries[0];
+        s.imei = Text::new("350000000000023");
         let mut bytes = s.to_bytes();
         assert_eq!(Status::from_bytes(&bytes), Some(s));
         bytes[97] = 9;
