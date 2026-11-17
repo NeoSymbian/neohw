@@ -28,7 +28,7 @@
 
 pub const NAME: &str = "NeoModem";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (2, 3, 0);
+pub const VERSION: (i8, i8, i16) = (2, 4, 0);
 
 pub mod op {
     pub const STATUS: i32 = 1;
@@ -110,6 +110,10 @@ pub mod sms {
     pub const EDIT_DELETE_BLOCKED: i32 = 6;
     /// every message read (the id is ignored)
     pub const EDIT_ALL_READ: i32 = 7;
+    /// (2.4) every message with that message's number archived: Messages lists the thread under Archived; a new
+    /// message from that number brings it back
+    pub const EDIT_ARCHIVE_THREAD: i32 = 8;
+    pub const EDIT_UNARCHIVE_THREAD: i32 = 9;
 
     pub const ALERT_TONE_VIBRATE: u8 = 0;
     pub const ALERT_VIBRATE: u8 = 1;
@@ -140,6 +144,8 @@ pub struct SmsEntry {
     pub parts: u8,
     pub unicode: bool,
     pub incoming: bool,
+    /// (2.4) its thread is archived ([`sms::EDIT_ARCHIVE_THREAD`]); on the wire, bit 1 of the `incoming` byte
+    pub archived: bool,
     /// the other side: digits with an optional +, or an alphanumeric sender
     pub number: Text,
 }
@@ -161,7 +167,7 @@ impl SmsEntry {
             self.why,
             self.parts,
             self.unicode as u8,
-            self.incoming as u8,
+            self.incoming as u8 | (self.archived as u8) << 1,
         ]);
         b[29] = self.number.len;
         b[30..62].copy_from_slice(&self.number.buf);
@@ -190,7 +196,8 @@ impl SmsEntry {
             why: h[25],
             parts: h[26],
             unicode: h[27] != 0,
-            incoming: h[28] != 0,
+            incoming: h[28] & 1 != 0,
+            archived: h[28] & 2 != 0,
             number: Text { len, buf },
         };
         Some((e, text, Self::HEAD + 2 + n))
@@ -777,12 +784,25 @@ mod tests {
             parts: 2,
             unicode: true,
             incoming: false,
+            archived: false,
             number: Text::new("+37491234567"),
         };
         let mut buf = [0u8; 200];
         let n = e.write("Բարև", &mut buf).unwrap();
         assert_eq!(n, SmsEntry::HEAD + 2 + 8);
         assert_eq!(SmsEntry::read(&buf[..n]), Some((e, "Բարև", n)));
+        // 2.4: archived rides in bit 1 of the incoming byte; a 2.3 record (0 or 1 there) reads as not archived
+        for (incoming, archived) in [(true, true), (false, true), (true, false)] {
+            let a = SmsEntry {
+                incoming,
+                archived,
+                ..e
+            };
+            let mut b = [0u8; 80];
+            a.write("x", &mut b).unwrap();
+            assert_eq!(b[28], incoming as u8 | (archived as u8) << 1);
+            assert_eq!(SmsEntry::read(&b).map(|r| r.0), Some(a));
+        }
         assert_eq!(SmsEntry::read(&buf[..n - 1]), None);
         assert_eq!(e.write("Բարև", &mut buf[..n - 1]), None);
         let s = SmsSettings {

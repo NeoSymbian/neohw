@@ -228,6 +228,13 @@ impl Store {
     ) -> u32 {
         let blocked = why != 0;
         self.alert |= !blocked;
+        // a new message brings its archived thread back
+        if !blocked {
+            self.archive(
+                |m| m.entry.archived && same(m.entry.number.as_str(), from),
+                false,
+            );
+        }
         self.push(
             SmsEntry {
                 utc,
@@ -379,8 +386,28 @@ impl Store {
             st::EDIT_DELETE => self.delete(|m| m.entry.id == id),
             st::EDIT_DELETE_THREAD => self.delete(in_thread),
             st::EDIT_DELETE_BLOCKED => self.delete(|m| m.entry.state == st::BLOCKED),
+            st::EDIT_ARCHIVE_THREAD => self.archive(in_thread, true),
+            st::EDIT_UNARCHIVE_THREAD => self.archive(in_thread, false),
             _ => false,
         }
+    }
+
+    /// Archive (or bring back) the messages `pick` chooses. True when something changed.
+    fn archive(&mut self, pick: impl Fn(&Message) -> bool, on: bool) -> bool {
+        let ids: Vec<u32> = self
+            .messages
+            .iter()
+            .filter(|m| m.entry.state != st::DELETED && m.entry.archived != on && pick(m))
+            .map(|m| m.entry.id)
+            .collect();
+        for id in &ids {
+            let rev = self.bump();
+            if let Some(m) = self.find(*id) {
+                m.entry.archived = on;
+                m.entry.rev = rev;
+            }
+        }
+        !ids.is_empty()
     }
 
     fn mark_read(&mut self, pick: impl Fn(&Message) -> bool) -> bool {
@@ -714,6 +741,49 @@ mod tests {
         let mut s = Store::decode(&s.encode()).unwrap();
         s.restarted();
         assert_eq!(all(&s, 0)[0].0.state, st::FAILED);
+    }
+
+    #[test]
+    fn threads_archive_and_a_new_message_brings_them_back() {
+        let mut s = Store::default();
+        let a = s
+            .receive(deliver("+37491234567", "hi", None), None, 1)
+            .unwrap();
+        let b = s
+            .receive(deliver("+37491234567", "again", None), None, 2)
+            .unwrap();
+        let other = s.receive(deliver("+15550142", "x", None), None, 3).unwrap();
+        let rev = s.rev;
+        assert!(s.edit(st::EDIT_ARCHIVE_THREAD, a));
+        let got = all(&s, rev);
+        assert_eq!(got.len(), 2, "both messages of the thread changed");
+        assert!(
+            got.iter()
+                .all(|(e, _)| e.archived && (e.id == a || e.id == b))
+        );
+        assert!(!s.edit(st::EDIT_ARCHIVE_THREAD, b), "already archived");
+        // saved and read back
+        let back = Store::decode(&s.encode()).unwrap();
+        assert!(
+            back.messages
+                .iter()
+                .filter(|m| m.entry.id != other)
+                .all(|m| m.entry.archived)
+        );
+        assert!(
+            !back
+                .messages
+                .iter()
+                .any(|m| m.entry.id == other && m.entry.archived)
+        );
+        // a new message from that number brings the thread back
+        let rev = s.rev;
+        s.receive(deliver("+37491234567", "news", None), None, 4)
+            .unwrap();
+        assert!(all(&s, rev).iter().all(|(e, _)| !e.archived));
+        assert!(s.edit(st::EDIT_ARCHIVE_THREAD, a));
+        assert!(s.edit(st::EDIT_UNARCHIVE_THREAD, a));
+        assert!(s.messages.iter().all(|m| !m.entry.archived));
     }
 
     #[test]
