@@ -153,6 +153,8 @@ pub const SPK: (u16, u16, u32) = (40, 0x9010, 0x202);
 /// dai 0x89 and clock 0x33.
 pub const HPH: (u16, u16, u32) = (0x89, 0x102e, 0x10f);
 const MCLK: (u16, u16, u32) = (0x33, 0, 0x305);
+/// The headset's mic (A8): INT3 MI2S TX (port 0x1035, bit clock 0x112), the same I2S format; the DTB's dai 0x90.
+pub const HSMIC: (u16, u16, u32) = (0x90, 0x1035, 0x112);
 const I2S_BCLK_HZ: u32 = 1_536_000;
 const MCLK_HZ: u32 = 9_600_000;
 const BCLK_HZ: u32 = 6_144_000; // 48 kHz x 8 slots x 16 bits
@@ -526,6 +528,10 @@ pub struct Audio {
     pub jack: bool,
     /// the running media path's output is the jack
     jack_is: bool,
+    /// a headset with a mic is plugged in: recordings use it (the daemon sets it; a change restarts recording)
+    pub headset: bool,
+    /// the running duplex path records from the headset's mic
+    headset_is: bool,
 }
 
 impl Audio {
@@ -585,6 +591,16 @@ impl Audio {
         }
     }
 
+    /// The port recordings come from: the headset's mic while the running duplex path uses it, else the DMIC.
+    fn mic_port(&self) -> (u16, u16, u32) {
+        if self.headset_is { HSMIC } else { MIC }
+    }
+
+    /// The running duplex path records from the headset's mic.
+    pub fn headset_is(&self) -> bool {
+        self.headset_is && self.is == Mode::Duplex
+    }
+
     /// The running media path plays on the jack.
     pub fn jack_is(&self) -> bool {
         self.jack_is && matches!(self.is, Mode::Media | Mode::Duplex)
@@ -595,6 +611,7 @@ impl Audio {
         matches!(self.is, Mode::Media | Mode::Duplex)
             && self.want == self.is
             && self.jack == self.jack_is
+            && (self.is != Mode::Duplex || (self.jack && self.headset) == self.headset_is)
             && self.idle()
             && !self.broken
     }
@@ -838,14 +855,25 @@ impl Audio {
             }
             Mode::Media | Mode::Duplex => {
                 q = alloc::vec![CoreReady];
-                if m == Mode::Duplex {
+                self.jack_is = self.jack;
+                self.headset_is = m == Mode::Duplex && self.jack && self.headset;
+                if self.headset_is {
+                    // the headset's mic: the codec's MCLK, its I2S port (the jack's output below shares the MCLK)
+                    q.extend([
+                        ClockHz(MCLK, MCLK_HZ, true),
+                        ClockHz(HSMIC, I2S_BCLK_HZ, true),
+                        I2sConfig(HSMIC),
+                        Port(HSMIC, true),
+                    ]);
+                } else if m == Mode::Duplex {
                     // the mic's port first, as a call
                     q.extend([Clock(MIC), TdmConfig(MIC), SlotMap(MIC), Port(MIC, true)]);
                 }
-                self.jack_is = self.jack;
                 if self.jack {
+                    if !self.headset_is {
+                        q.push(ClockHz(MCLK, MCLK_HZ, true));
+                    }
                     q.extend([
-                        ClockHz(MCLK, MCLK_HZ, true),
                         ClockHz(HPH, I2S_BCLK_HZ, true),
                         I2sConfig(HPH),
                         Port(HPH, true),
@@ -919,16 +947,18 @@ impl Audio {
                 }
                 q.push(Codecs(false));
                 if self.jack_is {
-                    q.extend([
-                        Port(HPH, false),
-                        ClockHz(HPH, I2S_BCLK_HZ, false),
-                        ClockHz(MCLK, MCLK_HZ, false),
-                    ]);
+                    q.extend([Port(HPH, false), ClockHz(HPH, I2S_BCLK_HZ, false)]);
                 } else {
                     q.push(Port(SPK, false));
                 }
                 if duplex {
-                    q.push(Port(MIC, false));
+                    q.push(Port(self.mic_port(), false));
+                    if self.headset_is {
+                        q.push(ClockHz(HSMIC, I2S_BCLK_HZ, false));
+                    }
+                }
+                if self.jack_is {
+                    q.push(ClockHz(MCLK, MCLK_HZ, false)); // last: both jack ports run from it
                 }
             }
             Mode::Ring => q.extend([
@@ -1115,7 +1145,8 @@ impl Audio {
             AdmOpenTx => {
                 let mut v = Vec::new();
                 // mode 2 = TX path, record
-                for h in [0u16, 2, MIC.1, 0] {
+                let mic = self.mic_port();
+                for h in [0u16, 2, mic.1, 0] {
                     v.extend_from_slice(&h.to_le_bytes());
                 }
                 v.extend_from_slice(&0x10312u32.to_le_bytes()); // ADM NULL_COPP_TOPOLOGY
@@ -1123,7 +1154,7 @@ impl Audio {
                 v.extend_from_slice(&16u16.to_le_bytes());
                 v.extend_from_slice(&48_000u32.to_le_bytes());
                 v.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
-                packet(SVC_ADM, MIC.1, MIC.1, u32::from(MIC.0) << 16, ADM_OPEN, &v)
+                packet(SVC_ADM, mic.1, mic.1, u32::from(mic.0) << 16, ADM_OPEN, &v)
             }
             AdmRouteTx => {
                 let mut v = Vec::new();
@@ -1141,9 +1172,9 @@ impl Audio {
             AsmCloseRead => packet(SVC_ASM, REC_PORT, REC_PORT, 2, ASM_CLOSE, &[]),
             AdmCloseTx => packet(
                 SVC_ADM,
-                MIC.1,
+                self.mic_port().1,
                 self.copp_tx,
-                u32::from(MIC.0) << 16,
+                u32::from(self.mic_port().0) << 16,
                 ADM_CLOSE,
                 &[],
             ),
@@ -1176,7 +1207,8 @@ impl Audio {
             }
         }
         // headphones in or out while media runs: stop it, and it starts again on the other port
-        let replug = matches!(self.is, Mode::Media | Mode::Duplex) && self.jack != self.jack_is;
+        let replug = matches!(self.is, Mode::Media | Mode::Duplex) && self.jack != self.jack_is
+            || self.is == Mode::Duplex && (self.jack && self.headset) != self.headset_is;
         if self.idle() && (self.want != self.is || replug) {
             if self.is == Mode::Off {
                 log(format_args!("apr: starting {:?}", self.want));
@@ -2265,5 +2297,49 @@ mod tests {
             .unwrap();
         assert!(stop < bclk_off && bclk_off < mclk_off && mclk_off < spk);
         assert!(a.running() && !a.jack_is());
+    }
+
+    #[test]
+    fn recording_with_a_headset_uses_its_mic_and_the_mclk_goes_last() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            jack: true,
+            headset: true,
+            ..Default::default()
+        };
+        a.set(Mode::Duplex);
+        let sent = run_packets(&mut a, 0);
+        assert!(a.running() && a.headset_is() && a.jack_is());
+        assert!(sent.contains(&afe_clock_hz(HSMIC, I2S_BCLK_HZ, true)));
+        assert!(sent.contains(&afe_i2s_config(HSMIC)));
+        assert!(sent.contains(&afe_start(HSMIC, true)));
+        assert!(
+            !sent.contains(&afe_start(MIC, true)),
+            "the built-in mic's port stays off"
+        );
+        assert_eq!(
+            sent.iter()
+                .filter(|p| **p == afe_clock_hz(MCLK, MCLK_HZ, true))
+                .count(),
+            1,
+            "one MCLK for both jack ports"
+        );
+        let tx = sent
+            .iter()
+            .filter(|p| opcode(p) == ADM_OPEN)
+            .find(|p| u16::from_le_bytes(p[22..24].try_into().unwrap()) == 2)
+            .unwrap();
+        assert_eq!(u16::from_le_bytes(tx[24..26].try_into().unwrap()), HSMIC.1);
+        // the headset unplugged: everything stops, the MCLK last, and recording starts again on the DMIC
+        a.jack = false;
+        a.headset = false;
+        let sent = run_packets(&mut a, 300);
+        let at = |p: &Vec<u8>| sent.iter().position(|x| x == p).unwrap();
+        assert!(at(&afe_start(HPH, false)) < at(&afe_start(HSMIC, false)));
+        assert!(
+            at(&afe_clock_hz(HSMIC, I2S_BCLK_HZ, false)) < at(&afe_clock_hz(MCLK, MCLK_HZ, false))
+        );
+        assert!(at(&afe_clock_hz(MCLK, MCLK_HZ, false)) < at(&afe_start(MIC, true)));
+        assert!(a.running() && !a.headset_is());
     }
 }

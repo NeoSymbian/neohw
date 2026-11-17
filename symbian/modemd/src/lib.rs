@@ -815,6 +815,9 @@ impl Daemon {
                 dprintln!("[modemd] audio: codecs probed for the jack -> {}", r);
             }
             let j = adsp::audio(8, 0);
+            if j >= 0 {
+                a.apr.headset = j & 2 != 0;
+            }
             if j >= 0 && (j & 1 != 0) != a.apr.jack {
                 a.apr.jack = j & 1 != 0;
                 dprintln!(

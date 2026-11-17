@@ -326,6 +326,8 @@ pub struct CallAudio {
     rec_logged: u32,
     /// the kernel's headphone path (op 9) is on: it goes off before the codecs (the ADSP's MCLK feeds it)
     jack_on: bool,
+    /// the kernel's headset-mic path (op 10) is on: off with the headphones
+    hsmic_on: bool,
 }
 
 impl CallAudio {
@@ -342,6 +344,7 @@ impl CallAudio {
             media_volume: 7,
             rec_logged: 0,
             jack_on: false,
+            hsmic_on: false,
         }
     }
 
@@ -518,11 +521,28 @@ impl CallAudio {
                             let r = audio(1, 3);
                             let j = audio(9, 1);
                             self.jack_on = j >= 0;
-                            if r < 0 { r } else { j }
+                            // recording from the headset: its mic's path too (op 10)
+                            let m = if self.apr.headset_is() {
+                                audio(10, 1)
+                            } else {
+                                0
+                            };
+                            self.hsmic_on = self.apr.headset_is() && m >= 0;
+                            if r < 0 {
+                                r
+                            } else if j < 0 {
+                                j
+                            } else {
+                                m
+                            }
                         } else {
                             audio(1, self.route())
                         }
                     } else {
+                        if core::mem::take(&mut self.hsmic_on) {
+                            let m = audio(10, 0);
+                            dprintln!("[modemd] audio: headset mic off -> {}", m);
+                        }
                         if core::mem::take(&mut self.jack_on) {
                             let j = audio(9, 0);
                             dprintln!("[modemd] audio: headphones off -> {}", j);
