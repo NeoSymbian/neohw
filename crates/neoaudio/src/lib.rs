@@ -12,7 +12,7 @@
 //! - [`op::INFO`] arg 0 = writable des8 of [`Info::SIZE`]: the stream's state, frames played/recorded, underruns.
 //!   An underrun (the queue ran dry while playing) is how a player learns its data has ended.
 //! - [`op::ROUTE`] arg 0 = [`route`]: where media plays when there is no call (all streams); [`op::MASTER`] arg 0 =
-//!   0..=10, the media's amp volume (all streams).
+//!   0..=10, the media's amp volume (all streams); [`op::MIC`] arg 0 = which microphone records (0 main, 1 second).
 //!
 //! Everything is mixed to [`RATE`] mono, the ADSP's stream format: a linear resampler per stream, volume, and a
 //! saturating sum. Recording is the reverse: the 48 kHz mono mic resampled to each stream's rate and channels.
@@ -42,6 +42,8 @@ pub mod op {
     pub const ROUTE: i32 = 8;
     /// arg 0 = the media's amp volume 0..=10 (all streams; the device's volume keys)
     pub const MASTER: i32 = 9;
+    /// arg 0 = the microphone: 0 the main one (the RT5514's DMIC1, calls use it), 1 DMIC2 (finding the top mic)
+    pub const MIC: i32 = 10;
 }
 
 pub mod flag {

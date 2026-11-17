@@ -49,6 +49,16 @@ pub const MEDIA_PERIOD: usize = 1920;
 pub const MEDIA_SLOTS: usize = 8;
 /// Leaving media waits this long for the periods in flight to come back before closing the stream anyway.
 const MEDIA_DRAIN_MS: u64 = 1000;
+/// Recording (A5): [`MEDIA_SLOTS`] read buffers of [`MEDIA_PERIOD`] bytes after the media periods; a second ASM
+/// session (port 0x0201) reads the mic's TX path (ADM from PRIMARY_TDM_TX), 48 kHz mono S16.
+pub const REC_OFFSET: u32 = 0x34000;
+const REC_PORT: u16 = 0x0201;
+// Wire facts: Linux sound/soc/qcom/qdsp6/q6asm.c (open read v3, the PCM encoder config block, read v2, read done v2)
+const ASM_OPEN_READ: u32 = 0x10db4;
+const ASM_READ: u32 = 0x10db5;
+const ASM_READ_DONE: u32 = 0x10d9a;
+const ASM_ENCDEC: u32 = 0x10c10;
+const ASM_ENC_CFG_PCM: u32 = 0x10da3;
 
 const RATE: f32 = 48_000.0;
 
@@ -396,6 +406,14 @@ enum Cmd {
     AsmClose,
     AsmUnmap,
     AdmClose,
+    AsmOpenRead,
+    AsmEncCfg,
+    AdmOpenTx,
+    AdmRouteTx,
+    AsmRunRead,
+    AsmPauseRead,
+    AsmCloseRead,
+    AdmCloseTx,
 }
 
 /// What the daemon does next.
@@ -422,6 +440,8 @@ pub enum Mode {
     Ring,
     /// NeoAudio's mix, streamed in periods
     Media,
+    /// Media and recording: the mic read in periods too (A5)
+    Duplex,
 }
 
 /// The audio state machine. Callers only say what they want ([`Audio::set`]); a running sequence is never cut
@@ -454,6 +474,12 @@ pub struct Audio {
     releases: Vec<(u32, u32)>,
     /// when leaving media started waiting for the periods in flight
     drain_since: Option<u64>,
+    /// the TX path's COPP (recording)
+    copp_tx: u16,
+    /// recording buffers the ADSP holds: (ticket, generation) per slot
+    rec: [Option<(u32, u32)>; MEDIA_SLOTS],
+    /// recorded buffers it gave back: (slot, ticket, generation, bytes), for the daemon to release and copy out
+    recorded: Vec<(usize, u32, u32, u32)>,
 }
 
 impl Audio {
@@ -498,10 +524,95 @@ impl Audio {
 
     /// Media: a free period slot to fill now (media runs and is staying), else None.
     pub fn media_slot(&self) -> Option<usize> {
-        if self.is != Mode::Media || self.want != Mode::Media || !self.idle() || self.broken {
+        if !self.streaming() {
             return None;
         }
         self.slots.iter().position(Option::is_none)
+    }
+
+    /// Media (or media and recording) runs and is staying.
+    fn streaming(&self) -> bool {
+        matches!(self.is, Mode::Media | Mode::Duplex)
+            && self.want == self.is
+            && self.idle()
+            && !self.broken
+    }
+
+    /// Recording: a free read buffer to hand the ADSP now, else None.
+    pub fn rec_slot(&self) -> Option<usize> {
+        if self.is != Mode::Duplex || !self.streaming() {
+            return None;
+        }
+        self.rec.iter().position(Option::is_none)
+    }
+
+    /// Where a read buffer is in the region.
+    pub fn rec_offset(slot: usize) -> u32 {
+        REC_OFFSET + (slot * MEDIA_PERIOD) as u32
+    }
+
+    pub fn rec_in_flight(&self) -> usize {
+        self.rec.iter().flatten().count()
+    }
+
+    /// The daemon published read buffer `slot` (ticket, generation): the ASM READ to send.
+    pub fn rec_read(&mut self, slot: usize, ticket: u32, generation: u32) -> Vec<u8> {
+        self.rec[slot] = Some((ticket, generation));
+        let mut v = Vec::new();
+        for w in [
+            self.pcm_phys + Self::rec_offset(slot),
+            ASM_SID,
+            self.map_handle,
+            MEDIA_PERIOD as u32,
+            ticket,
+        ] {
+            v.extend_from_slice(&w.to_le_bytes());
+        }
+        packet(SVC_ASM, REC_PORT, REC_PORT, ticket, ASM_READ, &v)
+    }
+
+    /// The daemon could not send a READ: the buffer is not the ADSP's.
+    pub fn rec_unsent(&mut self, slot: usize) {
+        if let Some((t, g)) = self.rec[slot].take() {
+            self.releases.push((t, g));
+        }
+    }
+
+    /// Buffers the ADSP filled: (slot, ticket, generation, bytes). Release each ticket, then copy the bytes out.
+    pub fn take_recorded(&mut self) -> Vec<(usize, u32, u32, u32)> {
+        core::mem::take(&mut self.recorded)
+    }
+
+    /// A READ_DONE for one of the read buffers: {status, address (2 words), handle, size, offset, ...}.
+    fn read_done(&mut self, r: &Rsp) -> bool {
+        let word = |i: usize| {
+            r.payload
+                .get(i..i + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        let (Some(status), Some(addr), Some(high), Some(size), Some(off)) =
+            (word(0), word(4), word(8), word(16), word(20))
+        else {
+            return false;
+        };
+        if high != ASM_SID {
+            return false;
+        }
+        let Some(i) = (0..MEDIA_SLOTS).find(|&i| {
+            self.pcm_phys + Self::rec_offset(i) == addr
+                && self.rec[i].is_some_and(|(t, _)| t == r.token)
+        }) else {
+            return false;
+        };
+        let (t, g) = self.rec[i].take().unwrap();
+        // a failed or odd read gives nothing; the buffer is released either way
+        let n = if status == 0 && off == 0 {
+            size.min(MEDIA_PERIOD as u32)
+        } else {
+            0
+        };
+        self.recorded.push((i, t, g, n));
+        true
     }
 
     /// Where a period slot is in the region.
@@ -633,9 +744,13 @@ impl Audio {
                     self.broken = true;
                 }
             }
-            Mode::Media => {
-                q = alloc::vec![
-                    CoreReady,
+            Mode::Media | Mode::Duplex => {
+                q = alloc::vec![CoreReady];
+                if m == Mode::Duplex {
+                    // the mic's port first, as a call
+                    q.extend([Clock(MIC), TdmConfig(MIC), SlotMap(MIC), Port(MIC, true)]);
+                }
+                q.extend([
                     Clock(SPK),
                     TdmConfig(SPK),
                     SlotMap(SPK),
@@ -645,9 +760,14 @@ impl Audio {
                     AsmFormat,
                     AdmOpen,
                     AdmRoute,
-                    Codecs(true),
-                    AsmRun
-                ];
+                ]);
+                if m == Mode::Duplex {
+                    q.extend([AsmOpenRead, AsmEncCfg, AdmOpenTx, AdmRouteTx]);
+                }
+                q.extend([Codecs(true), AsmRun]);
+                if m == Mode::Duplex {
+                    q.push(AsmRunRead);
+                }
                 if self.pcm_phys == 0 {
                     self.broken = true;
                 }
@@ -686,6 +806,18 @@ impl Audio {
             // answered and the ADSP's AFE stopped answering (C6 2026-11-09)
             Mode::Test => q.extend([
                 Loopback(false),
+                Codecs(false),
+                Port(SPK, false),
+                Port(MIC, false),
+            ]),
+            Mode::Duplex => q.extend([
+                AsmPause,
+                AsmPauseRead,
+                AsmClose,
+                AsmCloseRead,
+                AsmUnmap,
+                AdmClose,
+                AdmCloseTx,
                 Codecs(false),
                 Port(SPK, false),
                 Port(MIC, false),
@@ -840,6 +972,65 @@ impl Audio {
                 ADM_CLOSE,
                 &[],
             ),
+            AsmOpenRead => {
+                let mut v = Vec::new();
+                // mode 0 (legacy session), from the device matrix, no pre-processing, PCM v2, 16 bits
+                for w in [0u32, 0, 0x10c68, 0x10da5] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                v.extend_from_slice(&16u16.to_le_bytes());
+                v.extend_from_slice(&0u16.to_le_bytes());
+                packet(SVC_ASM, REC_PORT, REC_PORT, 2, ASM_OPEN_READ, &v)
+            }
+            AsmEncCfg => {
+                let mut v = Vec::new();
+                // {param id, size 28}, {frames per buffer 1, block size 20}, 1 channel, 16 bits, 48 kHz, signed, FC
+                for w in [ASM_ENC_CFG_PCM, 28, 1, 20] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                v.extend_from_slice(&1u16.to_le_bytes());
+                v.extend_from_slice(&16u16.to_le_bytes());
+                v.extend_from_slice(&48_000u32.to_le_bytes());
+                v.extend_from_slice(&1u16.to_le_bytes());
+                v.extend_from_slice(&0u16.to_le_bytes());
+                v.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
+                packet(SVC_ASM, REC_PORT, REC_PORT, 2, ASM_ENCDEC, &v)
+            }
+            AdmOpenTx => {
+                let mut v = Vec::new();
+                // mode 2 = TX path, record
+                for h in [0u16, 2, MIC.1, 0] {
+                    v.extend_from_slice(&h.to_le_bytes());
+                }
+                v.extend_from_slice(&0x10312u32.to_le_bytes()); // ADM NULL_COPP_TOPOLOGY
+                v.extend_from_slice(&1u16.to_le_bytes());
+                v.extend_from_slice(&16u16.to_le_bytes());
+                v.extend_from_slice(&48_000u32.to_le_bytes());
+                v.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
+                packet(SVC_ADM, MIC.1, MIC.1, u32::from(MIC.0) << 16, ADM_OPEN, &v)
+            }
+            AdmRouteTx => {
+                let mut v = Vec::new();
+                // the TX matrix (1): session 2 from this COPP
+                for w in [1u32, 1] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                for h in [2u16, 1, self.copp_tx, 0] {
+                    v.extend_from_slice(&h.to_le_bytes());
+                }
+                packet(SVC_ADM, 0, 0, 0, ADM_ROUTE, &v)
+            }
+            AsmRunRead => packet(SVC_ASM, REC_PORT, REC_PORT, 2, ASM_RUN, &[0; 12]),
+            AsmPauseRead => packet(SVC_ASM, REC_PORT, REC_PORT, 2, ASM_PAUSE, &[]),
+            AsmCloseRead => packet(SVC_ASM, REC_PORT, REC_PORT, 2, ASM_CLOSE, &[]),
+            AdmCloseTx => packet(
+                SVC_ADM,
+                MIC.1,
+                self.copp_tx,
+                u32::from(MIC.0) << 16,
+                ADM_CLOSE,
+                &[],
+            ),
             Codecs(_) | Publish => Vec::new(),
         }
     }
@@ -870,16 +1061,16 @@ impl Audio {
             if self.is == Mode::Off {
                 log(format_args!("apr: starting {:?}", self.want));
                 self.begin(self.want);
-            } else if self.is == Mode::Media
-                && self.media_in_flight() > 0
+            } else if matches!(self.is, Mode::Media | Mode::Duplex)
+                && self.media_in_flight() + self.rec_in_flight() > 0
                 && now.saturating_sub(*self.drain_since.get_or_insert(now)) < MEDIA_DRAIN_MS
             {
                 return Out::Nothing; // the periods in flight play out first
             } else {
-                if self.is == Mode::Media && self.media_in_flight() > 0 {
+                if self.media_in_flight() + self.rec_in_flight() > 0 {
                     log(format_args!(
                         "apr: {} media periods not given back; closing anyway (they stay unusable)",
-                        self.media_in_flight()
+                        self.media_in_flight() + self.rec_in_flight()
                     ));
                 }
                 self.drain_since = None;
@@ -959,6 +1150,9 @@ impl Audio {
         if r.svc == SVC_ASM && r.opcode == ASM_WRITTEN && self.media_written(&r) {
             return;
         }
+        if r.svc == SVC_ASM && r.opcode == ASM_READ_DONE && self.read_done(&r) {
+            return;
+        }
         let Some((op, _)) = self.waiting else {
             return; // an event, or a late answer
         };
@@ -977,10 +1171,27 @@ impl Audio {
                     | Cmd::AsmClose
                     | Cmd::AsmUnmap
                     | Cmd::AdmClose
+                    | Cmd::AsmOpenRead
+                    | Cmd::AsmEncCfg
+                    | Cmd::AdmOpenTx
+                    | Cmd::AdmRouteTx
+                    | Cmd::AsmRunRead
+                    | Cmd::AsmPauseRead
+                    | Cmd::AsmCloseRead
+                    | Cmd::AdmCloseTx
             )
         ) {
-            let expected = if matches!(current, Some(Cmd::AdmOpen | Cmd::AdmRoute | Cmd::AdmClose))
-            {
+            let expected = if matches!(
+                current,
+                Some(
+                    Cmd::AdmOpen
+                        | Cmd::AdmRoute
+                        | Cmd::AdmClose
+                        | Cmd::AdmOpenTx
+                        | Cmd::AdmRouteTx
+                        | Cmd::AdmCloseTx
+                )
+            ) {
                 SVC_ADM
             } else {
                 SVC_ASM
@@ -1002,7 +1213,7 @@ impl Audio {
                 }
                 return;
             }
-            if current == Some(Cmd::AdmOpen) && r.opcode == ADM_OPEN_RSP {
+            if matches!(current, Some(Cmd::AdmOpen | Cmd::AdmOpenTx)) && r.opcode == ADM_OPEN_RSP {
                 let status = r
                     .payload
                     .get(..4)
@@ -1014,7 +1225,11 @@ impl Audio {
                 if status != Some(0) || copp.is_none_or(|c| c == 255) {
                     self.failed(log);
                 } else {
-                    self.copp = copp.unwrap();
+                    if current == Some(Cmd::AdmOpen) {
+                        self.copp = copp.unwrap();
+                    } else {
+                        self.copp_tx = copp.unwrap();
+                    }
                     self.waiting = None;
                     self.at += 1;
                 }
@@ -1039,8 +1254,10 @@ impl Audio {
                 return;
             }
             // MAP/OPEN return handles in dedicated replies; basic success is not completion.
-            if matches!(current, Some(Cmd::AsmMap | Cmd::AdmOpen | Cmd::AsmWrite))
-                && r.result().is_some_and(|(_, s)| s == 0)
+            if matches!(
+                current,
+                Some(Cmd::AsmMap | Cmd::AdmOpen | Cmd::AdmOpenTx | Cmd::AsmWrite)
+            ) && r.result().is_some_and(|(_, s)| s == 0)
             {
                 return;
             }
@@ -1698,5 +1915,106 @@ mod tests {
     fn media_slots_fit_after_the_ringtone() {
         assert!(MEDIA_OFFSET as usize >= RING_BYTES);
         assert!(MEDIA_OFFSET as usize + MEDIA_SLOTS * MEDIA_PERIOD <= RING_REGION as usize);
+    }
+
+    /// Start a mode with the scripted ADSP and return the ops sent.
+    fn start(a: &mut Audio, m: Mode) -> Vec<u32> {
+        a.set(m);
+        let mut ops = Vec::new();
+        for now in 0..200 {
+            match a.poll(now, &mut |_| {}) {
+                Out::Send(p) => {
+                    ops.push(u32::from_le_bytes(p[16..20].try_into().unwrap()));
+                    ring_response(a, &p);
+                }
+                Out::Codecs(_) => a.codecs_done(true, &mut |_| {}),
+                Out::Nothing => {}
+                o => panic!("{o:?}"),
+            }
+        }
+        ops
+    }
+
+    fn read_done_for(a: &mut Audio, read: &[u8], status: u32, size: u32) {
+        let token = u32::from_le_bytes(read[12..16].try_into().unwrap());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&status.to_le_bytes());
+        payload.extend_from_slice(&read[20..28]); // the address, both words
+        payload.extend_from_slice(&read[28..32]); // the map handle
+        payload.extend_from_slice(&size.to_le_bytes());
+        payload.extend_from_slice(&[0; 24]);
+        let mut r = packet(SVC_ASM, REC_PORT, REC_PORT, token, ASM_READ_DONE, &payload);
+        r[4] = SVC_ASM;
+        r[5] = DOMAIN_ADSP;
+        a.handle(&r, &mut |_| {});
+    }
+
+    #[test]
+    fn duplex_opens_the_mic_path_and_reads_buffers() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 3,
+            ..Default::default()
+        };
+        let ops = start(&mut a, Mode::Duplex);
+        let at = |o: u32| ops.iter().position(|x| *x == o).unwrap();
+        assert!(at(ASM_OPEN) < at(ASM_OPEN_READ));
+        assert!(at(ASM_OPEN_READ) < at(ASM_ENCDEC));
+        assert_eq!(ops.iter().filter(|o| **o == ADM_OPEN).count(), 2);
+        assert_eq!(*ops.last().unwrap(), ASM_RUN);
+        assert!(a.running());
+        assert!(a.media_slot().is_some());
+        let slot = a.rec_slot().unwrap();
+        let read = a.rec_read(slot, 21, 3);
+        assert_eq!(
+            u32::from_le_bytes(read[20..24].try_into().unwrap()),
+            0x9000_0000 + REC_OFFSET
+        );
+        // another buffer's done, then this one's
+        let mut other = read.clone();
+        other[20] ^= 0x40;
+        read_done_for(&mut a, &other, 0, 1920);
+        assert!(a.take_recorded().is_empty());
+        read_done_for(&mut a, &read, 0, 1920);
+        assert_eq!(a.take_recorded(), alloc::vec![(slot, 21, 3, 1920)]);
+        assert_eq!(a.rec_in_flight(), 0);
+        // a failed read releases its buffer with no bytes
+        let read = a.rec_read(1, 22, 3);
+        read_done_for(&mut a, &read, 1, 1920);
+        assert_eq!(a.take_recorded(), alloc::vec![(1, 22, 3, 0)]);
+    }
+
+    #[test]
+    fn media_has_no_read_buffers_and_leaving_duplex_drains_reads() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 3,
+            ..Default::default()
+        };
+        let ops = start(&mut a, Mode::Media);
+        assert!(!ops.contains(&ASM_OPEN_READ));
+        assert_eq!(a.rec_slot(), None);
+        let mut b = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 3,
+            ..Default::default()
+        };
+        start(&mut b, Mode::Duplex);
+        let read = b.rec_read(0, 30, 3);
+        b.set(Mode::Media);
+        assert_eq!(b.rec_slot(), None, "no new reads while leaving");
+        assert_eq!(b.poll(500, &mut |_| {}), Out::Nothing);
+        read_done_for(&mut b, &read, 0, 1920);
+        assert_eq!(b.take_recorded().len(), 1);
+        let Out::Send(p) = b.poll(501, &mut |_| {}) else {
+            panic!()
+        };
+        assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), ASM_PAUSE);
+    }
+
+    #[test]
+    fn read_buffers_fit_after_the_media_periods() {
+        assert!(REC_OFFSET as usize >= MEDIA_OFFSET as usize + MEDIA_SLOTS * MEDIA_PERIOD);
+        assert!(REC_OFFSET as usize + MEDIA_SLOTS * MEDIA_PERIOD <= RING_REGION as usize);
     }
 }

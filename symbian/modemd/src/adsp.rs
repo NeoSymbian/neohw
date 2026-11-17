@@ -483,11 +483,12 @@ impl CallAudio {
                     let r = if on {
                         let v = match self.apr.is() {
                             Mode::Ring => self.ring.volume,
-                            Mode::Media => self.media_volume,
+                            Mode::Media | Mode::Duplex => self.media_volume,
                             _ => self.volume,
                         };
                         let r = audio(4, v as u32);
-                        let mute = audio(5, self.muted as u32);
+                        // the call's Mute is the call's: a recording hears the mic
+                        let mute = audio(5, (self.muted && self.apr.is() == Mode::Call) as u32);
                         if r < 0 {
                             r
                         } else if mute < 0 {
@@ -510,13 +511,83 @@ impl CallAudio {
         }
     }
 
+    /// Recording runs on the ADSP: hand it every free read buffer, then release the filled ones and copy them out.
+    /// What was recorded (48 kHz mono), in order.
+    pub fn rec_feed(&mut self) -> Vec<i16> {
+        use modem_proto::apr::{self, MEDIA_PERIOD};
+        let mut mic = Vec::new();
+        let mut bytes = [0u8; MEDIA_PERIOD];
+        for (slot, ticket, generation, n) in self.apr.take_recorded() {
+            let r = hal_io(
+                crate::AUDIO_MEM,
+                Io {
+                    a: 3,
+                    b: ticket,
+                    buf: generation,
+                    ..Io::default()
+                },
+            )
+            .0;
+            if r < 0 {
+                dprintln!("[modemd] rec: release slot {} -> {}", slot, r);
+                continue;
+            }
+            if n == 0 {
+                continue;
+            }
+            let (r, _) = hal_io(
+                crate::AUDIO_MEM,
+                Io {
+                    a: 4,
+                    b: apr::Audio::rec_offset(slot),
+                    len: n,
+                    buf: bytes.as_mut_ptr() as u32,
+                },
+            );
+            if r < 0 {
+                dprintln!("[modemd] rec: copy out slot {} -> {}", slot, r);
+                continue;
+            }
+            mic.extend(
+                bytes[..n as usize]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| i16::from_le_bytes(*b)),
+            );
+        }
+        while let Some(slot) = self.apr.rec_slot() {
+            let off = apr::Audio::rec_offset(slot);
+            let (r, info) = hal_io(
+                crate::AUDIO_MEM,
+                Io {
+                    a: 2,
+                    b: off,
+                    len: MEDIA_PERIOD as u32,
+                    buf: 0,
+                },
+            );
+            if r < 0 {
+                dprintln!("[modemd] rec: publish slot {} -> {}", slot, r);
+                break;
+            }
+            let p = self.apr.rec_read(slot, info.b, info.buf);
+            if let Err(e) = send(RING_APR, &p) {
+                dprintln!("[modemd] rec: read slot {} not sent ({})", slot, e);
+                self.apr.rec_unsent(slot);
+                break;
+            }
+        }
+        mic
+    }
+
     /// The route the codecs take (the kernel's: 0 earpiece, 1 both amps, 2 bottom): the test's while the test
     /// runs, the ringtone's loudspeaker, media's own, else the call's Speaker button.
     pub fn route(&self) -> u32 {
         match self.apr.is() {
             Mode::Test => self.test.unwrap_or(true) as u32,
             Mode::Ring => 1,
-            Mode::Media => self.media_route,
+            Mode::Media | Mode::Duplex => self.media_route,
             _ => self.speaker as u32,
         }
     }

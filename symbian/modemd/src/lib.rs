@@ -333,6 +333,8 @@ struct Daemon {
     sms_buzz_at: u64,
     /// NeoAudio's streams and mixer (docs/audio.md)
     sound: sound::Sound,
+    /// the last amp protection poll (ms)
+    amps_checked: u64,
 }
 
 impl Daemon {
@@ -775,7 +777,7 @@ impl Daemon {
         let now = time::millis();
         let up = matches!(self.adsp, adsp::Adsp::Up);
         let a = &mut self.audio;
-        let playing = up && a.apr.is() == Mode::Media && a.apr.running();
+        let playing = up && matches!(a.apr.is(), Mode::Media | Mode::Duplex) && a.apr.running();
         if self.sound.changed {
             self.sound.changed = false;
             a.media_route = match self.sound.route {
@@ -784,6 +786,11 @@ impl Daemon {
                 _ => 1,
             };
             a.media_volume = self.sound.master;
+            // the mic choice is the kernel's own state: set it now, running or not (a call keeps DMIC1)
+            if a.apr.is() != Mode::Call {
+                let r = adsp::audio(6, self.sound.mic as u32);
+                dprintln!("[modemd] media: mic DMIC{} -> {}", self.sound.mic + 1, r);
+            }
             if playing {
                 let r = adsp::audio(3, a.media_route);
                 let v = adsp::audio(4, u32::from(a.media_volume));
@@ -796,7 +803,21 @@ impl Daemon {
                 );
             }
         }
-        let starting = up && !playing && a.apr.wanted() == Mode::Media && !a.apr.failed_hard();
+        // amp protection (A7): the kernel polls the amps' IRQ lines; a protection event switches that amp off
+        if up && a.apr.running() && now >= self.amps_checked + 250 {
+            self.amps_checked = now;
+            let r = adsp::audio(7, 0);
+            if r > 0 {
+                dprintln!(
+                    "[modemd] audio: amp protection event (mask {}): that amp is off until the next start",
+                    r
+                );
+            }
+        }
+        let starting = up
+            && !playing
+            && matches!(a.apr.wanted(), Mode::Media | Mode::Duplex)
+            && !a.apr.failed_hard();
         self.sound
             .step(now, if playing { Some(a) } else { None }, starting);
     }
@@ -1116,10 +1137,11 @@ impl Daemon {
             (true, true, _, _) => Mode::Call,
             (true, false, _, true) => Mode::Ring,
             (true, false, Some(_), false) => Mode::Test,
+            (true, false, None, false) if media && self.sound.wants_record() => Mode::Duplex,
             (true, false, None, false) if media => Mode::Media,
             (true, false, None, false) => Mode::Off,
         };
-        self.sound.preempted = media && wanted != Mode::Media;
+        self.sound.preempted = media && !matches!(wanted, Mode::Media | Mode::Duplex);
         let audio = (wanted, self.audio.apr.is(), self.audio.apr.quiescent());
         if self.audio_seen != Some(audio) {
             dprintln!(
@@ -1713,6 +1735,7 @@ fn main() -> i32 {
         sms_tone_until: 0,
         sms_buzz_at: 0,
         sound: sound::Sound::new(),
+        amps_checked: 0,
     };
     // Ordinary C: settings only; modem EFS remains RAM-backed (G4).
     if let Ok(fs) = e32::fs::Fs::connect() {

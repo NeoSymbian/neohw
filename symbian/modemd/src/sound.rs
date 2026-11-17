@@ -36,6 +36,8 @@ pub struct Sound {
     pub route: i32,
     /// the media's amp volume 0..=10
     pub master: u8,
+    /// the microphone recordings use: 0 DMIC1, 1 DMIC2 (the kernel's op 6)
+    pub mic: i32,
     /// media wanted until (ms)
     active_until: u64,
     /// when media was first wanted, while it is not playing on the ADSP yet
@@ -55,6 +57,7 @@ impl Sound {
             next_session: 0,
             route: neoaudio::route::SPEAKER,
             master: 7,
+            mic: 0,
             active_until: 0,
             wanted_since: None,
             clock_ms: 0,
@@ -68,12 +71,17 @@ impl Sound {
         self.slots.iter_mut().filter_map(|s| s.stream.as_mut())
     }
 
-    /// Whether the media path should run: something plays now, or did within [`LINGER_MS`].
+    /// Whether the media path should run: something plays now, or did within [`LINGER_MS`], or records.
     pub fn wants_media(&mut self, now: u64) -> bool {
         if self.streams().any(|s| s.active()) {
             self.active_until = now + LINGER_MS;
         }
-        now < self.active_until
+        now < self.active_until || self.wants_record()
+    }
+
+    /// Whether a stream records (the mic's path runs with media: Duplex).
+    pub fn wants_record(&mut self) -> bool {
+        self.streams().any(|s| s.record && !s.paused)
     }
 
     /// One step: the mix goes to the ADSP when `dsp` (media runs there) is given, else to the clock sink, unless
@@ -89,6 +97,10 @@ impl Sound {
                 a.media_feed(|out| {
                     neoaudio::mix(slots.iter_mut().filter_map(|s| s.stream.as_mut()), out);
                 });
+                let mic = a.rec_feed();
+                if !mic.is_empty() {
+                    neoaudio::capture(self.streams(), &mic);
+                }
             }
             None => {
                 let since = *self.wanted_since.get_or_insert(now);
@@ -102,7 +114,7 @@ impl Sound {
                 if !hold && ms > 0 {
                     let mut out = vec![0i16; (ms * u64::from(neoaudio::RATE) / 1000) as usize];
                     neoaudio::mix(self.streams(), &mut out);
-                    // shortcut: the mic is silence until recording through the ADSP (A5)
+                    // no ADSP path (QEMU, a call, the ringtone): recordings get silence, in real time
                     out.fill(0);
                     neoaudio::capture(self.streams(), &out);
                 }
@@ -194,7 +206,8 @@ impl Service for Sound {
     }
 
     fn message(&mut self, session: &mut u32, msg: Message) {
-        let (route, master) = (self.route, self.master);
+        let (route, master, mic) = (self.route, self.master, self.mic);
+        let mut new_mic = None;
         let sink = self.sink;
         let preempted = self.preempted;
         let mut new_route = None;
@@ -304,8 +317,21 @@ impl Service for Sound {
                     neoaudio::err::ARGUMENT
                 }
             }
+            op::MIC => {
+                let v = msg.int(0);
+                if (0..=1).contains(&v) {
+                    new_mic = (v != mic).then_some(v);
+                    err::KERR_NONE
+                } else {
+                    neoaudio::err::ARGUMENT
+                }
+            }
             _ => neoaudio::err::ARGUMENT,
         };
+        if let Some(m) = new_mic {
+            self.mic = m;
+            self.changed = true;
+        }
         if let Some(r) = new_route {
             self.route = r;
             self.changed = true;
