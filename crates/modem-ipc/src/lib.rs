@@ -28,7 +28,7 @@
 
 pub const NAME: &str = "NeoModem";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (2, 3, 0);
+pub const VERSION: (i8, i8, i16) = (2, 5, 0);
 
 pub mod op {
     pub const STATUS: i32 = 1;
@@ -67,8 +67,9 @@ pub mod op {
     /// arg0 des8: known-number hashes, u32 LE each.
     pub const KNOWN_SET: i32 = 23;
     /// arg0 des8: the recipient (digits, an optional leading +); arg1 des8: the text (UTF-8, at most
-    /// [`super::sms::MAX_TEXT`] bytes). Completes with the new message's id (> 0), or KErrArgument (-6) for a number
-    /// or text it can't send (more than 10 parts).
+    /// [`super::sms::MAX_TEXT`] bytes). Completes with the new message's id (> 0), KErrArgument (-6) for a number it
+    /// can't send to, or (2.5) KErrTooBig (-40) for a text over 10 parts or empty. A message that then fails says
+    /// why in its record ([`super::sms`] `FAIL_*`).
     pub const SMS_SEND: i32 = 24;
     /// arg0 writable des8; arg1 the revision the client has (0 = everything); arg2 [`super::sms`] `READ_*`. Writes
     /// the records changed since that revision, oldest change first, as many as fit (whole [`super::SmsEntry`]s).
@@ -110,6 +111,23 @@ pub mod sms {
     pub const EDIT_DELETE_BLOCKED: i32 = 6;
     /// every message read (the id is ignored)
     pub const EDIT_ALL_READ: i32 = 7;
+    /// (2.4) every message with that message's number archived: Messages lists the thread under Archived; a new
+    /// message from that number brings it back
+    pub const EDIT_ARCHIVE_THREAD: i32 = 8;
+    pub const EDIT_UNARCHIVE_THREAD: i32 = 9;
+    /// (2.5) that message's sender: its blocked messages become read ones in its conversation (Unblock sender)
+    pub const EDIT_UNBLOCK_SENDER: i32 = 10;
+    /// (2.5) every message but the blocked ones (Delete conversations; the id is ignored)
+    pub const EDIT_DELETE_ALL: i32 = 11;
+
+    /// (2.5) why a [`FAILED`] message failed, in [`super::SmsEntry::why`] (0: unknown, a 2.4 record)
+    pub const FAIL_NO_ANSWER: u8 = 1;
+    /// the network or the modem refused it (no service, barred, the SIM not ready)
+    pub const FAIL_REFUSED: u8 = 2;
+    /// MODEMD restarted while it was being sent
+    pub const FAIL_RESTART: u8 = 3;
+    /// a status report said it could not be delivered
+    pub const FAIL_UNDELIVERED: u8 = 4;
 
     pub const ALERT_TONE_VIBRATE: u8 = 0;
     pub const ALERT_VIBRATE: u8 = 1;
@@ -134,12 +152,15 @@ pub struct SmsEntry {
     pub done_utc: i64,
     /// [`sms`] state
     pub state: u8,
-    /// why a [`sms::BLOCKED`] message was blocked (`phone_rules::block::why`)
+    /// why a [`sms::BLOCKED`] message was blocked (`phone_rules::block::why`), or (2.5) why a [`sms::FAILED`] one
+    /// failed (`sms::FAIL_*`)
     pub why: u8,
     /// the SMS it took
     pub parts: u8,
     pub unicode: bool,
     pub incoming: bool,
+    /// (2.4) its thread is archived ([`sms::EDIT_ARCHIVE_THREAD`]); on the wire, bit 1 of the `incoming` byte
+    pub archived: bool,
     /// the other side: digits with an optional +, or an alphanumeric sender
     pub number: Text,
 }
@@ -161,7 +182,7 @@ impl SmsEntry {
             self.why,
             self.parts,
             self.unicode as u8,
-            self.incoming as u8,
+            self.incoming as u8 | (self.archived as u8) << 1,
         ]);
         b[29] = self.number.len;
         b[30..62].copy_from_slice(&self.number.buf);
@@ -190,7 +211,8 @@ impl SmsEntry {
             why: h[25],
             parts: h[26],
             unicode: h[27] != 0,
-            incoming: h[28] != 0,
+            incoming: h[28] & 1 != 0,
+            archived: h[28] & 2 != 0,
             number: Text { len, buf },
         };
         Some((e, text, Self::HEAD + 2 + n))
@@ -777,12 +799,25 @@ mod tests {
             parts: 2,
             unicode: true,
             incoming: false,
+            archived: false,
             number: Text::new("+37491234567"),
         };
         let mut buf = [0u8; 200];
         let n = e.write("Բարև", &mut buf).unwrap();
         assert_eq!(n, SmsEntry::HEAD + 2 + 8);
         assert_eq!(SmsEntry::read(&buf[..n]), Some((e, "Բարև", n)));
+        // 2.4: archived rides in bit 1 of the incoming byte; a 2.3 record (0 or 1 there) reads as not archived
+        for (incoming, archived) in [(true, true), (false, true), (true, false)] {
+            let a = SmsEntry {
+                incoming,
+                archived,
+                ..e
+            };
+            let mut b = [0u8; 80];
+            a.write("x", &mut b).unwrap();
+            assert_eq!(b[28], incoming as u8 | (archived as u8) << 1);
+            assert_eq!(SmsEntry::read(&b).map(|r| r.0), Some(a));
+        }
         assert_eq!(SmsEntry::read(&buf[..n - 1]), None);
         assert_eq!(e.write("Բարև", &mut buf[..n - 1]), None);
         let s = SmsSettings {

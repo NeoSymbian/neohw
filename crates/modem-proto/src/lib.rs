@@ -122,6 +122,7 @@ const POLL_MS: u64 = 30_000;
 const POST_CALL_MS: u64 = 30_000;
 pub const KERR_NOT_READY: i32 = -18;
 pub const KERR_ARGUMENT: i32 = -6;
+pub const KERR_TOO_BIG: i32 = -40;
 pub const KERR_IN_USE: i32 = -14;
 
 /// A server the modem announced: service, version|instance word, node, port.
@@ -921,11 +922,11 @@ impl Modem {
         self.send_next_sms(p);
     }
 
-    fn sms_send_failed(&mut self, p: &mut dyn Platform, id: u32) {
-        p.log(format_args!("wms: message {id} not sent"));
+    fn sms_send_failed(&mut self, p: &mut dyn Platform, id: u32, why: u8) {
+        p.log(format_args!("wms: message {id} not sent ({why})"));
         self.sms_in_flight = None;
         self.sms_out.retain(|o| o.0 != id);
-        self.sms.failed(id);
+        self.sms.failed(id, why);
         self.sms_status();
         self.send_next_sms(p);
     }
@@ -933,10 +934,13 @@ impl Modem {
     /// modem_ipc::op::SMS_SEND: the new message's id. It waits in the queue while the modem isn't up.
     pub fn sms_send(&mut self, p: &mut dyn Platform, to: &str, text: &str) -> Result<u32, i32> {
         if text.len() > modem_ipc::sms::MAX_TEXT {
-            return Err(KERR_ARGUMENT);
+            return Err(KERR_TOO_BIG);
         }
         let utc = p.utc_ms();
-        let (id, pdus) = self.sms.send(to, text, utc).map_err(|_| KERR_ARGUMENT)?;
+        let (id, pdus) = self.sms.send(to, text, utc).map_err(|e| match e {
+            sms::Error::BadLength => KERR_TOO_BIG,
+            sms::Error::BadNumber => KERR_ARGUMENT,
+        })?;
         self.sms_out.push((id, pdus, 0));
         self.sms_status();
         self.send_next_sms(p);
@@ -1180,7 +1184,7 @@ impl Modem {
             && now_ms.saturating_sub(since) >= SMS_SEND_MS
         {
             p.log(format_args!("wms: message {id} got no answer"));
-            self.sms_send_failed(p, id);
+            self.sms_send_failed(p, id, modem_ipc::sms::FAIL_NO_ANSWER);
         }
         let registered = matches!(
             self.status.reg,
@@ -1785,7 +1789,7 @@ impl Modem {
                 && let Some((id, txn, _, _)) = self.sms_in_flight
                 && txn == m.txn
             {
-                self.sms_send_failed(p, id);
+                self.sms_send_failed(p, id, modem_ipc::sms::FAIL_REFUSED);
             }
             if service == WMS {
                 self.sms_reads.retain(|r| r.0 != m.txn);
