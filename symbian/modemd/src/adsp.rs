@@ -319,6 +319,9 @@ pub struct CallAudio {
     pub test: Option<bool>,
     pub ring: modem_proto::modem_ipc::Ring,
     ring_loaded: bool,
+    /// NeoAudio's media: the kernel route (0 earpiece, 1 both amps, 2 bottom) and amp volume 0..=10
+    pub media_route: u32,
+    pub media_volume: u8,
 }
 
 impl CallAudio {
@@ -331,6 +334,69 @@ impl CallAudio {
             test: None,
             ring: Default::default(),
             ring_loaded: false,
+            media_route: 1,
+            media_volume: 7,
+        }
+    }
+
+    /// The kernel region's address, for media (the ringtone's preparation finds it too).
+    pub fn prepare_region(&mut self) -> Result<(), i32> {
+        if self.apr.pcm_phys != 0 {
+            return Ok(());
+        }
+        let (r, info) = hal_io(crate::AUDIO_MEM, Io::default());
+        if r < 0 {
+            return Err(r);
+        }
+        self.apr.pcm_phys = info.b;
+        self.apr.pcm_generation = info.buf;
+        Ok(())
+    }
+
+    /// Media runs on the ADSP: fill every free period with `fill` (48 kHz mono), copy it into its range of the
+    /// kernel region, publish that range and send its ASM WRITE.
+    pub fn media_feed(&mut self, mut fill: impl FnMut(&mut [i16])) {
+        use modem_proto::apr::{self, MEDIA_PERIOD};
+        let mut pcm = [0i16; MEDIA_PERIOD / 2];
+        let mut bytes = [0u8; MEDIA_PERIOD];
+        while let Some(slot) = self.apr.media_slot() {
+            fill(&mut pcm);
+            for (b, s) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(pcm) {
+                *b = s.to_le_bytes();
+            }
+            let off = apr::Audio::media_offset(slot);
+            let (r, _) = hal_io(
+                crate::AUDIO_MEM,
+                Io {
+                    a: 1,
+                    b: off,
+                    len: MEDIA_PERIOD as u32,
+                    buf: bytes.as_ptr() as u32,
+                },
+            );
+            if r < 0 {
+                dprintln!("[modemd] media: copy into slot {} -> {}", slot, r);
+                return;
+            }
+            let (r, info) = hal_io(
+                crate::AUDIO_MEM,
+                Io {
+                    a: 2,
+                    b: off,
+                    len: MEDIA_PERIOD as u32,
+                    buf: 0,
+                },
+            );
+            if r < 0 {
+                dprintln!("[modemd] media: publish slot {} -> {}", slot, r);
+                return;
+            }
+            let p = self.apr.media_write(slot, info.b, info.buf);
+            if let Err(e) = send(RING_APR, &p) {
+                dprintln!("[modemd] media: write slot {} not sent ({})", slot, e);
+                self.apr.media_unsent(slot);
+                return;
+            }
         }
     }
 
@@ -415,10 +481,10 @@ impl CallAudio {
                 }
                 modem_proto::apr::Out::Codecs(on) => {
                     let r = if on {
-                        let v = if self.apr.is() == Mode::Ring {
-                            self.ring.volume
-                        } else {
-                            self.volume
+                        let v = match self.apr.is() {
+                            Mode::Ring => self.ring.volume,
+                            Mode::Media => self.media_volume,
+                            _ => self.volume,
                         };
                         let r = audio(4, v as u32);
                         let mute = audio(5, self.muted as u32);
@@ -427,7 +493,7 @@ impl CallAudio {
                         } else if mute < 0 {
                             mute
                         } else {
-                            audio(1, self.loudspeaker() as u32)
+                            audio(1, self.route())
                         }
                     } else {
                         audio(2, 0)
@@ -444,12 +510,14 @@ impl CallAudio {
         }
     }
 
-    /// The route the codecs take: the test's while the test runs, else the call's Speaker button.
-    pub fn loudspeaker(&self) -> bool {
+    /// The route the codecs take (the kernel's: 0 earpiece, 1 both amps, 2 bottom): the test's while the test
+    /// runs, the ringtone's loudspeaker, media's own, else the call's Speaker button.
+    pub fn route(&self) -> u32 {
         match self.apr.is() {
-            Mode::Test => self.test.unwrap_or(true),
-            Mode::Ring => true,
-            _ => self.speaker,
+            Mode::Test => self.test.unwrap_or(true) as u32,
+            Mode::Ring => 1,
+            Mode::Media => self.media_route,
+            _ => self.speaker as u32,
         }
     }
 

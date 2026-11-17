@@ -41,6 +41,14 @@ const RING_PORT: u16 = 0x0101;
 pub const RING_BYTES: usize = 192_000;
 /// The ASM-mapped region (the kernel's KAudioBytes).
 pub const RING_REGION: u32 = 0x40000;
+/// Media (NeoAudio, docs/audio.md): [`MEDIA_SLOTS`] periods of [`MEDIA_PERIOD`] bytes, after the ringtone's bytes in
+/// the same region, each published to the ADSP on its own (the kernel's per-range AudioMem tickets).
+pub const MEDIA_OFFSET: u32 = 0x30000;
+/// 20 ms of 48 kHz mono S16
+pub const MEDIA_PERIOD: usize = 1920;
+pub const MEDIA_SLOTS: usize = 8;
+/// Leaving media waits this long for the periods in flight to come back before closing the stream anyway.
+const MEDIA_DRAIN_MS: u64 = 1000;
 
 const RATE: f32 = 48_000.0;
 
@@ -412,6 +420,8 @@ pub enum Mode {
     Call,
     Test,
     Ring,
+    /// NeoAudio's mix, streamed in periods
+    Media,
 }
 
 /// The audio state machine. Callers only say what they want ([`Audio::set`]); a running sequence is never cut
@@ -438,6 +448,12 @@ pub struct Audio {
     ticket: u32,
     release: bool,
     last_token: u32,
+    /// media periods the ADSP holds: (ticket, generation) per slot
+    slots: [Option<(u32, u32)>; MEDIA_SLOTS],
+    /// media periods it gave back, to release in the kernel
+    releases: Vec<(u32, u32)>,
+    /// when leaving media started waiting for the periods in flight
+    drain_since: Option<u64>,
 }
 
 impl Audio {
@@ -480,8 +496,79 @@ impl Audio {
         }
     }
 
+    /// Media: a free period slot to fill now (media runs and is staying), else None.
+    pub fn media_slot(&self) -> Option<usize> {
+        if self.is != Mode::Media || self.want != Mode::Media || !self.idle() || self.broken {
+            return None;
+        }
+        self.slots.iter().position(Option::is_none)
+    }
+
+    /// Where a period slot is in the region.
+    pub fn media_offset(slot: usize) -> u32 {
+        MEDIA_OFFSET + (slot * MEDIA_PERIOD) as u32
+    }
+
+    pub fn media_in_flight(&self) -> usize {
+        self.slots.iter().flatten().count()
+    }
+
+    /// The daemon copied a period into `slot` and published it (ticket, generation): the ASM WRITE to send.
+    pub fn media_write(&mut self, slot: usize, ticket: u32, generation: u32) -> Vec<u8> {
+        self.slots[slot] = Some((ticket, generation));
+        let mut v = Vec::new();
+        for w in [
+            self.pcm_phys + Self::media_offset(slot),
+            ASM_SID,
+            self.map_handle,
+            MEDIA_PERIOD as u32,
+            ticket,
+            0,
+            0,
+            0,
+        ] {
+            v.extend_from_slice(&w.to_le_bytes());
+        }
+        packet(SVC_ASM, RING_PORT, RING_PORT, ticket, ASM_WRITE, &v)
+    }
+
+    /// The daemon could not send a media WRITE: the period is not the ADSP's, release it.
+    pub fn media_unsent(&mut self, slot: usize) {
+        if let Some(t) = self.slots[slot].take() {
+            self.releases.push(t);
+        }
+    }
+
+    /// A WRITE_DONE for one of the media periods (its address and ticket): released. False if it is not one.
+    fn media_written(&mut self, r: &Rsp) -> bool {
+        let word = |i: usize| {
+            r.payload
+                .get(i..i + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        let (Some(addr), Some(high)) = (word(0), word(4)) else {
+            return false;
+        };
+        if high != ASM_SID {
+            return false;
+        }
+        let Some(i) = (0..MEDIA_SLOTS).find(|&i| {
+            self.pcm_phys + Self::media_offset(i) == addr
+                && self.slots[i].is_some_and(|(t, _)| t == r.token)
+        }) else {
+            return false;
+        };
+        self.releases.push(self.slots[i].take().unwrap());
+        true
+    }
+
     pub fn set(&mut self, want: Mode) {
         self.want = want;
+    }
+
+    /// The mode asked for.
+    pub fn wanted(&self) -> Mode {
+        self.want
     }
 
     /// The mode running (or being started); Off while stopping.
@@ -546,6 +633,25 @@ impl Audio {
                     self.broken = true;
                 }
             }
+            Mode::Media => {
+                q = alloc::vec![
+                    CoreReady,
+                    Clock(SPK),
+                    TdmConfig(SPK),
+                    SlotMap(SPK),
+                    Port(SPK, true),
+                    AsmMap,
+                    AsmOpen,
+                    AsmFormat,
+                    AdmOpen,
+                    AdmRoute,
+                    Codecs(true),
+                    AsmRun
+                ];
+                if self.pcm_phys == 0 {
+                    self.broken = true;
+                }
+            }
             Mode::Off => q.clear(),
         }
         self.queue = q;
@@ -584,7 +690,7 @@ impl Audio {
                 Port(SPK, false),
                 Port(MIC, false),
             ]),
-            Mode::Ring => q.extend([
+            Mode::Ring | Mode::Media => q.extend([
                 AsmPause,
                 AsmClose,
                 AsmUnmap,
@@ -744,6 +850,9 @@ impl Audio {
             self.release = false;
             return Out::Complete(self.ticket, self.pcm_generation);
         }
+        if let Some((t, g)) = self.releases.pop() {
+            return Out::Complete(t, g);
+        }
         if self.broken {
             return Out::Nothing;
         }
@@ -761,7 +870,19 @@ impl Audio {
             if self.is == Mode::Off {
                 log(format_args!("apr: starting {:?}", self.want));
                 self.begin(self.want);
+            } else if self.is == Mode::Media
+                && self.media_in_flight() > 0
+                && now.saturating_sub(*self.drain_since.get_or_insert(now)) < MEDIA_DRAIN_MS
+            {
+                return Out::Nothing; // the periods in flight play out first
             } else {
+                if self.is == Mode::Media && self.media_in_flight() > 0 {
+                    log(format_args!(
+                        "apr: {} media periods not given back; closing anyway (they stay unusable)",
+                        self.media_in_flight()
+                    ));
+                }
+                self.drain_since = None;
                 log(format_args!("apr: stopping {:?}", self.is));
                 self.end();
             }
@@ -835,6 +956,9 @@ impl Audio {
             log(format_args!("apr: bad packet ({} bytes)", packet.len()));
             return;
         };
+        if r.svc == SVC_ASM && r.opcode == ASM_WRITTEN && self.media_written(&r) {
+            return;
+        }
         let Some((op, _)) = self.waiting else {
             return; // an event, or a late answer
         };
@@ -1439,5 +1563,140 @@ mod tests {
         assert_eq!(a.poll(200, &mut |_| {}), Out::Nothing);
         // A fresh owner is created only after the kernel confirms DSP stop.
         assert!(Audio::default().quiescent());
+    }
+
+    /// The WRITE_DONE the ADSP sends for a media WRITE packet.
+    fn media_done(a: &mut Audio, w: &[u8]) {
+        let token = u32::from_le_bytes(w[12..16].try_into().unwrap());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&w[20..28]); // its address, both words
+        payload.extend_from_slice(&[0; 8]);
+        let mut r = packet(SVC_ASM, RING_PORT, RING_PORT, token, ASM_WRITTEN, &payload);
+        r[4] = SVC_ASM;
+        r[5] = DOMAIN_ADSP;
+        a.handle(&r, &mut |_| {});
+    }
+
+    /// Start media and return the ops sent.
+    fn start_media(a: &mut Audio) -> Vec<u32> {
+        a.set(Mode::Media);
+        let mut ops = Vec::new();
+        for now in 0..100 {
+            match a.poll(now, &mut |_| {}) {
+                Out::Send(p) => {
+                    ops.push(u32::from_le_bytes(p[16..20].try_into().unwrap()));
+                    ring_response(a, &p);
+                }
+                Out::Codecs(_) => a.codecs_done(true, &mut |_| {}),
+                Out::Nothing => {}
+                o => panic!("{o:?}"),
+            }
+        }
+        ops
+    }
+
+    #[test]
+    fn media_streams_periods_and_releases_each_once() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 4,
+            ..Default::default()
+        };
+        assert_eq!(a.media_slot(), None);
+        let ops = start_media(&mut a);
+        assert_eq!(*ops.last().unwrap(), ASM_RUN);
+        assert!(!ops.contains(&ASM_WRITE));
+        assert!(a.running());
+        // fill every slot
+        let mut writes = Vec::new();
+        for t in 1..=MEDIA_SLOTS as u32 {
+            let slot = a.media_slot().unwrap();
+            writes.push(a.media_write(slot, t, 4));
+        }
+        assert_eq!(a.media_slot(), None);
+        assert_eq!(a.media_in_flight(), MEDIA_SLOTS);
+        let w = &writes[2];
+        assert_eq!(
+            u32::from_le_bytes(w[20..24].try_into().unwrap()),
+            0x9000_0000 + MEDIA_OFFSET + 2 * MEDIA_PERIOD as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(w[32..36].try_into().unwrap()),
+            MEDIA_PERIOD as u32
+        );
+        // a done with a wrong ticket releases nothing
+        let mut bad = writes[2].clone();
+        bad[12] ^= 0x55;
+        media_done(&mut a, &bad);
+        assert_eq!(a.poll(200, &mut |_| {}), Out::Nothing);
+        media_done(&mut a, &writes[2]);
+        assert_eq!(a.poll(201, &mut |_| {}), Out::Complete(3, 4));
+        assert_eq!(a.poll(202, &mut |_| {}), Out::Nothing);
+        media_done(&mut a, &writes[2]); // a duplicate
+        assert_eq!(a.poll(203, &mut |_| {}), Out::Nothing);
+        assert_eq!(a.media_slot(), Some(2));
+    }
+
+    #[test]
+    fn leaving_media_waits_for_the_periods_in_flight() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 1,
+            ..Default::default()
+        };
+        start_media(&mut a);
+        let w = a.media_write(0, 7, 1);
+        a.set(Mode::Ring);
+        assert_eq!(a.media_slot(), None, "no new periods while leaving");
+        for now in 300..310 {
+            assert_eq!(a.poll(now, &mut |_| {}), Out::Nothing);
+        }
+        assert_eq!(a.is(), Mode::Media);
+        media_done(&mut a, &w);
+        assert_eq!(a.poll(311, &mut |_| {}), Out::Complete(7, 1));
+        let Out::Send(p) = a.poll(312, &mut |_| {}) else {
+            panic!()
+        };
+        assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), ASM_PAUSE);
+        assert_eq!(a.is(), Mode::Off);
+    }
+
+    #[test]
+    fn a_lost_media_period_does_not_block_a_call_forever() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 1,
+            ..Default::default()
+        };
+        start_media(&mut a);
+        a.media_write(0, 9, 1);
+        a.set(Mode::Call);
+        assert_eq!(a.poll(400, &mut |_| {}), Out::Nothing);
+        let Out::Send(p) = a.poll(400 + MEDIA_DRAIN_MS, &mut |_| {}) else {
+            panic!()
+        };
+        assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), ASM_PAUSE);
+        // never released: the kernel keeps that range the ADSP's
+        assert_eq!(a.media_in_flight(), 1);
+    }
+
+    #[test]
+    fn unsent_media_write_is_released() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 2,
+            ..Default::default()
+        };
+        start_media(&mut a);
+        a.media_write(5, 11, 2);
+        a.media_unsent(5);
+        assert_eq!(a.poll(500, &mut |_| {}), Out::Complete(11, 2));
+        assert_eq!(a.media_in_flight(), 0);
+    }
+
+    #[test]
+    fn media_slots_fit_after_the_ringtone() {
+        assert!(MEDIA_OFFSET as usize >= RING_BYTES);
+        assert!(MEDIA_OFFSET as usize + MEDIA_SLOTS * MEDIA_PERIOD <= RING_REGION as usize);
     }
 }

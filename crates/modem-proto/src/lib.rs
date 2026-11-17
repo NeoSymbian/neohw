@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+pub use neoaudio;
 pub use phone_rules;
 pub use sms;
 

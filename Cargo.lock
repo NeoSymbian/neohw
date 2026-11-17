@@ -15,10 +15,15 @@ name = "modem-proto"
 version = "0.1.0"
 dependencies = [
  "modem-ipc",
+ "neoaudio",
  "phone-rules",
  "sms",
  "wlfw",
 ]
+
+[[package]]
+name = "neoaudio"
+version = "0.1.0"
 
 [[package]]
 name = "phone-rules"

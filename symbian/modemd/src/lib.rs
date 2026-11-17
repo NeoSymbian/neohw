@@ -9,6 +9,7 @@
 extern crate alloc;
 
 mod adsp;
+mod sound;
 
 use alloc::string::String;
 use alloc::vec;
@@ -23,6 +24,7 @@ use e32::sys::ipc::TVersion;
 use e32::{dprintln, time};
 use modem_proto::apr::Mode;
 use modem_proto::modem_ipc::{self, Status, op};
+use modem_proto::neoaudio;
 use modem_proto::recovery::{self, StopProgress};
 use modem_proto::{Modem, Platform};
 
@@ -289,6 +291,8 @@ enum Phase {
     Failed,
     /// Startup radio-disabled build: ADSP services remain active.
     Disabled,
+    /// No modem on this machine (QEMU): NeoModem refuses connections as if absent; NeoAudio still serves (A1).
+    Absent,
 }
 
 struct Daemon {
@@ -327,6 +331,8 @@ struct Daemon {
     /// a new message's tone plays until here (ms), its second buzz comes here (0 = none)
     sms_tone_until: u64,
     sms_buzz_at: u64,
+    /// NeoAudio's streams and mixer (docs/audio.md)
+    sound: sound::Sound,
 }
 
 impl Daemon {
@@ -515,6 +521,9 @@ impl Daemon {
 
     /// One step of the work: Err(KErrNotSupported) when this machine has no modem (QEMU/Syborg).
     fn step(&mut self) -> Result<(), i32> {
+        if matches!(self.phase, Phase::Absent) {
+            return Ok(());
+        }
         self.adsp.step();
         self.run();
         self.save_log();
@@ -543,7 +552,12 @@ impl Daemon {
                     Err(ext4ro::Error::Io(e))
                         if e == err::KERR_NOT_SUPPORTED && !matches!(self.adsp, adsp::Adsp::Up) =>
                     {
-                        return Err(e);
+                        dprintln!(
+                            "[modemd] no modem on this machine ({}): serving NeoAudio only",
+                            e
+                        );
+                        self.phase = Phase::Absent;
+                        return Ok(());
                     }
                     Err(e) => dprintln!("[modemd] ipa: no firmware from vendor_a ({:?})", e),
                 }
@@ -708,7 +722,7 @@ impl Daemon {
                     }
                 }
             }
-            Phase::Running | Phase::Failed | Phase::Disabled => {}
+            Phase::Running | Phase::Failed | Phase::Disabled | Phase::Absent => {}
         }
         Ok(())
     }
@@ -753,6 +767,38 @@ impl Daemon {
         }
         self.audio.test = test;
         err::KERR_NONE
+    }
+
+    /// NeoAudio's step: route/volume changes reach a running media path, then the mix goes to the ADSP's periods
+    /// (media runs) or the clock sink.
+    fn sound_step(&mut self) {
+        let now = time::millis();
+        let up = matches!(self.adsp, adsp::Adsp::Up);
+        let a = &mut self.audio;
+        let playing = up && a.apr.is() == Mode::Media && a.apr.running();
+        if self.sound.changed {
+            self.sound.changed = false;
+            a.media_route = match self.sound.route {
+                neoaudio::route::EARPIECE => 0,
+                neoaudio::route::BOTTOM => 2,
+                _ => 1,
+            };
+            a.media_volume = self.sound.master;
+            if playing {
+                let r = adsp::audio(3, a.media_route);
+                let v = adsp::audio(4, u32::from(a.media_volume));
+                dprintln!(
+                    "[modemd] media: route {} volume {} -> {} {}",
+                    a.media_route,
+                    a.media_volume,
+                    r,
+                    v
+                );
+            }
+        }
+        let starting = up && !playing && a.apr.wanted() == Mode::Media && !a.apr.failed_hard();
+        self.sound
+            .step(now, if playing { Some(a) } else { None }, starting);
     }
 
     /// A call is connected (its audio runs or is wanted).
@@ -1051,6 +1097,15 @@ impl Daemon {
         } else {
             ring_wanted
         };
+        // NeoAudio's media plays when nothing else needs the speaker; a call, the ringtone or the test preempt it
+        let media = self.sound.wants_media(now)
+            && match self.audio.prepare_region() {
+                Ok(()) => true,
+                Err(e) => {
+                    dprintln!("[modemd] media: no audio region ({})", e);
+                    false
+                }
+            };
         let wanted = match (
             matches!(self.adsp, adsp::Adsp::Up),
             talking,
@@ -1061,8 +1116,10 @@ impl Daemon {
             (true, true, _, _) => Mode::Call,
             (true, false, _, true) => Mode::Ring,
             (true, false, Some(_), false) => Mode::Test,
+            (true, false, None, false) if media => Mode::Media,
             (true, false, None, false) => Mode::Off,
         };
+        self.sound.preempted = media && wanted != Mode::Media;
         let audio = (wanted, self.audio.apr.is(), self.audio.apr.quiescent());
         if self.audio_seen != Some(audio) {
             dprintln!(
@@ -1185,6 +1242,9 @@ impl Service for Daemon {
     type Session = u32;
 
     fn connect(&mut self, v: TVersion) -> Result<u32, i32> {
+        if matches!(self.phase, Phase::Absent) {
+            return Err(err::KERR_NOT_FOUND); // as if there were no NeoModem server
+        }
         if v.major as i8 == modem_ipc::VERSION.0 {
             self.next_session = self.next_session.wrapping_add(1).max(1);
             Ok(self.next_session)
@@ -1610,7 +1670,16 @@ fn main() -> i32 {
             return 0;
         }
     };
-    dprintln!("[modemd] start: serving NeoModem, starting ADSP before radio preparation");
+    let audio_server = match Server::create(neoaudio::NAME) {
+        Ok(s) => s,
+        Err(e) => {
+            dprintln!("[modemd] NeoAudio name taken ({}): exiting", e);
+            return 0;
+        }
+    };
+    dprintln!(
+        "[modemd] start: serving NeoModem and NeoAudio, starting ADSP before radio preparation"
+    );
     let mut d = Daemon {
         phase: Phase::Adsp,
         images: Default::default(),
@@ -1643,6 +1712,7 @@ fn main() -> i32 {
         ring_retry_at: 0,
         sms_tone_until: 0,
         sms_buzz_at: 0,
+        sound: sound::Sound::new(),
     };
     // Ordinary C: settings only; modem EFS remains RAM-backed (G4).
     if let Ok(fs) = e32::fs::Fs::connect() {
@@ -1728,6 +1798,7 @@ fn main() -> i32 {
     d.publish();
     rt::block_on(async {
         let mut receive = pin!(server.receive());
+        let mut audio_receive = pin!(audio_server.receive());
         let mut pump =
             modem_proto::schedule::PumpDeadline::new(time::millis(), (LOOP_US / 1000) as u64);
         loop {
@@ -1736,13 +1807,17 @@ fn main() -> i32 {
                     dprintln!("[modemd] no modem on this machine ({}): exiting", e);
                     return e;
                 }
+                d.sound_step();
                 pump.completed(time::millis());
             }
             // one step every 10 ms: the rings are polled (e32 delays are in microseconds; the old "20 ms / 2 s"
             // were 20 us / 2 ms, C6 2026-11-09)
             match rt::select(
                 receive.as_mut(),
-                time::delay(pump.wait_us(time::millis()).max(1)),
+                rt::select(
+                    audio_receive.as_mut(),
+                    time::delay(pump.wait_us(time::millis()).max(1)),
+                ),
             )
             .await
             {
@@ -1754,7 +1829,15 @@ fn main() -> i32 {
                     dprintln!("[modemd] receive failed ({})", e);
                     receive.set(server.receive());
                 }
-                Either::Right(()) => {}
+                Either::Right(Either::Left(Ok(msg))) => {
+                    audio_receive.set(audio_server.receive());
+                    let _ = server::dispatch(&mut d.sound, msg);
+                }
+                Either::Right(Either::Left(Err(e))) => {
+                    dprintln!("[modemd] NeoAudio receive failed ({})", e);
+                    audio_receive.set(audio_server.receive());
+                }
+                Either::Right(Either::Right(())) => {}
             }
             d.publish();
         }

@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 modem-ipc = { path = "../modem-ipc" }
+neoaudio = { path = "../neoaudio" }
 phone-rules = { path = "../phone-rules" }
 sms = { path = "../sms" }
 # the Wi-Fi firmware's QMI client lives in NeoSymbian/neolink (owner, 2026-11-12); MODEMD drives it because it owns
