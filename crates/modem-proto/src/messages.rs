@@ -300,6 +300,7 @@ impl Store {
         let rev = self.bump();
         let m = self.find(id)?;
         m.entry.state = st::SENDING;
+        m.entry.why = 0;
         m.refs.clear();
         m.delivered = 0;
         m.entry.rev = rev;
@@ -318,12 +319,14 @@ impl Store {
     }
 
     /// Message `id` could not be sent.
-    pub fn failed(&mut self, id: u32) {
+    /// Message `id` could not be sent, for `why` (modem_ipc::sms::FAIL_*).
+    pub fn failed(&mut self, id: u32, why: u8) {
         let rev = self.bump();
         if let Some(m) = self.find(id)
             && !m.entry.incoming
         {
             m.entry.state = st::FAILED;
+            m.entry.why = why;
             m.entry.rev = rev;
         }
     }
@@ -343,6 +346,7 @@ impl Store {
         };
         if r.failed() {
             m.entry.state = st::FAILED;
+            m.entry.why = st::FAIL_UNDELIVERED;
         } else {
             m.delivered = m.delivered.saturating_add(1);
             if m.delivered < m.entry.parts {
@@ -386,10 +390,33 @@ impl Store {
             st::EDIT_DELETE => self.delete(|m| m.entry.id == id),
             st::EDIT_DELETE_THREAD => self.delete(in_thread),
             st::EDIT_DELETE_BLOCKED => self.delete(|m| m.entry.state == st::BLOCKED),
+            st::EDIT_DELETE_ALL => self.delete(|m| m.entry.state != st::BLOCKED),
+            st::EDIT_UNBLOCK_SENDER => {
+                self.unblock(|m| thread.is_some_and(|t| same(m.entry.number.as_str(), t.as_str())))
+            }
             st::EDIT_ARCHIVE_THREAD => self.archive(in_thread, true),
             st::EDIT_UNARCHIVE_THREAD => self.archive(in_thread, false),
             _ => false,
         }
+    }
+
+    /// The blocked messages `pick` chooses become read ones (Unblock sender). True when something changed.
+    fn unblock(&mut self, pick: impl Fn(&Message) -> bool) -> bool {
+        let ids: Vec<u32> = self
+            .messages
+            .iter()
+            .filter(|m| m.entry.state == st::BLOCKED && pick(m))
+            .map(|m| m.entry.id)
+            .collect();
+        for id in &ids {
+            let rev = self.bump();
+            if let Some(m) = self.find(*id) {
+                m.entry.state = st::READ;
+                m.entry.why = 0;
+                m.entry.rev = rev;
+            }
+        }
+        !ids.is_empty()
     }
 
     /// Archive (or bring back) the messages `pick` chooses. True when something changed.
@@ -480,7 +507,7 @@ impl Store {
             .map(|m| m.entry.id)
             .collect();
         for id in sending {
-            self.failed(id);
+            self.failed(id, st::FAIL_RESTART);
         }
     }
 
@@ -734,13 +761,60 @@ mod tests {
         assert_eq!(s.send("+1 555 abc", "x", T0), Err(sms::Error::BadNumber));
         let (id, _) = s.send("+37491234567", "x", T0).unwrap();
         assert!(s.retry(id).is_none(), "only a failed message is sent again");
-        s.failed(id);
-        assert_eq!(all(&s, 0)[0].0.state, st::FAILED);
+        s.failed(id, st::FAIL_REFUSED);
+        assert_eq!(
+            (all(&s, 0)[0].0.state, all(&s, 0)[0].0.why),
+            (st::FAILED, st::FAIL_REFUSED),
+            "a failure says why"
+        );
         assert_eq!(s.retry(id).map(|p| p.len()), Some(1));
-        assert_eq!(all(&s, 0)[0].0.state, st::SENDING);
+        assert_eq!(
+            (all(&s, 0)[0].0.state, all(&s, 0)[0].0.why),
+            (st::SENDING, 0)
+        );
         let mut s = Store::decode(&s.encode()).unwrap();
         s.restarted();
-        assert_eq!(all(&s, 0)[0].0.state, st::FAILED);
+        assert_eq!(
+            (all(&s, 0)[0].0.state, all(&s, 0)[0].0.why),
+            (st::FAILED, st::FAIL_RESTART)
+        );
+        assert_eq!(s.send("+37491234567", "", T0), Err(sms::Error::BadLength));
+    }
+
+    #[test]
+    fn unblock_a_sender_and_delete_all() {
+        let mut s = Store::default();
+        let spam = s
+            .receive(deliver("+19005550101", "WIN", None), Some(1), 1)
+            .unwrap();
+        s.receive(deliver("+19005550101", "WIN again", None), Some(1), 2)
+            .unwrap();
+        let ok = s
+            .receive(deliver("+15550142", "hi", None), None, 3)
+            .unwrap();
+        // the blocked messages come back as read ones in their conversation
+        assert!(s.edit(st::EDIT_UNBLOCK_SENDER, spam));
+        let back: Vec<_> = s.messages.iter().filter(|m| m.entry.id != ok).collect();
+        assert!(
+            back.iter()
+                .all(|m| m.entry.state == st::READ && m.entry.why == 0)
+        );
+        assert!(
+            !s.edit(st::EDIT_UNBLOCK_SENDER, spam),
+            "nothing blocked is left"
+        );
+        // delete all keeps the blocked messages
+        let kept = s
+            .receive(deliver("+19005550199", "spam", None), Some(1), 4)
+            .unwrap();
+        assert!(s.edit(st::EDIT_DELETE_ALL, 0));
+        let live: Vec<u32> = s
+            .messages
+            .iter()
+            .filter(|m| m.entry.state != st::DELETED)
+            .map(|m| m.entry.id)
+            .collect();
+        assert_eq!(live, [kept]);
     }
 
     #[test]

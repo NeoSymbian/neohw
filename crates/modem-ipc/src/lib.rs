@@ -28,7 +28,7 @@
 
 pub const NAME: &str = "NeoModem";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (2, 4, 0);
+pub const VERSION: (i8, i8, i16) = (2, 5, 0);
 
 pub mod op {
     pub const STATUS: i32 = 1;
@@ -67,8 +67,9 @@ pub mod op {
     /// arg0 des8: known-number hashes, u32 LE each.
     pub const KNOWN_SET: i32 = 23;
     /// arg0 des8: the recipient (digits, an optional leading +); arg1 des8: the text (UTF-8, at most
-    /// [`super::sms::MAX_TEXT`] bytes). Completes with the new message's id (> 0), or KErrArgument (-6) for a number
-    /// or text it can't send (more than 10 parts).
+    /// [`super::sms::MAX_TEXT`] bytes). Completes with the new message's id (> 0), KErrArgument (-6) for a number it
+    /// can't send to, or (2.5) KErrTooBig (-40) for a text over 10 parts or empty. A message that then fails says
+    /// why in its record ([`super::sms`] `FAIL_*`).
     pub const SMS_SEND: i32 = 24;
     /// arg0 writable des8; arg1 the revision the client has (0 = everything); arg2 [`super::sms`] `READ_*`. Writes
     /// the records changed since that revision, oldest change first, as many as fit (whole [`super::SmsEntry`]s).
@@ -114,6 +115,19 @@ pub mod sms {
     /// message from that number brings it back
     pub const EDIT_ARCHIVE_THREAD: i32 = 8;
     pub const EDIT_UNARCHIVE_THREAD: i32 = 9;
+    /// (2.5) that message's sender: its blocked messages become read ones in its conversation (Unblock sender)
+    pub const EDIT_UNBLOCK_SENDER: i32 = 10;
+    /// (2.5) every message but the blocked ones (Delete conversations; the id is ignored)
+    pub const EDIT_DELETE_ALL: i32 = 11;
+
+    /// (2.5) why a [`FAILED`] message failed, in [`super::SmsEntry::why`] (0: unknown, a 2.4 record)
+    pub const FAIL_NO_ANSWER: u8 = 1;
+    /// the network or the modem refused it (no service, barred, the SIM not ready)
+    pub const FAIL_REFUSED: u8 = 2;
+    /// MODEMD restarted while it was being sent
+    pub const FAIL_RESTART: u8 = 3;
+    /// a status report said it could not be delivered
+    pub const FAIL_UNDELIVERED: u8 = 4;
 
     pub const ALERT_TONE_VIBRATE: u8 = 0;
     pub const ALERT_VIBRATE: u8 = 1;
@@ -138,7 +152,8 @@ pub struct SmsEntry {
     pub done_utc: i64,
     /// [`sms`] state
     pub state: u8,
-    /// why a [`sms::BLOCKED`] message was blocked (`phone_rules::block::why`)
+    /// why a [`sms::BLOCKED`] message was blocked (`phone_rules::block::why`), or (2.5) why a [`sms::FAILED`] one
+    /// failed (`sms::FAIL_*`)
     pub why: u8,
     /// the SMS it took
     pub parts: u8,
