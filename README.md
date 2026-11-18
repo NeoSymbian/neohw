@@ -24,18 +24,21 @@ in [kernel](https://github.com/NeoSymbian/kernel) under `baseport/arm64`.
 | `qrtr` | QRTR and QMI wire codecs |
 | `apr` | APR audio codecs and the audio state machine |
 | `hub-ipc` | NeoHub operations, snapshots, event batches, session queues and the cellular Bus/Event boundary |
-| `hub` | Node-1 QRTR routing, retry outbox, RAM EFS, locator/TFTP, IPA, SSCTL, recovery and WLFW driver |
+| `hub` | Node-1 QRTR routing, retry outbox, RAM EFS, locator/TFTP, IPA, SSCTL and recovery |
 | `modem` | Cellular QMI clients, status, calls, SIM/PIN, logs, blocklist and SMS; uses only the hub Bus/Event boundary |
 | `ext4ro` | Read-only ext4 for firmware on the vendor partition |
-| `wlfw` | The Wi-Fi firmware's QMI control service (WLFW, QMI 69); HWHUB drives it over its QRTR link |
+| `wlfw` | The Wi-Fi firmware's QMI control service (WLFW, QMI 69) |
+| `wifi` | The firmware's start over NeoHub (`Firmware`), the NeoWifi contract, the kernel's scan/link records and the saved networks |
 | `wpa` | WPA2-PSK, supplicant side: PMK, PTK, the 4-way and group key handshakes (sans-I/O; CCMP, PSK, no MFP) |
 | `net` | NeoNet: the IP stack (smoltcp: DHCP, DNS, TCP, UDP), its IPC protocol and the client (`client` feature) |
 | `symbian/sys` | Shared HAL ABI, vendor ext4/firmware access and private-file saving |
 | `symbian/hwhub` | HWHUB.EXE (0xE0003002): QRTR rings/router, firmware, MSS/ADSP boot, recovery and NeoHub |
-| `symbian/modemd` | MODEMD.EXE (0xE0003001): cellular NeoHub client, NeoModem, APR audio and NeoAudio |
+| `symbian/modemd` | MODEMD.EXE (0xE0003001): cellular NeoHub client, NeoModem, call/ring/alert policy, vibration; starts HWHUB and AUDIOD |
+| `symbian/audiod` | AUDIOD.EXE (0xE0003003): APR (ADSP ring 2), AudioMem, codecs, routes, amps, the jack; NeoAudio (+ MODEMD's op::CONTROL) |
+| `symbian/wifid` | WIFID.EXE (0xE0004002): WLFW over NeoHub, joining and WPA2, remembered networks, NeoWifi; starts NEONET |
 | `symbian/neonet` | NEONET.EXE (0xE0004001): the IP stack on the kernel's WlanLink frames, the NeoNet server |
 
-Consumers pin these crates by git rev: neoui (`modem-ipc`, `neoaudio`, `phone-rules`, `wpa`, `net`), phone
+Consumers pin these crates by git rev: neoui (`modem-ipc`, `neoaudio`, `phone-rules`, `wifi`, `net`), phone
 (`modem-ipc`, `phone-rules`, `sms`).
 
 ## MODEMD notes
