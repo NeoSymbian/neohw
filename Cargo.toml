@@ -6,7 +6,11 @@
 members = [
     "crates/ext4ro",
     "crates/modem-ipc",
-    "crates/modem-proto",
+    "crates/apr",
+    "crates/qrtr",
+    "crates/hub-ipc",
+    "crates/hub",
+    "crates/modem",
     "crates/neoaudio",
     "crates/net",
     "crates/phone-rules",

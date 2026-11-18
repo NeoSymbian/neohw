@@ -19,5 +19,11 @@ qrtr-trace = []
 
 [dependencies]
 e32.workspace = true
-modem-proto.workspace = true
+apr.workspace = true
+hub-ipc.workspace = true
+hub.workspace = true
+modem.workspace = true
+modem-ipc.workspace = true
+neoaudio.workspace = true
+sys.workspace = true
 ext4ro.workspace = true

@@ -3,13 +3,19 @@
 # (exes.txt). Its own workspace:
 # built only for armv5te-none-eabi with the pinned nightly (`cargo arm`), like neoui/symbian.
 [workspace]
-members = ["modemd", "neonet"]
+members = ["modemd", "neonet", "sys"]
 resolver = "2"
 
 [workspace.dependencies]
 # NeoSymbian/e32-rs, the same revision as neoui
 e32 = { git = "https://github.com/NeoSymbian/e32-rs", rev = "0489694ee55f6879a0f769d1e6d17077b22d4e32", features = ["critical-section"] }
-modem-proto = { path = "../crates/modem-proto" }
+apr = { path = "../crates/apr" }
+hub-ipc = { path = "../crates/hub-ipc" }
+hub = { path = "../crates/hub" }
+modem = { path = "../crates/modem" }
+modem-ipc = { path = "../crates/modem-ipc" }
+neoaudio = { path = "../crates/neoaudio" }
+sys = { package = "neohw-sys", path = "sys" }
 ext4ro = { path = "../crates/ext4ro" }
 net = { path = "../crates/net" }
 

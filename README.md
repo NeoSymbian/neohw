@@ -21,11 +21,16 @@ in [kernel](https://github.com/NeoSymbian/kernel) under `baseport/arm64`.
 | `modem-ipc` | The NeoModem contract (MODEMD <-> neoui, phone): calls, SIM/PIN, radio intent, ringing, SMS, recovery |
 | `neoaudio` | The NeoAudio contract and its mixer, resampler and streams |
 | `phone-rules`, `sms` | Dial strings, emergency numbers, caller matching, the blocklist; SMS PDUs |
-| `modem-proto` | QRTR/QMI services and clients, RAM-backed EFS, calls, SMS, APR audio (to be split, docs hardware.md S2) |
+| `qrtr` | QRTR and QMI wire codecs |
+| `apr` | APR audio codecs and the audio state machine |
+| `hub-ipc` | In-process Bus/Event boundary for the future NeoHub IPC |
+| `hub` | Node-1 QRTR routing, retry outbox, RAM EFS, locator/TFTP, IPA, SSCTL, recovery and WLFW driver |
+| `modem` | Cellular QMI clients, status, calls, SIM/PIN, logs, blocklist and SMS; uses only the hub Bus/Event boundary |
 | `ext4ro` | Read-only ext4 for firmware on the vendor partition |
 | `wlfw` | The Wi-Fi firmware's QMI control service (WLFW, QMI 69); MODEMD drives it over its QRTR link |
 | `wpa` | WPA2-PSK, supplicant side: PMK, PTK, the 4-way and group key handshakes (sans-I/O; CCMP, PSK, no MFP) |
 | `net` | NeoNet: the IP stack (smoltcp: DHCP, DNS, TCP, UDP), its IPC protocol and the client (`client` feature) |
+| `symbian/sys` | Shared HAL ABI, vendor ext4/firmware access and private-file saving |
 | `symbian/modemd` | MODEMD.EXE (0xE0003001): the modem, the ADSP, NeoModem and NeoAudio |
 | `symbian/neonet` | NEONET.EXE (0xE0004001): the IP stack on the kernel's WlanLink frames, the NeoNet server |
 
@@ -62,11 +67,12 @@ Validation uses the existing commands:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --offline -- -D warnings
-cargo test --offline
+cargo clippy --all-targets -- -D warnings
+cargo test
 cd symbian
 cargo fmt --all --check
-cargo arm --workspace --offline
+cargo arm --workspace
+cargo clippy --workspace --target armv5te-none-eabi -Zbuild-std=core,alloc --release -- -D warnings
 ```
 
 Qualcomm firmware and board data are never stored here: they are read from the phone's own partitions at runtime.
@@ -98,3 +104,31 @@ For the startup-only radio-disabled diagnostic image, build from `symbian/` with
 ADSP/loopback servicing available. This is a build option, not a runtime airplane-mode API. Default builds retain
 normal cellular startup. Validate cold boot without SIM, radio-disabled loopback, forced radio preparation failure
 and normal two-way calls on the phone before using this candidate as the installed image.
+
+## S2 ownership boundary
+
+MODEMD still runs the same 10 ms loop and serves NeoModem/NeoAudio. Its `inprocess` adapter composes `hub::Router`
+and `modem::Cellular`; cellular has no dependency on `hub` except in tests. `qrtr` owns the shared wire codecs,
+`apr` owns audio logic, and `symbian/sys` owns shared device glue. No pinned IPC contract changed.
+
+The router owns `ipa_up`, radio attachment, startup enable policy and terminal failure. `Event::State` delivers
+these facts before cellular service discovery and commands; cellular uses `ipa_up` for NAS voice-only selection.
+Cellular alone owns NeoModem `Status`; `RadioStarted`, `RadioResponse` and reset/state events retain running,
+heartbeat and failure reporting. Daemon status overlays for hardware boot/audio remain unchanged.
+
+`client_up` is split by ownership: cellular handles DMS/UIM/NAS/VOICE/WMS, the hub handles IPA, SSCTL and its
+small `WifiFw` driver. Packet events carry source address and bound destination port; cellular also verifies the
+expected server address. ServerDown is delivered without clearing an established client, matching C5 behavior.
+BYE/DEL_CLIENT retain their existing no-op handling. HELLO suppression stays entirely in the router.
+
+All essential sends, including cellular subscriptions and online transitions, use the hub's single ordered
+16-packet outbox and one-second retry cadence. Nonessential sends retain their immediate failure result.
+`Bus::send` reports physical delivery; cellular essential requests report acceptance even while queued, retaining
+the same transaction. The adapter preserves tick order: cellular intent, router retry, cellular call/SMS timers,
+IPA retry, NAS polling. The staged cellular methods keep that scheduling visible for S3.
+
+Reset retains RAM EFS and the transfer-port counter; `keep_adsp` also retains non-MSS discovery, HELLOs, queued
+traffic and transfers/readers, restoring ADSP SSCTL. Cellular retains logs, CLIR, messages/outgoing queue and user
+intent, and advances the supplied generation. Its blocklist clears on reset as before. `lost()` resets MSS state,
+then publishes terminal failure, while late MSS packets cannot repopulate queues. `support_only` and `attach_radio`
+remain router operations; attachment preserves healthy ADSP discovery and retries.

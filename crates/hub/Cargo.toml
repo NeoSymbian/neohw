@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "hub"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+qrtr = { path = "../qrtr" }
+hub-ipc = { path = "../hub-ipc" }
+wlfw = { path = "../wlfw" }
+
+[dev-dependencies]
+modem = { path = "../modem" }
