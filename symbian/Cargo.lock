@@ -7,6 +7,17 @@ name = "apr"
 version = "0.1.0"
 
 [[package]]
+name = "audiod"
+version = "0.1.0"
+dependencies = [
+ "apr",
+ "e32",
+ "modem-ipc",
+ "neoaudio",
+ "neohw-sys",
+]
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -155,7 +166,6 @@ version = "0.1.0"
 name = "modemd"
 version = "0.1.0"
 dependencies = [
- "apr",
  "e32",
  "hub",
  "hub-ipc",

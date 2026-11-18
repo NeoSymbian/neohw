@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "modemd"
-description = "MODEMD.EXE: cellular policy over NeoHub, NeoModem and NeoAudio"
+description = "MODEMD.EXE: cellular policy over NeoHub, NeoModem; drives AUDIOD and the vibration motor"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -13,7 +13,6 @@ test = false
 
 [dependencies]
 e32.workspace = true
-apr.workspace = true
 hub-ipc.workspace = true
 hub.workspace = true
 modem.workspace = true

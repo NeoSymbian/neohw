@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "audiod"
+description = "AUDIOD.EXE: the audio path (APR on ADSP ring 2, AudioMem, mixer, routes, amps, the jack) and NeoAudio"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+test = false
+
+[dependencies]
+e32.workspace = true
+apr.workspace = true
+modem-ipc.workspace = true
+neoaudio.workspace = true
+sys.workspace = true

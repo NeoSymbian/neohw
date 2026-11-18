@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-//! MODEMD.EXE (C5, C6, C7): cellular policy over NeoHub, NeoModem, and NeoAudio.
-//! HWHUB owns QRTR and processor boot/recovery; MODEMD owns APR ring 2 until S4.
-//! SYSSTART starts MODEMD, which starts HWHUB while continuing to serve both APIs.
+//! MODEMD.EXE (C5, C6, C7): cellular policy over NeoHub, and NeoModem.
+//! HWHUB owns QRTR and processor boot/recovery; AUDIOD owns APR and NeoAudio (S4): MODEMD tells it what the phone
+//! wants (the call's voice path, the ringtone, Dev tools' test) over NeoAudio's op::CONTROL.
+//! SYSSTART starts MODEMD, which starts HWHUB and AUDIOD while serving NeoModem.
 #![no_std]
 
 extern crate alloc;
 
-mod adsp;
+mod audio;
 mod client;
-mod sound;
 
 use alloc::vec;
 use alloc::vec::Vec;
-use apr::Mode;
 use client::{Hal, Modem};
 use core::ops::ControlFlow;
 use core::pin::pin;
@@ -41,8 +40,6 @@ enum Phase {
 struct Daemon {
     phase: Phase,
     modem: Option<Modem>,
-    /// APR receive scratch (8 KB: not on the 8 KB stack)
-    rx: Vec<u8>,
     /// before the modem exists (booting / failed)
     status: Status,
     /// Boot and recovery facts belong to HWHUB.
@@ -50,8 +47,8 @@ struct Daemon {
     next_connect: u64,
     connect_backoff: u64,
     spawned: bool,
-    /// the call's audio path and the in-call buttons' settings (C6)
-    audio: adsp::CallAudio,
+    /// AUDIOD: the call's audio path and the in-call buttons' settings (C6)
+    audio: audio::Link,
     /// a keypad tone ends here (ms): one tap = one 200 ms tone
     dtmf_stop: Option<u64>,
     subscribers: Vec<(u32, Message)>,
@@ -62,20 +59,12 @@ struct Daemon {
     /// the call Silence quietened (op::SILENCE): no tone or vibration until it stops ringing; the settings stay
     silenced: Option<u8>,
     waiting_alert: Option<u8>,
-    audio_seen: Option<(Mode, Mode, bool)>,
     haptic_error: i32,
-    /// a failed ringtone preparation is retried from here (ms)
-    ring_retry_at: u64,
     /// a new message's tone plays until here (ms), its second buzz comes here (0 = none)
     sms_tone_until: u64,
     sms_buzz_at: u64,
-    /// NeoAudio's streams and mixer (docs/hardware/audio.md)
-    sound: sound::Sound,
-    /// the last amp protection poll (ms)
-    amps_checked: u64,
-    /// the last jack poll (ms), and whether the codecs were probed for it
-    jack_checked: u64,
-    jack_probed: bool,
+    /// the last ringtone error AUDIOD reported (NeoModem's result once)
+    ring_error: i32,
 }
 
 impl Daemon {
@@ -127,15 +116,13 @@ impl Daemon {
         if haptic < 0 {
             dprintln!("[modemd] recovery vibration stop failed ({})", haptic);
         }
-        self.audio.apr.set(Mode::Off);
-        self.audio.test = None;
+        self.audio.clear();
         self.sms_tone_until = 0;
         self.sms_buzz_at = 0;
         self.haptic_at = 0;
         self.alert_dismissed = None;
         self.silenced = None;
         self.waiting_alert = None;
-        let _ = adsp::audio(2, 0);
     }
 
     fn recover(&mut self, mask: u32) {
@@ -363,29 +350,15 @@ impl Daemon {
     fn step(&mut self) {
         self.connect_hub();
         self.run();
+        // AUDIOD runs on every machine (NeoAudio's clock sink without an ADSP), so it is started and fed always
+        self.audio.intent.adsp_up = self.hub.adsp == hub_ipc::adsp::UP;
+        self.audio.sync();
         self.save_log();
         self.save_sms();
     }
 
-    /// An audio setting to the kernel's codecs while the call's audio runs (else it waits for the next call).
-    fn apply(&mut self, op: u32, arg: u32) -> i32 {
-        if self.audio.apr.is() != Mode::Call {
-            return err::KERR_NONE;
-        }
-        let r = adsp::audio(op, arg);
-        if r < 0 {
-            // The board driver stops amps on a failed control. Invalidate the live
-            // path immediately and rebuild both processors, preserving RAM EFS.
-            self.audio.apr.codec_fault();
-            self.recover(3);
-            r
-        } else {
-            err::KERR_NONE
-        }
-    }
-
     /// Dev tools' audio test (no call): 1 loudspeaker, 2 earpiece, the mic looped back to the amps; 0 stops it.
-    /// Pressing the other route while it runs only switches the amps.
+    /// AUDIOD runs it; pressing the other route while it runs only switches the amps.
     fn audio_test(&mut self, what: i32) -> i32 {
         if !(self.hub.adsp == hub_ipc::adsp::UP) {
             return NOT_READY;
@@ -393,93 +366,12 @@ impl Daemon {
         if self.talking() {
             return err::KERR_IN_USE;
         }
-        let test = match what {
-            0 => None,
-            1 | 2 => Some(what == 1),
-            _ => return err::KERR_ARGUMENT,
-        };
-        dprintln!("[modemd] audio test {:?} (loudspeaker)", test);
-        if let (Some(spk), Mode::Test) = (test, self.audio.apr.is()) {
-            let r = adsp::audio(3, spk as u32);
-            if r < 0 {
-                return r;
-            }
+        if !(0..=2).contains(&what) {
+            return err::KERR_ARGUMENT;
         }
-        self.audio.test = test;
+        dprintln!("[modemd] audio test {}", what);
+        self.audio.intent.test = what as u8;
         err::KERR_NONE
-    }
-
-    /// NeoAudio's step: route/volume changes reach a running media path, then the mix goes to the ADSP's periods
-    /// (media runs) or the clock sink.
-    fn sound_step(&mut self) {
-        let now = time::millis();
-        let up = self.hub.adsp == hub_ipc::adsp::UP;
-        let a = &mut self.audio;
-        let playing = up && matches!(a.apr.is(), Mode::Media | Mode::Duplex) && a.apr.running();
-        if self.sound.changed {
-            self.sound.changed = false;
-            a.media_route = match self.sound.route {
-                neoaudio::route::EARPIECE => 0,
-                neoaudio::route::BOTTOM => 2,
-                _ => 1,
-            };
-            a.media_volume = self.sound.master;
-            // the mic choice is the kernel's own state: set it now, running or not (a call keeps DMIC1)
-            if a.apr.is() != Mode::Call {
-                let r = adsp::audio(6, self.sound.mic as u32);
-                dprintln!("[modemd] media: mic DMIC{} -> {}", self.sound.mic + 1, r);
-            }
-            if playing && !a.apr.jack_is() {
-                let r = adsp::audio(3, a.media_route);
-                let v = adsp::audio(4, u32::from(a.media_volume));
-                dprintln!(
-                    "[modemd] media: route {} volume {} -> {} {}",
-                    a.media_route,
-                    a.media_volume,
-                    r,
-                    v
-                );
-            }
-        }
-        // the 3.5 mm jack (A8): the kernel debounces the PM660L's detection; media follows the headphones
-        if up && now >= self.jack_checked + 250 {
-            self.jack_checked = now;
-            if !self.jack_probed {
-                self.jack_probed = true;
-                let r = adsp::audio(0, 0);
-                dprintln!("[modemd] audio: codecs probed for the jack -> {}", r);
-            }
-            let j = adsp::audio(8, 0);
-            if j >= 0 {
-                a.apr.headset = j & 2 != 0;
-            }
-            if j >= 0 && (j & 1 != 0) != a.apr.jack {
-                a.apr.jack = j & 1 != 0;
-                dprintln!(
-                    "[modemd] audio: headphones {} ({:#x}: {})",
-                    if a.apr.jack { "in" } else { "out" },
-                    j,
-                    if j & 2 != 0 { "headset mic" } else { "no mic" }
-                );
-            }
-        }
-        // amp protection (A7): the kernel polls the amps' IRQ lines; a protection event switches that amp off
-        if up && a.apr.running() && now >= self.amps_checked + 250 {
-            self.amps_checked = now;
-            let r = adsp::audio(7, 0);
-            if r > 0 {
-                dprintln!(
-                    "[modemd] audio: amp protection event (mask {}): that amp is off until the next start",
-                    r
-                );
-            }
-        }
-        let starting = up
-            && !playing
-            && matches!(a.apr.wanted(), Mode::Media | Mode::Duplex)
-            && !a.apr.failed_hard();
-        self.sound
-            .step(now, if playing { Some(a) } else { None }, starting);
     }
 
     /// A call is connected (its audio runs or is wanted).
@@ -490,7 +382,7 @@ impl Daemon {
                 .as_slice()
                 .iter()
                 .any(|c| !matches!(c.state, modem_ipc::call::NONE | modem_ipc::call::END))
-                || call_audio(m.status.call.state, self.audio.apr.is())
+                || call_audio(m.status.call.state, self.audio.is_call())
         })
     }
 
@@ -500,22 +392,22 @@ impl Daemon {
         if matches!(self.phase, Phase::Recover { .. })
             || !self.modem.as_ref().is_some_and(|m| m.session().is_some())
         {
-            self.audio.apr.set(Mode::Off);
-            if self.hub.adsp == hub_ipc::adsp::UP {
-                self.audio.pump(&mut self.rx);
-            }
+            self.audio.intent.hold = true;
             return;
         }
         if matches!(self.phase, Phase::Absent) {
             return;
         }
         let running = matches!(self.phase, Phase::Running);
-        if running && self.hub.adsp == hub_ipc::adsp::UP && self.audio.apr.failed_hard() {
+        if running
+            && self.hub.adsp == hub_ipc::adsp::UP
+            && self.audio.report.failed
+            && self.audio.is_current()
+        {
             self.recover(3);
             return;
         }
         let Some(modem) = &mut self.modem else { return };
-        let buf = &mut self.rx;
         // the audio follows what is wanted now: a connected call's voice path, else the test, else nothing (the
         // state machine finishes a running sequence first)
         let talking = if modem.status.calls.len > 0 {
@@ -524,9 +416,9 @@ impl Daemon {
                 .calls
                 .as_slice()
                 .iter()
-                .any(|c| call_audio(c.state, self.audio.apr.is()))
+                .any(|c| call_audio(c.state, self.audio.is_call()))
         } else {
-            call_audio(modem.status.call.state, self.audio.apr.is())
+            call_audio(modem.status.call.state, self.audio.is_call())
         };
         if self.alert_dismissed.is_some_and(|id| {
             !modem.status.calls.as_slice().iter().any(|c| {
@@ -661,71 +553,26 @@ impl Daemon {
         }
         let chime = now < self.sms_tone_until && !talking && !modem.status.airplane;
         if talking {
-            self.audio.test = None;
+            self.audio.intent.test = 0;
         }
-        self.audio.ring = modem.status.ring;
-        // the message tone is the start of the ringtone, cut short
-        let ring_wanted = (ringing
+        // the message tone is the start of the ringtone, cut short; AUDIOD prepares and plays it
+        let i = &mut self.audio.intent;
+        i.hold = false;
+        i.call = talking;
+        i.ring = (ringing
             && !talking
             && !modem.status.airplane
             && !modem.status.ring.silent
             && modem.status.ring.volume > 0)
             || chime;
-        let ring_ready = if ring_wanted
-            && self.audio.apr.is() == Mode::Off
-            && self.audio.apr.idle()
-            && now >= self.ring_retry_at
-        {
-            match self.audio.prepare_ring() {
-                Ok(()) => true,
-                Err(e) => {
-                    // the vibration still alerts; the tone is tried again in 2 s, not every step
-                    modem.status.result = e;
-                    self.ring_retry_at = now + 2000;
-                    false
-                }
+        i.ring_volume = modem.status.ring.volume;
+        let e = self.audio.report.ring_error;
+        if e != self.ring_error {
+            self.ring_error = e;
+            if e < 0 {
+                // the vibration still alerts; AUDIOD retries the tone
+                modem.status.result = e;
             }
-        } else {
-            ring_wanted
-        };
-        // NeoAudio's media plays when nothing else needs the speaker; a call, the ringtone or the test preempt it
-        let media = self.sound.wants_media(now)
-            && match self.audio.prepare_region() {
-                Ok(()) => true,
-                Err(e) => {
-                    dprintln!("[modemd] media: no audio region ({})", e);
-                    false
-                }
-            };
-        let wanted = match (
-            self.hub.adsp == hub_ipc::adsp::UP,
-            talking,
-            self.audio.test,
-            ring_ready,
-        ) {
-            (false, _, _, _) => Mode::Off,
-            (true, true, _, _) => Mode::Call,
-            (true, false, _, true) => Mode::Ring,
-            (true, false, Some(_), false) => Mode::Test,
-            (true, false, None, false) if media && self.sound.wants_record() => Mode::Duplex,
-            (true, false, None, false) if media => Mode::Media,
-            (true, false, None, false) => Mode::Off,
-        };
-        self.sound.preempted = media && !matches!(wanted, Mode::Media | Mode::Duplex);
-        let audio = (wanted, self.audio.apr.is(), self.audio.apr.quiescent());
-        if self.audio_seen != Some(audio) {
-            dprintln!(
-                "[modemd] t={}ms audio wanted {:?} current {:?} quiescent {}",
-                now,
-                audio.0,
-                audio.1,
-                audio.2
-            );
-            self.audio_seen = Some(audio);
-        }
-        self.audio.apr.set(wanted);
-        if self.hub.adsp == hub_ipc::adsp::UP {
-            self.audio.pump(buf);
         }
         if self.dtmf_stop.is_some_and(|t| time::millis() >= t) {
             self.dtmf_stop = None;
@@ -857,31 +704,20 @@ impl Service for Daemon {
             }),
             // the in-call buttons (C6): remembered for the next call too, applied now if the audio runs
             op::MUTE => {
-                let want = msg.int(0) != 0;
-                let r = self.apply(5, want as u32);
-                if r == 0 {
-                    self.audio.muted = want;
-                }
-                r
+                self.audio.intent.muted = msg.int(0) != 0;
+                err::KERR_NONE
             }
             op::SPEAKER => {
-                let want = msg.int(0) != 0;
-                let r = self.apply(3, want as u32);
-                if r == 0 {
-                    self.audio.speaker = want;
-                }
-                r
+                self.audio.intent.speaker = msg.int(0) != 0;
+                err::KERR_NONE
             }
             op::VOLUME => {
                 let want = msg.int(0);
                 if !(0..=10).contains(&want) {
                     err::KERR_ARGUMENT
                 } else {
-                    let r = self.apply(4, want as u32);
-                    if r == 0 {
-                        self.audio.volume = want as u8;
-                    }
-                    r
+                    self.audio.intent.volume = want as u8;
+                    err::KERR_NONE
                 }
             }
             op::DTMF => {
@@ -1154,66 +990,40 @@ impl Service for Daemon {
 /// The call's voice path runs from "connected" until the modem says the call ended (END/NONE), through hold and
 /// disconnecting, as Linux (it stops on "terminated"). Stopping it at "disconnecting" overlapped the modem's own
 /// teardown with the ADSP: the ADSP stopped answering and the modem stayed on 3G (C6 2026-11-09).
-fn call_audio(state: u8, is: Mode) -> bool {
+fn call_audio(state: u8, is_call: bool) -> bool {
     use modem_ipc::call;
-    state == call::CONVERSATION
-        || (is == Mode::Call && matches!(state, call::HOLD | call::DISCONNECTING))
+    state == call::CONVERSATION || (is_call && matches!(state, call::HOLD | call::DISCONNECTING))
 }
 
 enum Wake {
     Modem(Result<Message, i32>),
-    Audio(Result<Message, i32>),
     Hub(Result<usize, i32>),
     Timer,
 }
 
-/// `select` is left-biased: rotate first priority so neither IPC floods nor QRTR starve peers.
-async fn next_wake<M, A, H>(
+/// `select` is left-biased: alternate first priority so neither IPC floods nor QRTR starve the other.
+async fn next_wake<M, H>(
     modem: core::pin::Pin<&mut M>,
-    audio: core::pin::Pin<&mut A>,
     hub: core::pin::Pin<&mut H>,
     wait_us: i32,
     turn: u8,
 ) -> Wake
 where
     M: core::future::Future<Output = Result<Message, i32>>,
-    A: core::future::Future<Output = Result<Message, i32>>,
     H: core::future::Future<Output = Result<usize, i32>>,
 {
-    match turn {
-        0 => match rt::select(
-            modem,
-            rt::select(audio, rt::select(hub, time::delay(wait_us))),
-        )
-        .await
-        {
+    if turn == 0 {
+        match rt::select(modem, rt::select(hub, time::delay(wait_us))).await {
             Either::Left(r) => Wake::Modem(r),
-            Either::Right(Either::Left(r)) => Wake::Audio(r),
-            Either::Right(Either::Right(Either::Left(r))) => Wake::Hub(r),
-            Either::Right(Either::Right(Either::Right(()))) => Wake::Timer,
-        },
-        1 => match rt::select(
-            audio,
-            rt::select(hub, rt::select(modem, time::delay(wait_us))),
-        )
-        .await
-        {
-            Either::Left(r) => Wake::Audio(r),
             Either::Right(Either::Left(r)) => Wake::Hub(r),
-            Either::Right(Either::Right(Either::Left(r))) => Wake::Modem(r),
-            Either::Right(Either::Right(Either::Right(()))) => Wake::Timer,
-        },
-        _ => match rt::select(
-            hub,
-            rt::select(modem, rt::select(audio, time::delay(wait_us))),
-        )
-        .await
-        {
+            Either::Right(Either::Right(())) => Wake::Timer,
+        }
+    } else {
+        match rt::select(hub, rt::select(modem, time::delay(wait_us))).await {
             Either::Left(r) => Wake::Hub(r),
             Either::Right(Either::Left(r)) => Wake::Modem(r),
-            Either::Right(Either::Right(Either::Left(r))) => Wake::Audio(r),
-            Either::Right(Either::Right(Either::Right(()))) => Wake::Timer,
-        },
+            Either::Right(Either::Right(())) => Wake::Timer,
+        }
     }
 }
 
@@ -1225,24 +1035,16 @@ fn main() -> i32 {
             return 0;
         }
     };
-    let audio_server = match Server::create(neoaudio::NAME) {
-        Ok(s) => s,
-        Err(e) => {
-            dprintln!("[modemd] NeoAudio name taken ({}): exiting", e);
-            return 0;
-        }
-    };
-    dprintln!("[modemd] start: serving NeoModem and NeoAudio, connecting to NeoHub");
+    dprintln!("[modemd] start: serving NeoModem, connecting to NeoHub and AUDIOD");
     let mut d = Daemon {
         phase: Phase::Starting,
         modem: Some(Modem::new()),
-        rx: vec![0u8; 0x2000],
         status: Status::default(),
         hub: Snapshot::default(),
         next_connect: 0,
         connect_backoff: 100,
         spawned: false,
-        audio: adsp::CallAudio::new(),
+        audio: audio::Link::new(),
         dtmf_stop: None,
         subscribers: Vec::new(),
         next_session: 0,
@@ -1251,15 +1053,10 @@ fn main() -> i32 {
         alert_dismissed: None,
         silenced: None,
         waiting_alert: None,
-        audio_seen: None,
         haptic_error: 0,
-        ring_retry_at: 0,
         sms_tone_until: 0,
         sms_buzz_at: 0,
-        sound: sound::Sound::new(),
-        amps_checked: 0,
-        jack_checked: 0,
-        jack_probed: false,
+        ring_error: 0,
     };
     // Ordinary C: settings only; modem EFS remains RAM-backed (G4).
     if let Ok(fs) = e32::fs::Fs::connect() {
@@ -1345,7 +1142,6 @@ fn main() -> i32 {
     d.publish();
     rt::block_on(async {
         let mut receive = pin!(server.receive());
-        let mut audio_receive = pin!(audio_server.receive());
         let mut pump = hub::schedule::PumpDeadline::new(time::millis(), (LOOP_US / 1000) as u64);
         let mut hub_bytes = vec![0; 0x8000];
         let mut receive_turn = 0;
@@ -1357,7 +1153,6 @@ fn main() -> i32 {
                 loop {
                     if pump.due(time::millis()) {
                         d.step();
-                        d.sound_step();
                         pump.completed(time::millis());
                     }
                     if hub_session.is_none()
@@ -1368,13 +1163,12 @@ fn main() -> i32 {
                     // C6: delays are microseconds. IPC traffic never postpones the 10 ms pump.
                     let wake = next_wake(
                         receive.as_mut(),
-                        audio_receive.as_mut(),
                         hub_receive.as_mut(),
                         pump.wait_us(time::millis()).max(1),
                         receive_turn,
                     )
                     .await;
-                    receive_turn = (receive_turn + 1) % 3;
+                    receive_turn = (receive_turn + 1) % 2;
                     match wake {
                         Wake::Modem(Ok(msg)) => {
                             receive.set(server.receive());
@@ -1383,14 +1177,6 @@ fn main() -> i32 {
                         Wake::Modem(Err(e)) => {
                             dprintln!("[modemd] receive failed ({})", e);
                             receive.set(server.receive());
-                        }
-                        Wake::Audio(Ok(msg)) => {
-                            audio_receive.set(audio_server.receive());
-                            let _ = server::dispatch(&mut d.sound, msg);
-                        }
-                        Wake::Audio(Err(e)) => {
-                            dprintln!("[modemd] NeoAudio receive failed ({})", e);
-                            audio_receive.set(audio_server.receive());
                         }
                         Wake::Hub(result) => break Some(result),
                         Wake::Timer => {}

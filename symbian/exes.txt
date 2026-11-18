@@ -1,4 +1,5 @@
 # NAME.EXE uid3 staticlib (build/emitter/build_rust_exe.py; copy the lines and the .a files into build/rust/)
 MODEMD.EXE     0xE0003001  libmodemd.a
 HWHUB.EXE      0xE0003002  libhwhub.a
+AUDIOD.EXE     0xE0003003  libaudiod.a
 NEONET.EXE     0xE0004001  libneonet.a  stack=0x10000

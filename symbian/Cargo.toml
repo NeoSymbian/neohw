@@ -3,7 +3,7 @@
 # (exes.txt). Its own workspace:
 # built only for armv5te-none-eabi with the pinned nightly (`cargo arm`), like neoui/symbian.
 [workspace]
-members = ["hwhub", "modemd", "neonet", "sys"]
+members = ["audiod", "hwhub", "modemd", "neonet", "sys"]
 resolver = "2"
 
 [workspace.dependencies]
