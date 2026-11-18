@@ -758,6 +758,24 @@ impl Router {
         self.radio_failed = true;
         self.events.push(Event::State(self.state()));
     }
+    /// Remove a closed IPC session's port and any of its unsent requests.
+    pub fn unbind(&mut self, port: u32) {
+        self.bindings.retain(|b| b.1 != port);
+        self.outbox.retain(|(_, p, _, _)| *p != port);
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// The pre-stop Reset was acknowledged already; reopen without announcing a second generation.
+    pub fn restart_quiesced(&mut self) {
+        let generation = self.generation;
+        self.reset(true);
+        self.generation = generation;
+        self.events.retain(|e| !matches!(e, Event::Reset { .. }));
+    }
+
     pub fn state(&self) -> State {
         State {
             radio_attached: self.radio_attached(),

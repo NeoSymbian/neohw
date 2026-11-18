@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-//! MODEMD.EXE (docs/hardware/modem.md C4, C5): reads the modem's EFS partitions, boots the modem, runs the apps side of
-//! QRTR (hub::Router + modem::Cellular) over the kernel's telephony HAL functions (kernel qcom_telhal.cpp, 0x4e0d..0x4e12), and
-//! serves the NeoModem IPC API (modem_ipc: status, dial, answer, hang up). neoui's SYSSTART starts it at boot; a
-//! second copy (Terminal `modemd`) finds the server name taken and exits.
-//! The server answers all the time: the partition reads and the boot wait are steps of the loop, never a long block.
+//! MODEMD.EXE (C5, C6, C7): cellular policy over NeoHub, NeoModem, and NeoAudio.
+//! HWHUB owns QRTR and processor boot/recovery; MODEMD owns APR ring 2 until S4.
+//! SYSSTART starts MODEMD, which starts HWHUB while continuing to serve both APIs.
 #![no_std]
 
 extern crate alloc;
 
 mod adsp;
-mod inprocess;
+mod client;
 mod sound;
 
-use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use apr::Mode;
-use core::fmt;
+use client::{Hal, Modem};
 use core::ops::ControlFlow;
 use core::pin::pin;
 use e32::rt::{self, Either};
@@ -24,215 +21,35 @@ use e32::server::{self, Message, Server, Service};
 use e32::sys::err;
 use e32::sys::ipc::TVersion;
 use e32::{dprintln, time};
-use hub::Platform;
-use hub::recovery::{self, StopProgress};
-use inprocess::Modem;
+use hub_ipc::{Event, Snapshot};
 use modem_ipc::{self, Status, op};
-use sys::{
-    BOOT, HAPTIC, IPA_START, Io, PART_READ, RECV, RMTFS_MEM, RPROC_STATE, RPROC_STOP, SEND, STATE,
-    WLAN_MSA, WLAN_START, ext4_err, fs_size, fw_read, hal, hal_io, ipa_firmware, save_private,
-    vendor_file,
-};
+use sys::{HAPTIC, Io, hal_io, save_private};
 
 const NOT_READY: i32 = -18;
-/// modemst1, modemst2, fsg, fsc (the phone's GPT, docs/hardware/modem.md C0)
-const PART_SIZES: [usize; 4] = [0x20_0000, 0x20_0000, 0x20_0000, 0x2_0000];
-const RUNNING: u32 = 8;
-/// the modem's QRTR node; every other node is behind the ADSP's IPCRTR
-const MODEM_NODE: u32 = 0;
-const FATAL: u32 = 1;
-const BOOT_TIMEOUT_MS: u64 = 60_000;
-/// the daemon's step period
 const LOOP_US: i32 = 10_000;
-const STATUS_LOG_MS: u64 = 30_000;
 
-/// boot step, error, SMP2P slave-kernel bits, IPCRTR open
-fn state() -> Result<[u32; 4], i32> {
-    let mut s = [0u32; 4];
-    // SAFETY: STATE writes the live four-word array and takes no second argument.
-    let r = unsafe { hal(STATE, s.as_mut_ptr().cast(), core::ptr::null_mut()) };
-    if r < 0 { Err(r) } else { Ok(s) }
-}
-
-fn processor_stop_state() -> Result<[u32; 4], i32> {
-    let mut s = [0u32; 4];
-    // SAFETY: RPROC_STATE writes the live four-word array and takes no second argument.
-    let r = unsafe { hal(RPROC_STATE, s.as_mut_ptr().cast(), core::ptr::null_mut()) };
-    if r < 0 { Err(r) } else { Ok(s) }
-}
-
-struct Hal;
-
-impl Platform for Hal {
-    fn send(&mut self, node: u32, packet: &[u8]) -> Result<(), i32> {
-        if node != MODEM_NODE {
-            return adsp::send(adsp::RING_QRTR, packet); // the ADSP's router (C6)
-        }
-        // No userspace retry sleeps: mandatory packets use the ordered outbox. The synchronous kernel HAL
-        // may still wait for a receive intent; this is not a hard real-time send deadline.
-        // SAFETY: SEND reads packet.len() bytes from the live packet slice.
-        match unsafe { hal(SEND, packet.as_ptr() as *mut u8, packet.len() as *mut u8) } {
-            r if r < 0 => Err(r),
-            _ => Ok(()),
-        }
-    }
-
-    fn rmtfs_read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), i32> {
-        let io = Io {
-            a: 1,
-            b: offset,
-            len: buf.len() as u32,
-            buf: buf.as_mut_ptr() as u32,
-        };
-        // SAFETY: RMTFS_MEM receives the live slice address and its exact length for this synchronous copy.
-        match unsafe { hal_io(RMTFS_MEM, io) }.0 {
-            r if r < 0 => Err(r),
-            _ => Ok(()),
-        }
-    }
-
-    fn rmtfs_write(&mut self, offset: u32, data: &[u8]) -> Result<(), i32> {
-        let io = Io {
-            a: 2,
-            b: offset,
-            len: data.len() as u32,
-            buf: data.as_ptr() as u32,
-        };
-        // SAFETY: RMTFS_MEM receives the live slice address and its exact length for this synchronous copy.
-        match unsafe { hal_io(RMTFS_MEM, io) }.0 {
-            r if r < 0 => Err(r),
-            _ => Ok(()),
-        }
-    }
-
-    fn log(&mut self, args: fmt::Arguments) {
-        dprintln!("[modemd t={}ms] {}", time::millis(), args);
-    }
-
-    fn utc_ms(&mut self) -> i64 {
-        // before the network or the RTC set the clock it reads 1970-ish: unknown (the log skips pruning)
-        match time::utc_now().0 {
-            u if u < 1_600_000_000 => 0,
-            u => u * 1000,
-        }
-    }
-
-    fn fw_size(&mut self, path: &str) -> Result<usize, i32> {
-        match path.strip_prefix("vendor/") {
-            // SAFETY: Only the daemon's one loop thread accesses the vendor cache.
-            Some(p) => unsafe { vendor_file(p, |fs, f| Ok(fs_size(fs, f))) },
-            None => fw_read(path, 0, &mut []),
-        }
-    }
-
-    fn fw_read(&mut self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, i32> {
-        match path.strip_prefix("vendor/") {
-            // SAFETY: Only the daemon's one loop thread accesses the vendor cache.
-            Some(p) => unsafe {
-                vendor_file(p, |fs, f| {
-                    fs.read_at(f, offset as u64, buf).map_err(ext4_err)
-                })
-            },
-            None => fw_read(path, offset, buf),
-        }
-    }
-
-    fn wlan_start(&mut self) -> Result<(), i32> {
-        // SAFETY: WLAN_START takes no arguments or buffers.
-        match unsafe { hal(WLAN_START, core::ptr::null_mut(), core::ptr::null_mut()) } {
-            r if r < 0 => Err(r),
-            _ => Ok(()),
-        }
-    }
-
-    fn wlan_msa(&mut self, regions: &[hub::wlfw::Region]) -> Result<(), i32> {
-        for r in regions {
-            let io = Io {
-                a: 1,
-                b: r.addr as u32,
-                len: r.size,
-                buf: r.secure as u32,
-            };
-            // SAFETY: WLAN_MSA uses scalar region address/size/security fields.
-            let e = unsafe { hal_io(WLAN_MSA, io) }.0;
-            if e < 0 {
-                return Err(e);
-            }
-        }
-        Ok(())
-    }
-
-    /// The board data on vendor_a: Pixel 3a XL's `firmware/bdwlan-bonito.bin` (the factory image also has -ROW,
-    /// -USA, -JPN, -VZW regional variants and the 3a's -sargo set), else the generic names.
-    /// shortcut: the board name and the default (non-regional) file are fixed; pick by device and region before release.
-    fn board_data(&mut self, board_id: u32) -> Vec<u8> {
-        let names = [
-            String::from("firmware/bdwlan-bonito.bin"),
-            alloc::format!("firmware/bdwlan.b{:02x}", board_id & 0xff),
-            String::from("firmware/bdwlan.bin"),
-        ];
-        for n in &names {
-            // SAFETY: Only the daemon's one loop thread accesses the vendor cache.
-            let got = unsafe {
-                vendor_file(n, |fs, f| {
-                    if f.size > 0x10_0000 {
-                        return Err(-9); // KErrOverflow: a board file is tens of KB
-                    }
-                    fs.read(f).map_err(ext4_err)
-                })
-            };
-            match got {
-                Ok(d) => {
-                    dprintln!("[modemd] wlfw: board data from {n}");
-                    return d;
-                }
-                Err(e) => dprintln!("[modemd] wlfw: no {n} ({e})"),
-            }
-        }
-        Vec::new()
-    }
-}
-
+#[derive(Clone, Copy)]
 enum Phase {
-    /// IPA's GSI firmware from vendor_a, then IPA powered and the firmware loaded (C5b)
-    Ipa,
-    /// reading partition i (one per loop step)
-    Read(usize),
-    /// the ADSP loads and comes up before the modem boots (C6): loading it during the modem's start-up lost the
-    /// modem's announcements, and the modem hears "adsp up" (SSCTL) as soon as both run
-    Adsp,
-    /// the kernel boots the modem; since t0
-    Wait(u64),
+    Starting,
     Running,
-    Recover {
-        mask: u32,
-        since: u64,
-        issued: bool,
-        /// A watchdog failure leaves stop ownership with the kernel until a terminal acknowledgement.
-        watchdog: Option<i32>,
-    },
+    Recover { watchdog: Option<i32> },
     Failed,
-    /// Startup radio-disabled build: ADSP services remain active.
     Disabled,
-    /// No modem on this machine (QEMU): NeoModem refuses connections as if absent; NeoAudio still serves (A1).
     Absent,
 }
 
 struct Daemon {
     phase: Phase,
-    images: [Vec<u8>; 4],
     modem: Option<Modem>,
-    /// the QRTR receive buffer (8 KB: not on the 8 KB stack)
+    /// APR receive scratch (8 KB: not on the 8 KB stack)
     rx: Vec<u8>,
     /// before the modem exists (booting / failed)
     status: Status,
-    t0: u64,
-    last_log: u64,
-    fatal_seen: bool,
-    /// the kernel runs IPA: LTE allowed, the IPA handshake on (else voice-only)
-    ipa_up: bool,
-    /// the audio DSP: serviced independently of radio preparation and failures
-    adsp: adsp::Adsp,
+    /// Boot and recovery facts belong to HWHUB.
+    hub: Snapshot,
+    next_connect: u64,
+    connect_backoff: u64,
+    spawned: bool,
     /// the call's audio path and the in-call buttons' settings (C6)
     audio: adsp::CallAudio,
     /// a keypad tone ends here (ms): one tap = one 200 ms tone
@@ -240,9 +57,7 @@ struct Daemon {
     subscribers: Vec<(u32, Message)>,
     next_session: u32,
     published: Status,
-    recovery_attempt: u8,
     haptic_at: u64,
-    healthy_since: u64,
     alert_dismissed: Option<u8>,
     /// the call Silence quietened (op::SILENCE): no tone or vibration until it stops ringing; the settings stay
     silenced: Option<u8>,
@@ -304,59 +119,184 @@ impl Daemon {
         }
     }
 
-    fn recover(&mut self, mask: u32) {
-        if matches!(self.phase, Phase::Recover { .. }) {
-            return;
-        }
-        // shortcut: the ADSP is never stopped. Its TrustZone PAS shutdown never returned on the phone and froze it
-        // (2026-11-12, three times: after a failed modem restart, then from Retry), so every recovery restarts the
-        // modem only, whatever the caller asked for; a lost ADSP means no call audio until a reboot. Upgrade when
-        // the PAS shutdown hang is understood.
-        if mask & 2 != 0 {
-            dprintln!(
-                "[modemd] recovery: keeping the ADSP (asked mask {}); restarting the modem only",
-                mask
-            );
-        }
-        let mask = 1;
-        // nothing more goes to the processors being stopped; the ADSP side survives for a modem-only stop
-        if let Some(m) = &mut self.modem {
-            m.lost(&mut Hal);
-        }
-        if self.recovery_attempt >= 3 {
-            self.phase = Phase::Failed;
-            return;
-        }
-        let delay = [1000, 3000, 10_000][usize::from(self.recovery_attempt)];
-        self.recovery_attempt += 1;
+    fn clear_audio(&mut self) {
         self.dtmf_stop = None;
-        self.healthy_since = 0;
-        // SAFETY: HAPTIC uses scalar duration/amplitude fields and no buffer.
+        // Stop alerts before acknowledging a processor reset (C6).
+        // SAFETY: HAPTIC uses scalar fields and no buffer.
         let haptic = unsafe { hal_io(HAPTIC, Io::default()) }.0;
         if haptic < 0 {
-            dprintln!(
-                "[modemd t={}ms] recovery vibration stop failed ({})",
-                time::millis(),
-                haptic
-            );
+            dprintln!("[modemd] recovery vibration stop failed ({})", haptic);
         }
         self.audio.apr.set(Mode::Off);
+        self.audio.test = None;
+        self.sms_tone_until = 0;
+        self.sms_buzz_at = 0;
+        self.haptic_at = 0;
         self.alert_dismissed = None;
         self.silenced = None;
         self.waiting_alert = None;
         let _ = adsp::audio(2, 0);
-        self.phase = Phase::Recover {
-            mask,
-            since: time::millis() + delay,
-            issued: false,
-            watchdog: None,
+    }
+
+    fn recover(&mut self, mask: u32) {
+        if matches!(self.phase, Phase::Recover { .. }) {
+            return;
+        }
+        self.clear_audio();
+        if let Some(m) = &self.modem {
+            let r = m.recover(mask);
+            if r < 0 {
+                dprintln!("[modemd] NeoHub recovery request failed ({})", r);
+            } else {
+                self.phase = Phase::Recover { watchdog: None };
+            }
+        }
+    }
+
+    fn snapshot(&mut self, s: Snapshot) {
+        if self
+            .modem
+            .as_ref()
+            .is_some_and(|m| (s.generation.wrapping_sub(m.status.generation) as i32) < 0)
+        {
+            return; // A pre-attach queued snapshot must not roll back a live generation.
+        }
+        if self
+            .modem
+            .as_ref()
+            .is_some_and(|m| m.status.generation != s.generation)
+        {
+            self.reset_client(s.generation, hub_ipc::Subsystem::All);
+        }
+        if let Some(m) = &mut self.modem {
+            m.event(Event::State(s.state));
+        }
+        self.hub = s;
+        self.phase = match s.phase {
+            hub_ipc::phase::RUNNING => Phase::Running,
+            hub_ipc::phase::RECOVER => Phase::Recover {
+                watchdog: (s.recovery_error != 0).then_some(s.recovery_error),
+            },
+            hub_ipc::phase::FAILED => Phase::Failed,
+            hub_ipc::phase::DISABLED => Phase::Disabled,
+            hub_ipc::phase::ABSENT => Phase::Absent,
+            _ => Phase::Starting,
         };
-        dprintln!(
-            "[modemd t={}ms] recovery attempt {} mask {}",
-            time::millis(),
-            self.recovery_attempt,
-            mask
-        );
+    }
+
+    fn reset_client(&mut self, generation: u32, subsystem: hub_ipc::Subsystem) {
+        self.clear_audio();
+        // MSS-only recovery leaves the ADSP's APR handles and published tickets alive.
+        // Retain their owner until Off teardown completes; a Reset is no shutdown proof.
+        if let Some(m) = &mut self.modem {
+            m.event(Event::Reset {
+                subsystem,
+                generation,
+            });
+            let r = m.quiesced(generation);
+            if r < 0 {
+                dprintln!("[modemd] NeoHub QUIESCED failed ({})", r);
+            }
+        }
+    }
+
+    fn hub_events(&mut self, bytes: &[u8]) {
+        let Some(events) = hub_ipc::decode_batch(bytes) else {
+            dprintln!("[modemd] malformed NeoHub event batch");
+            return;
+        };
+        let mut dropped = false;
+        for e in events {
+            match e {
+                Event::Status(s) => self.snapshot(s),
+                Event::Dropped(n) => {
+                    dropped = true;
+                    dprintln!("[modemd] NeoHub dropped {} events", n);
+                }
+                Event::Reset {
+                    generation,
+                    subsystem,
+                } => {
+                    if self
+                        .modem
+                        .as_ref()
+                        .is_some_and(|m| (generation.wrapping_sub(m.status.generation) as i32) < 0)
+                    {
+                        continue;
+                    }
+                    if self
+                        .modem
+                        .as_ref()
+                        .is_some_and(|m| m.status.generation != generation)
+                    {
+                        self.reset_client(generation, subsystem);
+                    } else if let Some(m) = &self.modem {
+                        let _ = m.quiesced(generation);
+                    }
+                }
+                _ => {
+                    if let Some(m) = &mut self.modem {
+                        m.event(e);
+                    }
+                }
+            }
+        }
+        if dropped {
+            // A Reset and its Status can both be evicted while the client stalls.
+            if let Some(Ok(s)) = self.modem.as_ref().map(Modem::snapshot) {
+                self.snapshot(s);
+            }
+        }
+    }
+
+    fn connect_hub(&mut self) {
+        let now = time::millis();
+        if self.modem.as_ref().is_some_and(|m| m.session().is_some()) || now < self.next_connect {
+            return;
+        }
+        match client::connect() {
+            Ok(session) => {
+                if let Some(m) = &mut self.modem {
+                    match m.attach(session) {
+                        Ok(s) => {
+                            self.snapshot(s);
+                            self.connect_backoff = 100;
+                            dprintln!("[modemd] connected to NeoHub");
+                            return;
+                        }
+                        Err(e) => dprintln!("[modemd] NeoHub attach failed ({})", e),
+                    }
+                }
+            }
+            Err(e) => {
+                if e == err::KERR_NOT_FOUND && !self.spawned {
+                    match e32::process::Process::spawn("HWHUB.EXE", "") {
+                        Ok(p) => {
+                            p.resume();
+                            self.spawned = true;
+                            dprintln!("[modemd] HWHUB started");
+                        }
+                        Err(r) => dprintln!("[modemd] HWHUB spawn failed ({})", r),
+                    }
+                } else if e != err::KERR_NOT_FOUND {
+                    dprintln!("[modemd] NeoHub connect failed ({})", e);
+                }
+            }
+        }
+        self.next_connect = now.saturating_add(self.connect_backoff);
+        self.connect_backoff = (self.connect_backoff * 2).min(2000);
+    }
+
+    fn hub_lost(&mut self, error: i32) {
+        dprintln!("[modemd] NeoHub disconnected ({})", error);
+        self.clear_audio();
+        if let Some(m) = &mut self.modem {
+            m.detach();
+        }
+        self.phase = Phase::Starting;
+        // A lost hub session does not acknowledge an ADSP stop: keep draining APR Off.
+        self.next_connect = time::millis() + 100;
+        self.spawned = false;
     }
 
     /// settings.bin: the C8 record (C7's plus caller ID and the log's days); C7 files still load.
@@ -420,235 +360,11 @@ impl Daemon {
             .unwrap_or(0)
     }
 
-    fn fail(&mut self, what: &str, r: i32) {
-        dprintln!("[modemd] {} failed ({})", what, r);
-        self.phase = Phase::Failed;
-        self.status.modem = modem_ipc::modem::FAILED;
-        if let Some(m) = &mut self.modem {
-            m.lost(&mut Hal);
-        }
-        if self.modem.is_some() && self.recovery_attempt < 3 {
-            // a modem failure restarts the modem only: the ADSP's TrustZone shutdown (PAS) never returned on the phone
-            // and froze it (2026-11-12); only the ADSP's own faults may stop it
-            self.recover(1);
-        }
-    }
-
-    /// One step of the work: Err(KErrNotSupported) when this machine has no modem (QEMU/Syborg).
-    fn step(&mut self) -> Result<(), i32> {
-        if matches!(self.phase, Phase::Absent) {
-            return Ok(());
-        }
-        self.adsp.step();
+    fn step(&mut self) {
+        self.connect_hub();
         self.run();
         self.save_log();
         self.save_sms();
-        match self.phase {
-            Phase::Ipa => {
-                match ipa_firmware() {
-                    Ok((image, mdt_len)) => {
-                        // SAFETY: The image stays alive while IPA_START reads its declared length.
-                        let (r, _) = unsafe {
-                            hal_io(
-                                IPA_START,
-                                Io {
-                                    a: mdt_len as u32,
-                                    b: 0,
-                                    len: image.len() as u32,
-                                    buf: image.as_ptr() as u32,
-                                },
-                            )
-                        };
-                        dprintln!(
-                            "[modemd] ipa: firmware {} bytes (mdt {}), IPA bring-up -> {}",
-                            image.len(),
-                            mdt_len,
-                            r
-                        );
-                        self.ipa_up = r == 0;
-                    }
-                    Err(ext4ro::Error::Io(e))
-                        if e == err::KERR_NOT_SUPPORTED && !matches!(self.adsp, adsp::Adsp::Up) =>
-                    {
-                        dprintln!(
-                            "[modemd] no modem on this machine ({}): serving NeoAudio only",
-                            e
-                        );
-                        self.phase = Phase::Absent;
-                        return Ok(());
-                    }
-                    Err(e) => dprintln!("[modemd] ipa: no firmware from vendor_a ({:?})", e),
-                }
-                self.phase = Phase::Read(0); // the modem boots either way
-            }
-            Phase::Read(i) => {
-                let n = PART_SIZES[i];
-                let mut v = vec![0u8; n];
-                // SAFETY: PART_READ writes only the live buffer described by this Io.
-                let (r, _) = unsafe {
-                    hal_io(
-                        PART_READ,
-                        Io {
-                            a: i as u32,
-                            b: 0,
-                            len: n as u32,
-                            buf: v.as_mut_ptr() as u32,
-                        },
-                    )
-                };
-                if r == err::KERR_NOT_SUPPORTED && !matches!(self.adsp, adsp::Adsp::Up) {
-                    return Err(r);
-                }
-                if r < 0 {
-                    self.fail("partition read", r);
-                    return Ok(());
-                }
-                self.images[i] = v;
-                if i + 1 < PART_SIZES.len() {
-                    self.phase = Phase::Read(i + 1);
-                } else {
-                    self.boot();
-                }
-            }
-            // (the top of step() already stepped the ADSP and serviced its rings)
-            Phase::Adsp => {
-                if !self.adsp.busy() {
-                    if matches!(self.adsp, adsp::Adsp::Failed) {
-                        // no audio, but the radio still starts (PR #2)
-                        dprintln!("[modemd] ADSP unavailable; starting the radio without it");
-                    }
-                    if cfg!(feature = "radio-disabled") {
-                        self.phase = Phase::Disabled;
-                    } else if self.modem.as_ref().is_some_and(Modem::radio_attached) {
-                        // a recovery restarted the ADSP: the radio storage is still attached, the modem boots again
-                        self.boot_modem();
-                    } else {
-                        self.phase = Phase::Ipa;
-                    }
-                }
-            }
-            Phase::Wait(t0) => {
-                let s = match state() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        self.fail("modem boot state", e);
-                        return Ok(());
-                    }
-                };
-                if s[1] != 0 {
-                    self.fail("modem boot", s[1] as i32);
-                } else if s[0] == RUNNING && s[3] != 0 {
-                    let now = time::millis();
-                    dprintln!("[modemd] modem running after {} ms; QRTR up", now - t0);
-                    self.t0 = now;
-                    self.last_log = now;
-                    if let Some(m) = &mut self.modem {
-                        m.start(&mut Hal);
-                    }
-                    self.phase = Phase::Running;
-                } else if time::millis() - t0 > BOOT_TIMEOUT_MS {
-                    self.fail("modem boot (60 s)", NOT_READY);
-                }
-            }
-            Phase::Recover {
-                mask,
-                since,
-                issued,
-                watchdog,
-            } => {
-                let now = time::millis();
-                if now < since {
-                    return Ok(());
-                }
-                if !issued {
-                    // A previous worker may still own shutdown, or its state may be unreadable. Neither
-                    // permits another stop request. Do not interpret a HAL read failure as an idle worker.
-                    if !matches!(processor_stop_state(), Ok([0 | 2 | 3, _, _, _])) {
-                        if watchdog.is_none()
-                            && now.saturating_sub(since) >= recovery::STOP_WATCHDOG_MS
-                        {
-                            dprintln!(
-                                "[modemd t={}ms] waiting for existing processor stop; quarantined",
-                                now
-                            );
-                            self.phase = Phase::Recover {
-                                mask,
-                                since,
-                                issued,
-                                watchdog: Some(err::KERR_TIMED_OUT),
-                            };
-                        }
-                        return Ok(());
-                    }
-                    // SAFETY: RPROC_STOP takes the processor mask and no buffer.
-                    let r = unsafe {
-                        hal_io(
-                            RPROC_STOP,
-                            Io {
-                                a: mask,
-                                ..Io::default()
-                            },
-                        )
-                    }
-                    .0;
-                    if r < 0 {
-                        self.fail("processor stop", r);
-                        return Ok(());
-                    }
-                    self.phase = Phase::Recover {
-                        mask,
-                        since: now,
-                        issued: true,
-                        watchdog: None,
-                    };
-                } else {
-                    match recovery::stop_progress(processor_stop_state(), now.saturating_sub(since))
-                    {
-                        StopProgress::Pending(error) => {
-                            if watchdog.is_none() && error.is_some() {
-                                dprintln!(
-                                    "[modemd t={}ms] processor stop watchdog {:?}; quarantined, still observing",
-                                    now,
-                                    error
-                                );
-                                self.phase = Phase::Recover {
-                                    mask,
-                                    since,
-                                    issued,
-                                    watchdog: error,
-                                };
-                            }
-                        }
-                        StopProgress::Failed(error) => {
-                            self.fail("processor stop completion", error)
-                        }
-                        StopProgress::Complete(generations) => {
-                            dprintln!(
-                                "[modemd t={}ms] processor stop acknowledged mask {} generations {}/{} after {}ms",
-                                now,
-                                mask,
-                                generations[0],
-                                generations[1],
-                                now.saturating_sub(since)
-                            );
-                            if let Some(m) = &mut self.modem {
-                                m.reset(&mut Hal, mask & 2 == 0);
-                            }
-                            self.audio = adsp::CallAudio::new();
-                            // fatal_seen stays: a FATAL bit the kernel left set is not a new fault
-                            if mask & 2 != 0 {
-                                self.adsp = adsp::Adsp::Idle;
-                                self.phase = Phase::Adsp;
-                            } else {
-                                self.boot_modem();
-                            }
-                        }
-                    }
-                }
-            }
-            Phase::Running | Phase::Failed | Phase::Disabled | Phase::Absent => {}
-        }
-        Ok(())
     }
 
     /// An audio setting to the kernel's codecs while the call's audio runs (else it waits for the next call).
@@ -671,7 +387,7 @@ impl Daemon {
     /// Dev tools' audio test (no call): 1 loudspeaker, 2 earpiece, the mic looped back to the amps; 0 stops it.
     /// Pressing the other route while it runs only switches the amps.
     fn audio_test(&mut self, what: i32) -> i32 {
-        if !matches!(self.adsp, adsp::Adsp::Up) {
+        if !(self.hub.adsp == hub_ipc::adsp::UP) {
             return NOT_READY;
         }
         if self.talking() {
@@ -697,7 +413,7 @@ impl Daemon {
     /// (media runs) or the clock sink.
     fn sound_step(&mut self) {
         let now = time::millis();
-        let up = matches!(self.adsp, adsp::Adsp::Up);
+        let up = self.hub.adsp == hub_ipc::adsp::UP;
         let a = &mut self.audio;
         let playing = up && matches!(a.apr.is(), Mode::Media | Mode::Duplex) && a.apr.running();
         if self.sound.changed {
@@ -778,124 +494,28 @@ impl Daemon {
         })
     }
 
-    fn boot(&mut self) {
-        // SAFETY: RMTFS_MEM operation zero only writes the descriptor with region information.
-        let (r, info) = unsafe { hal_io(RMTFS_MEM, Io::default()) };
-        if r < 0 {
-            self.fail("rmtfs carve-out", r);
-            return;
-        }
-        dprintln!(
-            "[modemd] rmtfs buffer {:#x} + {:#x}; booting the modem",
-            info.b,
-            info.len
-        );
-        if info.len < 0x20_0000 {
-            self.fail("rmtfs carve-out size", err::KERR_ARGUMENT);
-            return;
-        }
-        let images = core::mem::take(&mut self.images);
-        if let Some(modem) = &mut self.modem {
-            if let Err(e) = modem.attach_radio(images, info.b as u64) {
-                self.fail("radio storage attachment", e);
-                return;
-            }
-            modem.router.ipa_up = self.ipa_up;
-        }
-        self.boot_modem();
-    }
-
-    fn boot_modem(&mut self) {
-        if cfg!(feature = "radio-disabled") {
-            self.phase = Phase::Disabled;
-            return;
-        }
-        // SAFETY: BOOT takes no arguments or buffers.
-        let r = unsafe { hal(BOOT, core::ptr::null_mut(), core::ptr::null_mut()) };
-        if r < 0 {
-            self.fail("modem boot start", r);
-            return;
-        }
-        self.phase = Phase::Wait(time::millis());
-    }
-
-    /// Every step, in every phase (the ADSP serves audio before and without the radio, PR #2). The health checks
-    /// and the watchdog only judge a running modem; during a recovery nothing is sent to the processors being stopped.
+    /// Cellular and Router have independent 10 ms clocks across NeoHub. HWHUB alone
+    /// retries its ordered outbox; MODEMD runs begin_tick/tick/poll on its own deadline.
     fn run(&mut self) {
-        if matches!(self.phase, Phase::Recover { .. }) {
+        if matches!(self.phase, Phase::Recover { .. })
+            || !self.modem.as_ref().is_some_and(|m| m.session().is_some())
+        {
+            self.audio.apr.set(Mode::Off);
+            if self.hub.adsp == hub_ipc::adsp::UP {
+                self.audio.pump(&mut self.rx);
+            }
+            return;
+        }
+        if matches!(self.phase, Phase::Absent) {
             return;
         }
         let running = matches!(self.phase, Phase::Running);
-        let st = if running {
-            match state() {
-                Ok(s) => s,
-                Err(e) => {
-                    dprintln!(
-                        "[modemd t={}ms] modem state unavailable ({})",
-                        time::millis(),
-                        e
-                    );
-                    self.recover(3);
-                    return;
-                }
-            }
-        } else {
-            [0; 4]
-        };
-        // FATAL counts on its rising edge, observed while running: a bit the kernel leaves set after a stop must not
-        // restart the modem again and again (the latch keeps its value outside Running)
-        if running && recovery::rising(&mut self.fatal_seen, st[2] & FATAL != 0) {
-            let dsp = adsp::processor_state();
-            let quiescent = self.audio.apr.quiescent();
-            let mask = recovery::recovery_mask(dsp, quiescent);
-            dprintln!(
-                "[modemd t={}ms] modem fatal; ADSP {:?} APR quiescent {} -> mask {}",
-                time::millis(),
-                dsp,
-                quiescent,
-                mask
-            );
-            self.recover(mask);
+        if running && self.hub.adsp == hub_ipc::adsp::UP && self.audio.apr.failed_hard() {
+            self.recover(3);
             return;
         }
-        if running && matches!(self.adsp, adsp::Adsp::Up) {
-            // only an ADSP that was up can be lost: a missing one never takes the radio down (PR #2)
-            let dsp = adsp::processor_state();
-            if !matches!(dsp, Ok(s) if s[2] & FATAL == 0 && s[1] == 0) {
-                dprintln!("[modemd t={}ms] ADSP unavailable {:?}", time::millis(), dsp);
-                self.recover(3);
-                return;
-            }
-            if self.audio.apr.failed_hard() {
-                self.recover(3);
-                return;
-            }
-        }
-        let Some(modem) = &mut self.modem else {
-            return;
-        };
+        let Some(modem) = &mut self.modem else { return };
         let buf = &mut self.rx;
-        for _ in 0..32 {
-            if !matches!(self.phase, Phase::Running) {
-                break;
-            }
-            // SAFETY: RECV writes at most buf.len() bytes to the live receive buffer.
-            let r = unsafe { hal(RECV, buf.as_mut_ptr(), buf.len() as *mut u8) };
-            if r == NOT_READY {
-                break;
-            }
-            if r < 0 {
-                dprintln!("[modemd] receive failed ({})", r);
-                break;
-            }
-            modem.handle(&mut Hal, &buf[..r as usize]);
-        }
-        for _ in 0..32 {
-            let Some(n) = adsp::recv(adsp::RING_QRTR, buf) else {
-                break;
-            };
-            modem.handle(&mut Hal, &buf[..n]);
-        }
         // the audio follows what is wanted now: a connected call's voice path, else the test, else nothing (the
         // state machine finishes a running sequence first)
         let talking = if modem.status.calls.len > 0 {
@@ -953,7 +573,7 @@ impl Daemon {
                 }
                 .0;
                 if self.haptic_at == 0 || r != self.haptic_error {
-                    dprintln!("[modemd t={}ms] incoming vibration start -> {}", now, r);
+                    dprintln!("[modemd] t={}ms incoming vibration start -> {}", now, r);
                     self.haptic_error = r;
                 }
                 self.haptic_at = now + 1500;
@@ -961,7 +581,7 @@ impl Daemon {
         } else if self.haptic_at != 0 {
             // SAFETY: HAPTIC uses scalar duration/amplitude fields and no buffer.
             let r = unsafe { hal_io(HAPTIC, Io::default()) }.0;
-            dprintln!("[modemd t={}ms] incoming vibration stop -> {}", now, r);
+            dprintln!("[modemd] t={}ms incoming vibration stop -> {}", now, r);
             self.haptic_error = r;
             self.haptic_at = 0;
         }
@@ -1040,16 +660,6 @@ impl Daemon {
             };
         }
         let chime = now < self.sms_tone_until && !talking && !modem.status.airplane;
-        // a minute of a *running* modem earns new recovery attempts: run() also runs while a failing modem boots,
-        // and counting that time reset the attempts and escalated to stopping the ADSP (froze the phone 2026-11-12)
-        if running {
-            if self.healthy_since == 0 {
-                self.healthy_since = now;
-            }
-            if now.saturating_sub(self.healthy_since) >= 60_000 {
-                self.recovery_attempt = 0;
-            }
-        }
         if talking {
             self.audio.test = None;
         }
@@ -1088,7 +698,7 @@ impl Daemon {
                 }
             };
         let wanted = match (
-            matches!(self.adsp, adsp::Adsp::Up),
+            self.hub.adsp == hub_ipc::adsp::UP,
             talking,
             self.audio.test,
             ring_ready,
@@ -1105,7 +715,7 @@ impl Daemon {
         let audio = (wanted, self.audio.apr.is(), self.audio.apr.quiescent());
         if self.audio_seen != Some(audio) {
             dprintln!(
-                "[modemd t={}ms] audio wanted {:?} current {:?} quiescent {}",
+                "[modemd] t={}ms audio wanted {:?} current {:?} quiescent {}",
                 now,
                 audio.0,
                 audio.1,
@@ -1114,7 +724,7 @@ impl Daemon {
             self.audio_seen = Some(audio);
         }
         self.audio.apr.set(wanted);
-        if matches!(self.adsp, adsp::Adsp::Up) {
+        if self.hub.adsp == hub_ipc::adsp::UP {
             self.audio.pump(buf);
         }
         if self.dtmf_stop.is_some_and(|t| time::millis() >= t) {
@@ -1123,20 +733,6 @@ impl Daemon {
         }
         let now = time::millis();
         modem.tick(&mut Hal, now);
-        if matches!(self.phase, Phase::Running) && now - self.last_log >= STATUS_LOG_MS {
-            self.last_log = now;
-            let s = st;
-            let st = modem.status;
-            dprintln!(
-                "[modemd] {} s: slave-kernel {:#x}, reg {} rat {} bars {}, call state {}",
-                (now - self.t0) / 1000,
-                s[2],
-                st.reg,
-                st.rat,
-                st.bars,
-                st.call.state
-            );
-        }
         if running && modem.watchdog() {
             self.recover(3);
         }
@@ -1196,7 +792,7 @@ impl Service for Daemon {
                 | op::SMS_EDIT
                 | op::SMS_SETTINGS
         ) && !matches!(self.phase, Phase::Running)
-            && !(audio_op && matches!(self.adsp, adsp::Adsp::Up))
+            && !(audio_op && (self.hub.adsp == hub_ipc::adsp::UP))
         {
             msg.complete(NOT_READY);
             return;
@@ -1357,15 +953,10 @@ impl Service for Daemon {
                 }
             }
             op::RETRY => {
-                if !matches!(self.phase, Phase::Failed)
-                    || self.modem.is_none()
-                    || !matches!(processor_stop_state(), Ok([0 | 2 | 3, _, _, _]))
-                {
+                if !matches!(self.phase, Phase::Failed) {
                     err::KERR_IN_USE
                 } else {
-                    self.recovery_attempt = 0;
-                    self.recover(1); // the modem only (recover() never stops the ADSP)
-                    0
+                    self.modem.as_ref().map_or(NOT_READY, |m| m.recover(1))
                 }
             }
             // the call log (C8)
@@ -1542,9 +1133,10 @@ impl Service for Daemon {
                 }
             });
             // SAFETY: HAPTIC uses scalar duration/amplitude fields and no buffer.
+            // SAFETY: HAPTIC uses scalar fields and no buffer.
             let haptic = unsafe { hal_io(HAPTIC, Io::default()) }.0;
             dprintln!(
-                "[modemd t={}ms] answered/ended/silenced vibration stop -> {}",
+                "[modemd] t={}ms answered/ended/silenced vibration stop -> {}",
                 time::millis(),
                 haptic
             );
@@ -1568,6 +1160,63 @@ fn call_audio(state: u8, is: Mode) -> bool {
         || (is == Mode::Call && matches!(state, call::HOLD | call::DISCONNECTING))
 }
 
+enum Wake {
+    Modem(Result<Message, i32>),
+    Audio(Result<Message, i32>),
+    Hub(Result<usize, i32>),
+    Timer,
+}
+
+/// `select` is left-biased: rotate first priority so neither IPC floods nor QRTR starve peers.
+async fn next_wake<M, A, H>(
+    modem: core::pin::Pin<&mut M>,
+    audio: core::pin::Pin<&mut A>,
+    hub: core::pin::Pin<&mut H>,
+    wait_us: i32,
+    turn: u8,
+) -> Wake
+where
+    M: core::future::Future<Output = Result<Message, i32>>,
+    A: core::future::Future<Output = Result<Message, i32>>,
+    H: core::future::Future<Output = Result<usize, i32>>,
+{
+    match turn {
+        0 => match rt::select(
+            modem,
+            rt::select(audio, rt::select(hub, time::delay(wait_us))),
+        )
+        .await
+        {
+            Either::Left(r) => Wake::Modem(r),
+            Either::Right(Either::Left(r)) => Wake::Audio(r),
+            Either::Right(Either::Right(Either::Left(r))) => Wake::Hub(r),
+            Either::Right(Either::Right(Either::Right(()))) => Wake::Timer,
+        },
+        1 => match rt::select(
+            audio,
+            rt::select(hub, rt::select(modem, time::delay(wait_us))),
+        )
+        .await
+        {
+            Either::Left(r) => Wake::Audio(r),
+            Either::Right(Either::Left(r)) => Wake::Hub(r),
+            Either::Right(Either::Right(Either::Left(r))) => Wake::Modem(r),
+            Either::Right(Either::Right(Either::Right(()))) => Wake::Timer,
+        },
+        _ => match rt::select(
+            hub,
+            rt::select(modem, rt::select(audio, time::delay(wait_us))),
+        )
+        .await
+        {
+            Either::Left(r) => Wake::Hub(r),
+            Either::Right(Either::Left(r)) => Wake::Modem(r),
+            Either::Right(Either::Right(Either::Left(r))) => Wake::Audio(r),
+            Either::Right(Either::Right(Either::Right(()))) => Wake::Timer,
+        },
+    }
+}
+
 fn main() -> i32 {
     let server = match Server::create(modem_ipc::NAME) {
         Ok(s) => s,
@@ -1583,33 +1232,22 @@ fn main() -> i32 {
             return 0;
         }
     };
-    dprintln!(
-        "[modemd] start: serving NeoModem and NeoAudio, starting ADSP before radio preparation"
-    );
+    dprintln!("[modemd] start: serving NeoModem and NeoAudio, connecting to NeoHub");
     let mut d = Daemon {
-        phase: Phase::Adsp,
-        images: Default::default(),
-        modem: Some({
-            let mut router = Modem::support_only();
-            router.router.radio_enabled = !cfg!(feature = "radio-disabled");
-            router.router.trace = cfg!(feature = "qrtr-trace"); // every QRTR packet in the log (Wi-Fi W0)
-            router
-        }),
+        phase: Phase::Starting,
+        modem: Some(Modem::new()),
         rx: vec![0u8; 0x2000],
         status: Status::default(),
-        t0: 0,
-        last_log: 0,
-        fatal_seen: false,
-        ipa_up: false,
-        adsp: adsp::Adsp::Idle,
+        hub: Snapshot::default(),
+        next_connect: 0,
+        connect_backoff: 100,
+        spawned: false,
         audio: adsp::CallAudio::new(),
         dtmf_stop: None,
         subscribers: Vec::new(),
         next_session: 0,
         published: Status::default(),
-        recovery_attempt: 0,
         haptic_at: 0,
-        healthy_since: 0,
         alert_dismissed: None,
         silenced: None,
         waiting_alert: None,
@@ -1709,43 +1347,61 @@ fn main() -> i32 {
         let mut receive = pin!(server.receive());
         let mut audio_receive = pin!(audio_server.receive());
         let mut pump = hub::schedule::PumpDeadline::new(time::millis(), (LOOP_US / 1000) as u64);
+        let mut hub_bytes = vec![0; 0x8000];
+        let mut receive_turn = 0;
         loop {
-            if pump.due(time::millis()) {
-                if let Err(e) = d.step() {
-                    dprintln!("[modemd] no modem on this machine ({}): exiting", e);
-                    return e;
+            let hub_session = d.modem.as_ref().and_then(Modem::session);
+            // Descriptor storage outlives the pinned SendFuture and is read only after completion.
+            let completed = {
+                let mut hub_receive = pin!(client::receive(hub_session.as_deref(), &mut hub_bytes));
+                loop {
+                    if pump.due(time::millis()) {
+                        d.step();
+                        d.sound_step();
+                        pump.completed(time::millis());
+                    }
+                    if hub_session.is_none()
+                        && d.modem.as_ref().is_some_and(|m| m.session().is_some())
+                    {
+                        break None;
+                    }
+                    // C6: delays are microseconds. IPC traffic never postpones the 10 ms pump.
+                    let wake = next_wake(
+                        receive.as_mut(),
+                        audio_receive.as_mut(),
+                        hub_receive.as_mut(),
+                        pump.wait_us(time::millis()).max(1),
+                        receive_turn,
+                    )
+                    .await;
+                    receive_turn = (receive_turn + 1) % 3;
+                    match wake {
+                        Wake::Modem(Ok(msg)) => {
+                            receive.set(server.receive());
+                            let _ = server::dispatch(&mut d, msg);
+                        }
+                        Wake::Modem(Err(e)) => {
+                            dprintln!("[modemd] receive failed ({})", e);
+                            receive.set(server.receive());
+                        }
+                        Wake::Audio(Ok(msg)) => {
+                            audio_receive.set(audio_server.receive());
+                            let _ = server::dispatch(&mut d.sound, msg);
+                        }
+                        Wake::Audio(Err(e)) => {
+                            dprintln!("[modemd] NeoAudio receive failed ({})", e);
+                            audio_receive.set(audio_server.receive());
+                        }
+                        Wake::Hub(result) => break Some(result),
+                        Wake::Timer => {}
+                    }
+                    d.publish();
                 }
-                d.sound_step();
-                pump.completed(time::millis());
-            }
-            // one step every 10 ms: the rings are polled (e32 delays are in microseconds; the old "20 ms / 2 s"
-            // were 20 us / 2 ms, C6 2026-11-09)
-            match rt::select(
-                receive.as_mut(),
-                rt::select(
-                    audio_receive.as_mut(),
-                    time::delay(pump.wait_us(time::millis()).max(1)),
-                ),
-            )
-            .await
-            {
-                Either::Left(Ok(msg)) => {
-                    receive.set(server.receive());
-                    let _ = server::dispatch(&mut d, msg);
-                }
-                Either::Left(Err(e)) => {
-                    dprintln!("[modemd] receive failed ({})", e);
-                    receive.set(server.receive());
-                }
-                Either::Right(Either::Left(Ok(msg))) => {
-                    audio_receive.set(audio_server.receive());
-                    let _ = server::dispatch(&mut d.sound, msg);
-                }
-                Either::Right(Either::Left(Err(e))) => {
-                    dprintln!("[modemd] NeoAudio receive failed ({})", e);
-                    audio_receive.set(audio_server.receive());
-                }
-                Either::Right(Either::Right(())) => {}
+            };
+            match completed {
+                Some(Ok(n)) => d.hub_events(&hub_bytes[..n]),
+                Some(Err(e)) => d.hub_lost(e),
+                None => {}
             }
             d.publish();
         }

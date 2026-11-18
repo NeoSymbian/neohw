@@ -23,15 +23,16 @@ in [kernel](https://github.com/NeoSymbian/kernel) under `baseport/arm64`.
 | `phone-rules`, `sms` | Dial strings, emergency numbers, caller matching, the blocklist; SMS PDUs |
 | `qrtr` | QRTR and QMI wire codecs |
 | `apr` | APR audio codecs and the audio state machine |
-| `hub-ipc` | In-process Bus/Event boundary for the future NeoHub IPC |
+| `hub-ipc` | NeoHub operations, snapshots, event batches, session queues and the cellular Bus/Event boundary |
 | `hub` | Node-1 QRTR routing, retry outbox, RAM EFS, locator/TFTP, IPA, SSCTL, recovery and WLFW driver |
 | `modem` | Cellular QMI clients, status, calls, SIM/PIN, logs, blocklist and SMS; uses only the hub Bus/Event boundary |
 | `ext4ro` | Read-only ext4 for firmware on the vendor partition |
-| `wlfw` | The Wi-Fi firmware's QMI control service (WLFW, QMI 69); MODEMD drives it over its QRTR link |
+| `wlfw` | The Wi-Fi firmware's QMI control service (WLFW, QMI 69); HWHUB drives it over its QRTR link |
 | `wpa` | WPA2-PSK, supplicant side: PMK, PTK, the 4-way and group key handshakes (sans-I/O; CCMP, PSK, no MFP) |
 | `net` | NeoNet: the IP stack (smoltcp: DHCP, DNS, TCP, UDP), its IPC protocol and the client (`client` feature) |
 | `symbian/sys` | Shared HAL ABI, vendor ext4/firmware access and private-file saving |
-| `symbian/modemd` | MODEMD.EXE (0xE0003001): the modem, the ADSP, NeoModem and NeoAudio |
+| `symbian/hwhub` | HWHUB.EXE (0xE0003002): QRTR rings/router, firmware, MSS/ADSP boot, recovery and NeoHub |
+| `symbian/modemd` | MODEMD.EXE (0xE0003001): cellular NeoHub client, NeoModem, APR audio and NeoAudio |
 | `symbian/neonet` | NEONET.EXE (0xE0004001): the IP stack on the kernel's WlanLink frames, the NeoNet server |
 
 Consumers pin these crates by git rev: neoui (`modem-ipc`, `neoaudio`, `phone-rules`, `wpa`, `net`), phone
@@ -85,50 +86,53 @@ lists every outside source. Wi-Fi message ids and layouts are facts from Linux a
 The Linux Foundation), cited in the source. `wpa` follows IEEE 802.11-2016 12.7 and uses RustCrypto's `sha1`, `hmac`,
 `pbkdf2` and `aes-kw` (MIT/Apache-2.0).
 
-## Independent ADSP servicing (driver-support prerequisite)
+## S3 process boundary
 
-MODEMD remains the only consumer of the ADSP APR and QRTR rings. It starts the ADSP from `vendor_a` before
-IPA/EFS/RMTFS preparation. An ADSP-only router serves locator/TFTP without advertising RMTFS or inventing its
-physical address; real radio resources attach to the same router later. Radio preparation/boot failure does not
-stop ADSP QRTR or call/loopback processing. Pending radio packets are discarded on radio failure so they cannot
-block ADSP replies. This does not implement general PCM playback or a separate audio server.
+SYSSTART still starts MODEMD. It creates NeoModem and NeoAudio first, then connects to NeoHub, starting
+HWHUB.EXE when the server is absent. Connection retries use the loop's deadline; firmware loading and recovery
+run in HWHUB. HWHUB alone consumes MSS QRTR (HAL RECV 0x4e10) and ADSP QRTR (CHAN_RECV ring 1).
+MODEMD alone consumes APR ring 2 until S4. PCM stays in its existing AudioMem buffers.
 
-The loop checks a fixed polling deadline before dispatching another IPC request. Receive batches are bounded,
-and the userspace transport no longer adds retry sleeps after a failed HAL send. The kernel GLINK HAL can still
-wait for a receive intent (up to 200 kernel sleep iterations). The deadline prevents IPC floods from resetting
-the polling timer; synchronous transport, firmware, storage and codec HAL calls still need measured phone budgets
-before PCM deadlines can be promised.
+HWHUB starts the ADSP from `vendor_a` before IPA/EFS/RMTFS preparation (C5, C6). Its support-only router serves
+locator/TFTP without advertising RMTFS or inventing a physical address; real radio resources attach later.
+Radio preparation failure leaves ADSP QRTR servicing available. On Syborg HWHUB serves a no-hardware snapshot;
+MODEMD retains NeoAudio's clock sink and rejects NeoModem connections once that state is known.
 
-For the startup-only radio-disabled diagnostic image, build from `symbian/` with
-`cargo arm --features radio-disabled`. It skips IPA/EFS/MSS startup and automatic online requests while leaving
-ADSP/loopback servicing available. This is a build option, not a runtime airplane-mode API. Default builds retain
-normal cellular startup. Validate cold boot without SIM, radio-disabled loopback, forced radio preparation failure
-and normal two-way calls on the phone before using this candidate as the installed image.
+NeoHub v1 uses little-endian descriptors; integer arguments are Symbian IPC words:
 
-## S2 ownership boundary
+| Op | Arguments and completion |
+|---|---|
+| 0 BIND | int0 service, int1 local port; session owns the port |
+| 1 SEND | des0: port:u32, destination node:u32, destination port:u32, essential:u32 (0/1), length:u32, payload bytes; completion 1 physically sent, 0 otherwise |
+| 2 RECV | writable des0: event batch; held until events arrive; one outstanding per session |
+| 3 CANCEL_RECV | completes the session's outstanding receive with cancellation |
+| 4 STATUS | writable des0: hub state, boot phase, processor states, recovery and generation snapshot |
+| 5 RECOVER | int0 processor mask; current phone workaround forces MSS-only restart |
+| 6 QUIESCED | int0 reset generation; acknowledges client state invalidation |
 
-MODEMD still runs the same 10 ms loop and serves NeoModem/NeoAudio. Its `inprocess` adapter composes `hub::Router`
-and `modem::Cellular`; cellular has no dependency on `hub` except in tests. `qrtr` owns the shared wire codecs,
-`apr` owns audio logic, and `symbian/sys` owns shared device glue. No pinned IPC contract changed.
+Event batches have a u32 count followed by u32 length and encoded event records. Records never cross batch
+boundaries. Each session holds at most 64 events; overflow drops the oldest and reports a Dropped count.
+Session close releases its ports and pending receive. Discovery is replayed when a client binds, so a late
+MODEMD receives existing services. The pinned NeoModem and NeoAudio wire contracts stay unchanged.
 
-The router owns `ipa_up`, radio attachment, startup enable policy and terminal failure. `Event::State` delivers
-these facts before cellular service discovery and commands; cellular uses `ipa_up` for NAS voice-only selection.
-Cellular alone owns NeoModem `Status`; `RadioStarted`, `RadioResponse` and reset/state events retain running,
-heartbeat and failure reporting. Daemon status overlays for hardware boot/audio remain unchanged.
+Recovery sends Reset before waiting for every bound session's matching QUIESCED, or two seconds, then runs
+the existing kernel stop acknowledgement/watchdog and 1/3/10-second backoff path. MODEMD clears Cellular
+state and its audio/alert intents before acknowledging. RAM EFS survives; the current ADSP PAS shutdown
+workaround still forces MSS-only recovery. Cellular retains logs, CLIR, messages/outgoing queue and user
+intent; its blocklist clears on reset as before.
 
-`client_up` is split by ownership: cellular handles DMS/UIM/NAS/VOICE/WMS, the hub handles IPA, SSCTL and its
-small `WifiFw` driver. Packet events carry source address and bound destination port; cellular also verifies the
-expected server address. ServerDown is delivered without clearing an established client, matching C5 behavior.
-BYE/DEL_CLIENT retain their existing no-op handling. HELLO suppression stays entirely in the router.
+Both loops use a fixed 10 ms PumpDeadline checked before another IPC dispatch. HWHUB independently retries
+the shared ordered 16-packet outbox at its one-second cadence and ticks IPA/WLFW. MODEMD independently runs
+cellular intent, call/SMS timers and NAS polling. Cross-process scheduling replaces S2's exact
+intent/retry/timers/IPA/poll order; event delivery may add a scheduling turn. Essential SEND still retains the
+same transaction while queued. Nonessential SEND reports physical delivery. ADSP QRTR now makes one HAL send
+attempt, replacing S2's 20 attempts with 5 ms sleeps; essential retries use the shared one-second cadence.
+APR audio retains its existing send behavior. SEND/BIND/STATUS and scalar client calls are synchronous RPCs;
+RECV is asynchronous and remains posted across server and timer wakeups.
 
-All essential sends, including cellular subscriptions and online transitions, use the hub's single ordered
-16-packet outbox and one-second retry cadence. Nonessential sends retain their immediate failure result.
-`Bus::send` reports physical delivery; cellular essential requests report acceptance even while queued, retaining
-the same transaction. The adapter preserves tick order: cellular intent, router retry, cellular call/SMS timers,
-IPA retry, NAS polling. The staged cellular methods keep that scheduling visible for S3.
+The hub's diagnostic features are `radio-disabled` and `qrtr-trace` (Wi-Fi W0). Build from `symbian/` with
+`cargo arm -p hwhub --features radio-disabled` to skip IPA/EFS/MSS startup while retaining ADSP services.
+Hub logs use `[hwhub]`; cellular/audio logs use `[modemd]`.
 
-Reset retains RAM EFS and the transfer-port counter; `keep_adsp` also retains non-MSS discovery, HELLOs, queued
-traffic and transfers/readers, restoring ADSP SSCTL. Cellular retains logs, CLIR, messages/outgoing queue and user
-intent, and advances the supplied generation. Its blocklist clears on reset as before. `lost()` resets MSS state,
-then publishes terminal failure, while late MSS packets cannot repopulate queues. `support_only` and `attach_radio`
-remain router operations; attachment preserves healthy ADSP discovery and retries.
+The kernel GLINK HAL can still wait for a receive intent; firmware, storage and codec HAL calls are synchronous.
+Host tests and ARM compilation do not establish phone timing, cold-boot, call, recovery or headset acceptance.

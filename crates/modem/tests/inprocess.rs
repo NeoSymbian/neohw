@@ -17,7 +17,7 @@ const UIM_GET_CARD_STATUS: u16 = 0x2f;
 const VOICE: u32 = voice::SERVICE;
 const IPA_PORT: u32 = 0x13;
 #[allow(dead_code)]
-#[path = "../../../symbian/modemd/src/inprocess.rs"]
+#[path = "support/encoded.rs"]
 mod inprocess;
 use inprocess::Modem;
 #[derive(Default)]
@@ -287,23 +287,36 @@ fn server_down_and_reset_cross_the_router_boundary() {
     use hub_ipc::{Event, Subsystem};
     let mut r = hub::Router::new(core::array::from_fn(|_| vec![1; 512]), 0xfc20_1000);
     let (mut c, mut f) = (modem::Cellular::new(), fake());
-    c.bind(&mut r.bus(&mut f)).unwrap();
+    c.bind(&mut inprocess::EncodedBus::new(&mut r, &mut f))
+        .unwrap();
     let state = r.state();
-    c.event(&mut r.bus(&mut f), Event::State(state));
+    c.event(
+        &mut inprocess::EncodedBus::new(&mut r, &mut f),
+        inprocess::round_trip(&[Event::State(state)]).remove(0),
+    );
     r.handle(&mut f, &ns(DMS, 68));
     let event = r.next_event().unwrap();
     assert!(matches!(event, Event::ServerUp(s) if s.service == DMS));
-    c.event(&mut r.bus(&mut f), event);
+    c.event(
+        &mut inprocess::EncodedBus::new(&mut r, &mut f),
+        inprocess::round_trip(&[event]).remove(0),
+    );
     let mut down = ns(DMS, 68);
     down[4..8].copy_from_slice(&qrtr::TYPE_DEL_SERVER.to_le_bytes());
     down[32..36].copy_from_slice(&qrtr::TYPE_DEL_SERVER.to_le_bytes());
     r.handle(&mut f, &down);
     let event = r.next_event().unwrap();
     assert!(matches!(event, Event::ServerDown(s) if s.port == 68));
-    c.event(&mut r.bus(&mut f), event);
+    c.event(
+        &mut inprocess::EncodedBus::new(&mut r, &mut f),
+        inprocess::round_trip(&[event]).remove(0),
+    );
     assert!(r.servers.is_empty());
     // Existing C5 semantics: discovery removal leaves the QMI client available until reset.
-    assert_eq!(c.airplane(&mut r.bus(&mut f), true), Ok(()));
+    assert_eq!(
+        c.airplane(&mut inprocess::EncodedBus::new(&mut r, &mut f), true),
+        Ok(())
+    );
     assert_eq!(req(f.sent.last().unwrap()).2, DMS_SET_OPERATING_MODE);
     r.reset(true);
     let event = r.next_event().unwrap();
@@ -314,11 +327,14 @@ fn server_down_and_reset_cross_the_router_boundary() {
             generation: 1
         }
     );
-    c.event(&mut r.bus(&mut f), event);
+    c.event(
+        &mut inprocess::EncodedBus::new(&mut r, &mut f),
+        inprocess::round_trip(&[event]).remove(0),
+    );
     assert_eq!(c.status.generation, 1);
     assert!(c.status.airplane);
     let sent = f.sent.len();
-    c.begin_tick(&mut r.bus(&mut f), 30000);
+    c.begin_tick(&mut inprocess::EncodedBus::new(&mut r, &mut f), 30000);
     assert_eq!(f.sent.len(), sent); // the old client's port cannot transmit after reset
 }
 
@@ -327,10 +343,14 @@ fn shared_outbox_retries_router_and_cellular_packets_in_order() {
     use hub_ipc::Event;
     let mut r = hub::Router::new(core::array::from_fn(|_| vec![1; 512]), 0xfc20_1000);
     let (c, mut f) = (modem::Cellular::new(), fake());
-    c.bind(&mut r.bus(&mut f)).unwrap();
+    c.bind(&mut inprocess::EncodedBus::new(&mut r, &mut f))
+        .unwrap();
     let mut c = c;
     let state = r.state();
-    c.event(&mut r.bus(&mut f), Event::State(state));
+    c.event(
+        &mut inprocess::EncodedBus::new(&mut r, &mut f),
+        inprocess::round_trip(&[Event::State(state)]).remove(0),
+    );
     f.refuse = 1;
     r.handle(
         &mut f,
@@ -343,7 +363,10 @@ fn shared_outbox_retries_router_and_cellular_packets_in_order() {
     );
     r.handle(&mut f, &ns(VOICE, 50));
     while let Some(e) = r.next_event() {
-        c.event(&mut r.bus(&mut f), e);
+        c.event(
+            &mut inprocess::EncodedBus::new(&mut r, &mut f),
+            inprocess::round_trip(&[e]).remove(0),
+        );
     }
     let request = qmi::Builder::new(qmi::REQUEST, 9, 0x24).finish();
     r.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 60, 0x11, &request));

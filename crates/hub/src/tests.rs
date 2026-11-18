@@ -2,7 +2,7 @@
 use super::*;
 use std::format;
 #[allow(dead_code)]
-#[path = "../../../symbian/modemd/src/inprocess.rs"]
+#[path = "../../modem/tests/support/encoded.rs"]
 mod inprocess;
 #[derive(Default)]
 struct Fake {
@@ -647,5 +647,36 @@ mod composed {
         assert!(!m.router.radio_failed);
         m.handle(&mut f, &ns(VOICE, 77));
         assert!(m.router.servers.iter().any(|s| s.node == MODEM_NODE));
+    }
+}
+
+#[test]
+fn closed_session_unbinds_ports_and_removes_its_outbox_requests() {
+    use hub_ipc::Bus;
+    let (mut r, mut f) = (modem(), fake());
+    r.bus(&mut f).bind(2, 0x20).unwrap();
+    f.refuse = 1;
+    assert!(!r.bus(&mut f).send(0x20, (0, 68), b"old session", true));
+    r.unbind(0x20);
+    r.retry(&mut f, 1000);
+    assert!(f.sent.is_empty());
+    assert!(!r.bus(&mut f).send(0x20, (0, 68), b"closed", true));
+    r.bus(&mut f).bind(11, 0x20).unwrap();
+    assert!(r.bus(&mut f).send(0x20, (0, 55), b"new session", true));
+}
+
+#[test]
+fn acknowledged_recovery_reopens_without_a_second_reset_generation() {
+    let mut r = modem();
+    r.lost();
+    let generation = r.generation();
+    assert!(matches!(r.next_event(), Some(Event::Reset { generation: g, .. }) if g == generation));
+    while r.next_event().is_some() {}
+    assert!(r.state().radio_failed);
+    r.restart_quiesced();
+    assert_eq!(r.generation(), generation);
+    assert!(!r.state().radio_failed);
+    while let Some(event) = r.next_event() {
+        assert!(!matches!(event, Event::Reset { .. }));
     }
 }

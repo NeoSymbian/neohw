@@ -114,6 +114,17 @@ name = "hub-ipc"
 version = "0.1.0"
 
 [[package]]
+name = "hwhub"
+version = "0.1.0"
+dependencies = [
+ "e32",
+ "ext4ro",
+ "hub",
+ "hub-ipc",
+ "neohw-sys",
+]
+
+[[package]]
 name = "linked_list_allocator"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -146,7 +157,6 @@ version = "0.1.0"
 dependencies = [
  "apr",
  "e32",
- "ext4ro",
  "hub",
  "hub-ipc",
  "modem",
