@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "hwhub"
+description = "HWHUB.EXE: QRTR router and hardware lifecycle, serving NeoHub"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+[lib]
+crate-type = ["staticlib"]
+test = false
+[features]
+# Startup-only policy: keep ADSP services without booting MSS.
+radio-disabled = []
+# Wi-Fi W0 diagnostic: log every QRTR packet.
+qrtr-trace = []
+[dependencies]
+e32.workspace = true
+hub.workspace = true
+hub-ipc.workspace = true
+sys.workspace = true
+ext4ro.workspace = true

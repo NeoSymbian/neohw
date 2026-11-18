@@ -222,6 +222,8 @@ impl Cellular {
             Event::RadioResponse => self.response_seen = true,
             Event::RadioStarted => self.status.modem = modem_ipc::modem::RUNNING,
             Event::Reset { generation, .. } => self.reset(generation),
+            // Process status and transport loss accounting belong to the NeoHub adapter.
+            Event::Status(_) | Event::Dropped(_) => {}
         }
     }
 

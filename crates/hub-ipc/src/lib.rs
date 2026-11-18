@@ -5,6 +5,14 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt;
 
+mod wire;
+pub use wire::*;
+mod queue;
+pub use queue::SessionQueue;
+
+#[cfg(test)]
+mod tests;
+
 /// A discovered QRTR server; instance packs version in the low byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Server {
@@ -45,6 +53,8 @@ pub enum Event {
     State(State),
     RadioStarted,
     RadioResponse,
+    Status(Snapshot),
+    Dropped(u32),
 }
 
 pub trait Bus {
