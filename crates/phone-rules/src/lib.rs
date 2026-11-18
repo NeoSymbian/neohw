@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The phone's rules, shared by MODEMD and neoui (docs/telephony.md C8). The facts come from the 2010 Symbian phone
+//! The phone's rules, shared by MODEMD and neoui (docs/hardware/modem.md C8). The facts come from the 2010 Symbian phone
 //! sources, read and re-expressed in our own code (docs/symbian-phone-sources.md, "SPS"):
 //! - [`dial`]: what a typed string is (number, service code, USSD, ...), SPS §5-§6;
 //! - [`emergency`]: the emergency numbers, SPS §8;

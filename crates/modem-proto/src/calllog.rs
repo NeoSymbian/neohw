@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The call log (docs/telephony.md C8): MODEMD watches every call of the All Call Status indications and records each
+//! The call log (docs/hardware/modem.md C8): MODEMD watches every call of the All Call Status indications and records each
 //! one when it ends, as dialled, received (answered), missed, rejected (hung up while it rang) or blocked (rejected by
 //! the blocklist before it rang). MODEMD keeps it in `C:\private\e0003001\calls.db` ([`CallLog::encode`]); clients
 //! read it with modem_ipc::op::CALL_LOG.

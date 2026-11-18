@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The ADSP, the audio DSP (docs/telephony.md C6): its firmware from vendor_a streamed to the kernel, which has
+//! The ADSP, the audio DSP (docs/hardware/modem.md C6): its firmware from vendor_a streamed to the kernel, which has
 //! TrustZone authenticate and start it (HAL AdspLoad, PAS 1), then its two GLINK channels: IPCRTR (QRTR, the same
 //! router as the modem's: the audio PD asks our locator for avs/audio) and APR (the audio services).
 //! The load runs in steps of the daemon's loop (256 KB each), so NeoModem and the modem keep being served.

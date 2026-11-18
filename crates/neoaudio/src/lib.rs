@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! NeoAudio (docs/audio.md): the audio service MODEMD.EXE serves next to NeoModem, for native apps and for the old
+//! NeoAudio (docs/hardware/audio.md): the audio service MODEMD.EXE serves next to NeoModem, for native apps and for the old
 //! apps' DevSound bridge. One session = one stream:
 //! - [`op::OPEN`] arg 0 = rate (8000..=96000 Hz), arg 1 = channels (1 or 2), arg 2 = [`flag`]s. Signed 16-bit
 //!   little-endian PCM, channels interleaved.

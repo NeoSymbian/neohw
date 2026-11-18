@@ -1,2 +1,3 @@
-# NAME.EXE uid3 staticlib (build/emitter/build_rust_exe.py; copy the line and the .a into build/rust/)
+# NAME.EXE uid3 staticlib (build/emitter/build_rust_exe.py; copy the lines and the .a files into build/rust/)
 MODEMD.EXE     0xE0003001  libmodemd.a
+NEONET.EXE     0xE0004001  libneonet.a  stack=0x10000

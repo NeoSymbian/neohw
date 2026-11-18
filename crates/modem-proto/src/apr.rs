@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! APR, the ADSP's packet protocol (docs/telephony.md C6), and the call-audio sequence over it: the TDM ports the
+//! APR, the ADSP's packet protocol (docs/hardware/modem.md C6), and the call-audio sequence over it: the TDM ports the
 //! earpiece/speaker amps and the mic sit on, then a voice path the modem's call audio flows through. Each GLINK
 //! message on "apr_audio_svc" is one APR packet: a 20-byte header {hdr_field, pkt_size, src svc/domain/port,
 //! dest svc/domain/port, token, opcode} and the payload. Commands are acked by APR_BASIC_RSP_RESULT {opcode, status}.
@@ -41,7 +41,7 @@ const RING_PORT: u16 = 0x0101;
 pub const RING_BYTES: usize = 192_000;
 /// The ASM-mapped region (the kernel's KAudioBytes).
 pub const RING_REGION: u32 = 0x40000;
-/// Media (NeoAudio, docs/audio.md): [`MEDIA_SLOTS`] periods of [`MEDIA_PERIOD`] bytes, after the ringtone's bytes in
+/// Media (NeoAudio, docs/hardware/audio.md): [`MEDIA_SLOTS`] periods of [`MEDIA_PERIOD`] bytes, after the ringtone's bytes in
 /// the same region, each published to the ADSP on its own (the kernel's per-range AudioMem tickets).
 pub const MEDIA_OFFSET: u32 = 0x30000;
 /// 20 ms of 48 kHz mono S16

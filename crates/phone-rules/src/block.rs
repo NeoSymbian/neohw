@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The blocklist (docs/telephony.md C8, "Blocking"): which incoming calls MODEMD rejects as busy before they ring.
+//! The blocklist (docs/hardware/modem.md C8, "Blocking"): which incoming calls MODEMD rejects as busy before they ring.
 //! A rule is a whole number (compared like caller names, [`number::matches`]) or a prefix of the digits; two switches
 //! block hidden callers and callers not in the contacts. Contacts are known to MODEMD only as [`known_key`] hashes the
 //! Phone app sends. Emergency numbers are never blocked.

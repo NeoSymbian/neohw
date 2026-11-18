@@ -9,7 +9,7 @@ pub const SERVICE: u32 = 64;
 pub const VERSION: u32 = 1;
 pub const INSTANCE: u32 = 1;
 /// SERVREG_GET_DOMAIN_LIST_REQ (Linux qcom_pdr_internal.h). It was 0x20 (REGISTER_LISTENER) until 2026-11-12: every
-/// lookup got an error, so the modem never started its WLAN domain (docs wifi.md W0).
+/// lookup got an error, so the modem never started its WLAN domain (docs hardware/wifi.md W0).
 const GET_DOMAIN_LIST: u16 = 0x21;
 const PFR: u16 = 0x24;
 

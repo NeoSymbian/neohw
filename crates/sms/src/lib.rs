@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! SMS TPDUs for MODEMD and the Messages app (docs/telephony.md C9), written from 3GPP TS 23.040 (the TPDUs) and
+//! SMS TPDUs for MODEMD and the Messages app (docs/hardware/modem.md C9), written from 3GPP TS 23.040 (the TPDUs) and
 //! 23.038 (the alphabets):
 //! - [`count`]: how a text will be sent (GSM 7-bit or UCS-2, the parts, the characters left), for the composer;
 //! - [`submit`]: SMS-SUBMIT TPDUs for a text, split into concatenated parts;

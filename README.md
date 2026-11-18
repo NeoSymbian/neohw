@@ -1,20 +1,38 @@
-# NeoSymbian telephony
+# neohw
 
-User-side Rust for the cellular modem on the Pixel 3a XL (Qualcomm SDM670), running on the 2010 Symbian user side
-(`armv5te-none-eabi`, `no_std`, the [`e32`](https://github.com/NeoSymbian/e32-rs) crate).
+NeoSymbian's hardware, user side: Rust for the Pixel 3a XL's (Qualcomm SDM670) modem, audio DSP, Wi-Fi and, later,
+Bluetooth, on the 2010 Symbian user side (`armv5te-none-eabi`, `no_std` + `alloc`, the
+[`e32`](https://github.com/NeoSymbian/e32-rs) crate). Renamed from `telephony` on 2026-11-18; `neolink` (Wi-Fi) was
+merged in with its history.
 
-The plan, hardware facts and stages are in [docs/telephony.md](https://github.com/NeoSymbian/docs/blob/main/telephony.md).
-The kernel transport (SCM, SMEM, SMP2P, GLINK, remote-processor boot) lives in
-[kernel](https://github.com/NeoSymbian/kernel) under `baseport/arm64/sdm670_assp`.
+Every driver's status, the processes and their IPC are in
+[docs/hardware.md](https://github.com/NeoSymbian/docs/blob/main/hardware.md); the details per area in
+[docs/hardware/](https://github.com/NeoSymbian/docs/tree/main/hardware) (modem.md, audio.md, wifi.md, bluetooth.md).
+The kernel side (SCM, SMEM, SMP2P, GLINK, remote-processor boot, the audio codecs, the WCN3990 copy engines) is C++
+in [kernel](https://github.com/NeoSymbian/kernel) under `baseport/arm64`.
 
-The existing workspaces contain:
+## Layout
 
-| Crate | Responsibility |
+`crates/` is the host workspace: protocols, IPC contracts and sans-I/O state machines, tested on the Mac.
+`symbian/` is the Symbian workspace: the EXEs (`exes.txt`), built only for armv5te.
+
+| Crate / EXE | What |
 |---|---|
-| `modem-ipc` | Version 2 NeoModem contract: calls, command results, SIM/PIN, radio intent, ringing and recovery |
-| `modem-proto` | QRTR/QMI services and clients, RAM-backed EFS, complete call indications and serialized APR voice/ringtone/loopback |
-| `ext4ro` | Read-only firmware access |
-| `symbian/modemd` | MODEMD.EXE: incremental firmware loading, the NeoModem server, notifications and processor recovery |
+| `modem-ipc` | The NeoModem contract (MODEMD <-> neoui, phone): calls, SIM/PIN, radio intent, ringing, SMS, recovery |
+| `neoaudio` | The NeoAudio contract and its mixer, resampler and streams |
+| `phone-rules`, `sms` | Dial strings, emergency numbers, caller matching, the blocklist; SMS PDUs |
+| `modem-proto` | QRTR/QMI services and clients, RAM-backed EFS, calls, SMS, APR audio (to be split, docs hardware.md S2) |
+| `ext4ro` | Read-only ext4 for firmware on the vendor partition |
+| `wlfw` | The Wi-Fi firmware's QMI control service (WLFW, QMI 69); MODEMD drives it over its QRTR link |
+| `wpa` | WPA2-PSK, supplicant side: PMK, PTK, the 4-way and group key handshakes (sans-I/O; CCMP, PSK, no MFP) |
+| `net` | NeoNet: the IP stack (smoltcp: DHCP, DNS, TCP, UDP), its IPC protocol and the client (`client` feature) |
+| `symbian/modemd` | MODEMD.EXE (0xE0003001): the modem, the ADSP, NeoModem and NeoAudio |
+| `symbian/neonet` | NEONET.EXE (0xE0004001): the IP stack on the kernel's WlanLink frames, the NeoNet server |
+
+Consumers pin these crates by git rev: neoui (`modem-ipc`, `neoaudio`, `phone-rules`, `wpa`, `net`), phone
+(`modem-ipc`, `phone-rules`, `sms`).
+
+## MODEMD notes
 
 C7 implementation is on `feat/c7-complete-calls`; phone acceptance is still required. The server and all IPC consumers
 must be updated together: v1 sessions are rejected. STATUS is a fixed little-endian snapshot; NOTIFY takes that same
@@ -51,13 +69,15 @@ cargo fmt --all --check
 cargo arm --workspace --offline
 ```
 
-Qualcomm firmware is never stored here: it is read from the phone's own partitions at runtime.
+Qualcomm firmware and board data are never stored here: they are read from the phone's own partitions at runtime.
 
 ## Licence
 
 Apache-2.0 (`SPDX-License-Identifier: Apache-2.0` in every file). Code ported from the BSD-3-Clause linux-msm tools
-keeps its original copyright line; [docs/telephony.md](https://github.com/NeoSymbian/docs/blob/main/telephony.md)
-lists every outside source.
+keeps its original copyright line; [docs/hardware/modem.md](https://github.com/NeoSymbian/docs/blob/main/hardware/modem.md)
+lists every outside source. Wi-Fi message ids and layouts are facts from Linux ath10k (ISC, Copyright (c) 2018
+The Linux Foundation), cited in the source. `wpa` follows IEEE 802.11-2016 12.7 and uses RustCrypto's `sha1`, `hmac`,
+`pbkdf2` and `aes-kw` (MIT/Apache-2.0).
 
 ## Independent ADSP servicing (driver-support prerequisite)
 

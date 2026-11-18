@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! QMI NAS (service 3): registration, the serving network's name and the signal (docs/telephony.md C5).
+//! QMI NAS (service 3): registration, the serving network's name and the signal (docs/hardware/modem.md C5).
 //! Message ids and TLV layouts from libqmi's `qmi-service-nas.json` (facts), checked against the C1 capture
 //! (ModemManager on the same phone and SIM, 2026-11-08).
 

@@ -3,7 +3,7 @@
 //! the shared carve-out (`rmtfs-mem@fc201000`). The modem names a partition by path, asks for the buffer's address,
 //! then reads/writes sectors between the partition and buffer offsets.
 //! Written from linux-msm rmtfs (`qmi_rmtfs.qmi`, `rmtfs.c`, `storage.c`; BSD-3).
-//! shortcut: writes change only the RAM image (gate G4 persists them, docs/telephony.md C12).
+//! shortcut: writes change only the RAM image (gate G4 persists them, docs/hardware/modem.md C12).
 
 use crate::Platform;
 use crate::qmi::{Builder, Msg, RESPONSE};

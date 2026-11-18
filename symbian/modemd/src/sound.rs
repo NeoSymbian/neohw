@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! NeoAudio (docs/audio.md): the audio service MODEMD serves next to NeoModem, because MODEMD owns the ADSP. One
+//! NeoAudio (docs/hardware/audio.md): the audio service MODEMD serves next to NeoModem, because MODEMD owns the ADSP. One
 //! session is one stream ([`neoaudio`]); every step the streams are mixed into the ADSP's media periods
 //! ([`crate::adsp::CallAudio::media_feed`]) or, when nothing plays them (no audio DSP, a call, the ringtone, a start
 //! that failed), consumed in real time by the clock sink so players keep their pace. A WRITE waits while its stream's
