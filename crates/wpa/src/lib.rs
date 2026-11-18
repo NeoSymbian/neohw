@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! WPA2-PSK, the supplicant side (docs wifi.md W4): the passphrase hash, the pairwise key expansion, and the 4-way and
+//! WPA2-PSK, the supplicant side (docs hardware/wifi.md W4): the passphrase hash, the pairwise key expansion, and the 4-way and
 //! group key handshakes over EAPOL-Key frames, sans-I/O. [`Handshake`] turns each EAPOL frame from the AP into
 //! [`Action`]s the caller carries out in order through the driver (send, install keys, open the port).
 //!

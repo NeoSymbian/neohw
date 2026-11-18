@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! MODEMD.EXE (docs/telephony.md C4, C5): reads the modem's EFS partitions, boots the modem, runs the apps side of
+//! MODEMD.EXE (docs/hardware/modem.md C4, C5): reads the modem's EFS partitions, boots the modem, runs the apps side of
 //! QRTR (modem_proto::Modem) over the kernel's telephony HAL functions (kernel qcom_telhal.cpp, 0x4e0d..0x4e12), and
 //! serves the NeoModem IPC API (modem_ipc: status, dial, answer, hang up). neoui's SYSSTART starts it at boot; a
 //! second copy (Terminal `modemd`) finds the server name taken and exits.
@@ -55,7 +55,7 @@ const HAPTIC: i32 = 0x4e27;
 const VENDOR: u32 = 4;
 const SECTOR: u64 = 512;
 const NOT_READY: i32 = -18;
-/// modemst1, modemst2, fsg, fsc (the phone's GPT, docs/telephony.md C0)
+/// modemst1, modemst2, fsg, fsc (the phone's GPT, docs/hardware/modem.md C0)
 const PART_SIZES: [usize; 4] = [0x20_0000, 0x20_0000, 0x20_0000, 0x2_0000];
 const RUNNING: u32 = 8;
 /// the modem's QRTR node; every other node is behind the ADSP's IPCRTR
@@ -331,7 +331,7 @@ struct Daemon {
     /// a new message's tone plays until here (ms), its second buzz comes here (0 = none)
     sms_tone_until: u64,
     sms_buzz_at: u64,
-    /// NeoAudio's streams and mixer (docs/audio.md)
+    /// NeoAudio's streams and mixer (docs/hardware/audio.md)
     sound: sound::Sound,
     /// the last amp protection poll (ms)
     amps_checked: u64,

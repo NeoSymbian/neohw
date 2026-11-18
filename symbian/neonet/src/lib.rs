@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! NEONET.EXE (docs wifi.md W5): the phone's IP stack. It moves Ethernet frames between [`net::Stack`] and the Wi-Fi
+//! NEONET.EXE (docs hardware/wifi.md W5): the phone's IP stack. It moves Ethernet frames between [`net::Stack`] and the Wi-Fi
 //! driver (kernel HAL WlanLink 0x4e1f: op 3 the link, op 8 a received frame, op 9 a frame to send, op 10 wait for
-//! either, docs wifi.md W7), gets an address
+//! either, docs hardware/wifi.md W7), gets an address
 //! by DHCP once the link is connected, and serves the NeoNet API ([`net::proto`]) to SYSSTART and apps. SYSSTART
 //! starts it at boot; a second copy finds the server name taken and exits.
 #![no_std]
@@ -606,7 +606,7 @@ fn main() -> i32 {
         }
     };
     dprintln!("[neonet] start: serving {} (API {})", NAME, VERSION_MAJOR);
-    // ESOCK's CommsDat records (docs wifi.md W5a), if the ROM has ESOCK; NEOCDB writes them once and exits
+    // ESOCK's CommsDat records (docs hardware/wifi.md W5a), if the ROM has ESOCK; NEOCDB writes them once and exits
     match e32::process::Process::spawn("NEOCDB.EXE", "") {
         Ok(p) => {
             p.resume();

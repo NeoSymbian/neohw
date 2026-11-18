@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! NeoNet (docs wifi.md W5): the phone's IP stack over the Wi-Fi link, on smoltcp. [`Stack`] holds the Ethernet
+//! NeoNet (docs hardware/wifi.md W5): the phone's IP stack over the Wi-Fi link, on smoltcp. [`Stack`] holds the Ethernet
 //! interface, a DHCPv4 client, a DNS resolver and up to [`MAX_SOCKETS`] TCP, listening and UDP sockets (one id
 //! space; W7 added UDP and listening); the caller (NEONET.EXE) moves the
 //! frames in and out through a `smoltcp::phy::Device` and calls [`Stack::poll`]. Sans-I/O: the clock and the device

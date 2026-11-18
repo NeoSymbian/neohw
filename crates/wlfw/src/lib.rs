@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! WLFW (QMI service 69, version 1): the WCN3990 Wi-Fi firmware's control service, run by the modem's WLAN domain
-//! (`msm/modem/wlan_pd`) once it loaded `wlanmdsp.mbn` over TFTP (docs wifi.md W0/W1).
+//! (`msm/modem/wlan_pd`) once it loaded `wlanmdsp.mbn` over TFTP (docs hardware/wifi.md W0/W1).
 //!
 //! Message ids, TLV numbers and layouts are facts from Linux ath10k `qmi_wlfw_v01.{c,h}` and the start-up order
 //! from `qmi.c` (both ISC, Copyright (c) 2018 The Linux Foundation); this file is a new implementation, sans-I/O:

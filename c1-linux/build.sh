@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
 #
-# build.sh -- the telephony C1 reference image (docs/telephony.md C1): mainline Linux (postmarketOS
+# build.sh -- the telephony C1 reference image (docs/hardware/modem.md C1): mainline Linux (postmarketOS
 # linux-postmarketos-qcom-sdm670) with the modem userland, all in a RAM disk, as a fastboot boot image for the
 # Pixel 3a XL (bonito). It never mounts or writes the eMMC: rmtfs serves the modem's EFS from RAM copies of the C0
 # backup, and keeps the modem's writes in RAM (-r).

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "net"
-description = "NeoNet: the IP stack over Wi-Fi (smoltcp: DHCP, DNS, TCP) and its IPC protocol and client (docs wifi.md W5)"
+description = "NeoNet: the IP stack over Wi-Fi (smoltcp: DHCP, DNS, TCP) and its IPC protocol and client (docs hardware/wifi.md W5)"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"

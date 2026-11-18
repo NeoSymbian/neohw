@@ -3,7 +3,7 @@
 //! port. Writes are kept in RAM (C1: /readwrite/server_check.txt). Reads are served only from the modem's firmware
 //! partitions, read-only: `/readonly/firmware/image/X` = modem_a `IMAGE/X` (the folder Linux tqftpserv maps to the
 //! remoteproc firmware) and `/readonly/vendor/firmware/X` = vendor_a `firmware/X`. The modem's WLAN domain loads `wlanmdsp.mbn` that way, with `rsize`/`seek` reads in
-//! `wsize`-block windows (Linux kprobe trace, docs wifi.md W0). Every other read is refused, as under Linux in C1.
+//! `wsize`-block windows (Linux kprobe trace, docs hardware/wifi.md W0). Every other read is refused, as under Linux in C1.
 //! Written from linux-msm tqftpserv (`tqftpserv.c`, BSD-3) and RFC 1350/2347/2348.
 
 use alloc::string::String;

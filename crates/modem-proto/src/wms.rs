@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! QMI WMS (service 5): SMS (docs/telephony.md C9). Message ids and TLV layouts from libqmi's `qmi-service-wms.json`
+//! QMI WMS (service 5): SMS (docs/hardware/modem.md C9). Message ids and TLV layouts from libqmi's `qmi-service-wms.json`
 //! (facts), checked against the C1 ModemManager capture where it had them: Set Event Report, Set/Get Routes, the
 //! SMSC Address indication, List Messages (which needs a message tag), the transfer-route Event Report (a bare
 //! TPDU, no SMSC address in front) and Send Ack. Raw Send, Raw Read and Delete are from libqmi only.

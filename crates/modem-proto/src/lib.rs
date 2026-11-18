@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The apps side of the Pixel 3a XL's modem (docs/telephony.md C4, C5): a QRTR router for node 1 with the services
+//! The apps side of the Pixel 3a XL's modem (docs/hardware/modem.md C4, C5): a QRTR router for node 1 with the services
 //! the modem needs from it (rmtfs, the service locator, TFTP) and QMI clients for DMS, UIM, NAS and VOICE that keep
 //! a [`modem_ipc::Status`] and place, answer and end calls. Pure logic over a [`Platform`] (the kernel's HAL on the
 //! phone, a fake in tests), so it is unit-tested on the host.

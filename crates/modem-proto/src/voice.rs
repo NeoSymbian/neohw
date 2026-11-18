@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! QMI VOICE (service 9, v2): calls (docs/telephony.md C5). Message ids and TLV layouts from libqmi's
+//! QMI VOICE (service 9, v2): calls (docs/hardware/modem.md C5). Message ids and TLV layouts from libqmi's
 //! `qmi-service-voice.json` (facts), checked against the C1 capture where it had them (incoming calls: the All Call
 //! Status indications, Answer, End); Dial is from libqmi only.
 //! C7 parses the complete indication atomically; malformed/overflowing lists never replace a live snapshot.

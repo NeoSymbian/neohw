@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The messages (docs/telephony.md C9): every SMS received or sent, kept by MODEMD in `C:\private\e0003001\sms.db`
+//! The messages (docs/hardware/modem.md C9): every SMS received or sent, kept by MODEMD in `C:\private\e0003001\sms.db`
 //! ([`Store::encode`]). Clients read them with modem_ipc::op::SMS_READ: each change gets a new store revision, so a
 //! client asks only for what changed since the revision it has. Deleted messages stay as `DELETED` tombstones for a
 //! while, so clients drop their copies too.

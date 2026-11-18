@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The NeoModem server's contract (docs/telephony.md C5): MODEMD.EXE serves it, neoui's SYSSTART is its client.
+//! The NeoModem server's contract (docs/hardware/modem.md C5): MODEMD.EXE serves it, neoui's SYSSTART is its client.
 //! - [`op::STATUS`]: the server writes [`Status::SIZE`] bytes ([`Status::to_bytes`]) into the des8 in arg 0;
 //! - [`op::DIAL`]: arg 0 = the number (des8, ASCII digits, `+`, `*`, `#`);
 //! - [`op::ANSWER`], [`op::HANGUP`]: arg 0 = call ID, or 0 for the selected call;

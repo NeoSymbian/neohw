@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
-# NeoSymbian telephony C1: RAM-only Linux reference (docs/telephony.md). Never mounts or writes the eMMC; the modem's
+# NeoSymbian telephony C1: RAM-only Linux reference (docs/hardware/modem.md). Never mounts or writes the eMMC; the modem's
 # EFS comes from RAM copies of the C0 backup (rmtfs -o, -r keeps its writes in RAM).
 export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev

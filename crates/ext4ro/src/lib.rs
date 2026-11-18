@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! A read-only ext4 reader, just enough to find and read files: the superblock, the group descriptors (32- or
 //! 64-byte), inodes, extent trees of any depth, and directories scanned linearly (htree directories included: their
-//! index blocks look like one empty entry). For the firmware on the Pixel's `vendor_a` (docs/telephony.md C5b), which
+//! index blocks look like one empty entry). For the firmware on the Pixel's `vendor_a` (docs/hardware/modem.md C5b), which
 //! no NeoSymbian code ever writes. Written from the on-disk layout in the kernel's Documentation/filesystems/ext4
 //! (facts).
 //! shortcut: no block-mapped (pre-extent) files, inline data or encryption: Android's vendor images use extents.

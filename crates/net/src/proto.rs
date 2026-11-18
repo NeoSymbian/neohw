@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The NeoNet IPC API (server NEONET.EXE, docs wifi.md W5): names, function numbers, errors and the status record,
+//! The NeoNet IPC API (server NEONET.EXE, docs hardware/wifi.md W5): names, function numbers, errors and the status record,
 //! shared by the server and [`crate::client`].
 //!
 //! | Function | Arguments | Completes with |

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The IPA QMI handshake (docs/telephony.md C5b): once the kernel has IPA running, the modem must be told where IPA's
+//! The IPA QMI handshake (docs/hardware/modem.md C5b): once the kernel has IPA running, the modem must be told where IPA's
 //! tables live (INIT_DRIVER), and it answers when its side is up (DRIVER_INIT_COMPLETE, INDICATION_REGISTER); then
 //! we send INIT_COMPLETE. Service 0x31: we serve instance 1, the modem serves instance 2.
 //! Message ids, TLV layouts and the IPA v3.5.1 values from Linux drivers/net/ipa (ipa_qmi.c, ipa_qmi_msg.c,
