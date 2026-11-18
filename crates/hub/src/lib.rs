@@ -8,7 +8,6 @@ use alloc::vec::Vec;
 use core::fmt;
 pub use hub_ipc::{Event, Server, State, Subsystem};
 use qrtr::{Header, NODE_BCAST, PORT_CTRL};
-pub use wlfw;
 pub mod ipa;
 pub mod locator;
 pub mod recovery;
@@ -32,18 +31,6 @@ pub trait Platform {
     fn fw_read(&mut self, _path: &str, _offset: usize, _buf: &mut [u8]) -> Result<usize, i32> {
         Err(-5)
     }
-    /// Hand the Wi-Fi firmware's MSA regions to its VMIDs (TrustZone; kernel HAL WlanMsa). Wi-Fi W1.
-    fn wlan_msa(&mut self, _regions: &[wlfw::Region]) -> Result<(), i32> {
-        Err(-5)
-    }
-    /// The WCN3990 board data file for `board_id` (vendor_a), or empty if there is none.
-    fn board_data(&mut self, _board_id: u32) -> Vec<u8> {
-        Vec::new()
-    }
-    /// The firmware is in mission mode: start the host's copy engines, HTC and WMI (kernel HAL WlanStart, W2).
-    fn wlan_start(&mut self) -> Result<(), i32> {
-        Err(-5)
-    }
     /// The wall clock, UTC Unix milliseconds, for the call log; 0 = unknown.
     fn utc_ms(&mut self) -> i64 {
         0
@@ -58,10 +45,6 @@ const TFTP_PORT: u32 = 0x12;
 const IPA_PORT: u32 = 0x13;
 /// our SSCTL client port (the "subsystem up" events, ssctl.rs)
 const SSCTL_PORT: u32 = 0x25;
-/// our WLFW client port (the Wi-Fi firmware's control service, wlfw.rs)
-const WLFW_PORT: u32 = 0x26;
-/// DTB wlan-msa@94d00000: the MSA carve-out the Wi-Fi firmware may use
-const WLAN_MSA: (u64, u32) = (0x94d0_0000, 0x10_0000);
 const FIRST_TRANSFER_PORT: u32 = 0x100;
 /// (service, version, instance, our port); the IPA server is announced only once the kernel runs IPA
 const SERVICES: [(u32, u32, u32, u32); 4] = [
@@ -87,12 +70,6 @@ struct Client {
     pending: Vec<(u16, u16)>,
 }
 
-struct WifiFw {
-    dst: (u32, u32),
-    client: wlfw::Client,
-    board: u32,
-}
-
 pub struct Router {
     /// Log every QRTR packet both ways (bring-up).
     pub trace: bool,
@@ -114,8 +91,6 @@ pub struct Router {
     transfers: Vec<tftp::Transfer>,
     /// firmware reads in progress (the modem's WLAN domain image)
     readers: Vec<tftp::Reader>,
-    /// the Wi-Fi firmware's control service once it appears: its address and our client (W1)
-    wlfw: Option<WifiFw>,
     next_port: u32,
     /// the nodes whose HELLO we answered (the modem, the ADSP)
     hello_seen: Vec<u32>,
@@ -181,7 +156,6 @@ impl Router {
             ipa_init_at: 0,
             transfers: Vec::new(),
             readers: Vec::new(),
-            wlfw: None,
             next_port: FIRST_TRANSFER_PORT,
             hello_seen: Vec::new(),
             ssctl: [None; 2],
@@ -417,20 +391,6 @@ impl Router {
                 } else if self.bindings.iter().any(|b| b.0 == service) {
                     self.events.push(Event::ServerUp(s));
                 }
-                if service == wlfw::SERVICE && node == MODEM_NODE {
-                    let mut c = wlfw::Client::new(WLAN_MSA.0, WLAN_MSA.1);
-                    let steps = c.start();
-                    let board = self.wlfw.as_ref().map_or(0xff, |wifi| wifi.board);
-                    self.wlfw = Some(WifiFw {
-                        dst: (node, port),
-                        client: c,
-                        board,
-                    });
-                    p.log(format_args!(
-                        "wlfw: the Wi-Fi firmware's service is up; starting"
-                    ));
-                    self.wlfw_steps(p, steps);
-                }
             }
             qrtr::TYPE_NEW_LOOKUP => {
                 // the remote looks up our services: matching NEW_SERVERs, then an empty one ends the list
@@ -564,13 +524,6 @@ impl Router {
                 },
                 tftp::Action::Ignore => {}
             },
-            WLFW_PORT => {
-                let steps = match &mut self.wlfw {
-                    Some(wifi) if wifi.dst == from => wifi.client.message(payload),
-                    _ => return,
-                };
-                self.wlfw_steps(p, steps);
-            }
             port if self
                 .readers
                 .iter()
@@ -627,72 +580,6 @@ impl Router {
                     self.files.push((t.name, t.data));
                 }
             }
-        }
-    }
-
-    /// Carry out what the WLFW client asks for (wlfw.rs): sends, the MSA assignment, the board data
-    fn wlfw_steps(&mut self, p: &mut dyn Platform, mut steps: Vec<wlfw::Step>) {
-        while !steps.is_empty() {
-            let mut next = Vec::new();
-            for s in steps {
-                let Some(wifi) = &self.wlfw else {
-                    return;
-                };
-                let dst = wifi.dst;
-                match s {
-                    wlfw::Step::Send(m) => {
-                        let id = qmi::Msg::parse(&m).map_or(0, |q| q.id);
-                        p.log(format_args!("wlfw: request {id:#x}"));
-                        self.send_must(p, qrtr::TYPE_DATA, WLFW_PORT, dst, &m);
-                    }
-                    wlfw::Step::AssignMsa(regions) => {
-                        for r in &regions {
-                            p.log(format_args!(
-                                "wlfw: MSA region {:#x} + {:#x}{}",
-                                r.addr,
-                                r.size,
-                                if r.secure { " (secure)" } else { "" }
-                            ));
-                        }
-                        let r = p.wlan_msa(&regions);
-                        p.log(format_args!("wlfw: MSA assigned -> {r:?}"));
-                        if let Some(wifi) = &mut self.wlfw {
-                            next.extend(wifi.client.msa_assigned(r.is_ok()));
-                        }
-                    }
-                    wlfw::Step::LoadBoardData => {
-                        let data = p.board_data(wifi.board);
-                        p.log(format_args!("wlfw: board data {} bytes", data.len()));
-                        if let Some(wifi) = &mut self.wlfw {
-                            next.extend(wifi.client.board_data(data));
-                        }
-                    }
-                    wlfw::Step::Caps(k) => {
-                        if let Some(wifi) = &mut self.wlfw {
-                            wifi.board = k.board_id;
-                        }
-                        p.log(format_args!(
-                            "wlfw: chip {:#x} family {:#x} board {:#x} soc {:#x} fw {:#x} {} {}",
-                            k.chip_id,
-                            k.chip_family,
-                            k.board_id,
-                            k.soc_id,
-                            k.fw_version,
-                            k.fw_timestamp,
-                            k.fw_build_id
-                        ));
-                    }
-                    wlfw::Step::Ready => p.log(format_args!("wlfw: firmware ready (W1 done)")),
-                    wlfw::Step::Enabled => {
-                        let r = p.wlan_start();
-                        p.log(format_args!(
-                            "wlfw: mission mode; host copy engines start -> {r:?}"
-                        ));
-                    }
-                    wlfw::Step::Failed(what, e) => p.log(format_args!("wlfw: {what} failed ({e})")),
-                }
-            }
-            steps = next;
         }
     }
 

@@ -3,7 +3,7 @@
 # (exes.txt). Its own workspace:
 # built only for armv5te-none-eabi with the pinned nightly (`cargo arm`), like neoui/symbian.
 [workspace]
-members = ["audiod", "hwhub", "modemd", "neonet", "sys"]
+members = ["audiod", "hwhub", "modemd", "neonet", "sys", "wifid"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -18,6 +18,8 @@ neoaudio = { path = "../crates/neoaudio" }
 sys = { package = "neohw-sys", path = "sys" }
 ext4ro = { path = "../crates/ext4ro" }
 net = { path = "../crates/net" }
+wifi = { path = "../crates/wifi" }
+wpa = { path = "../crates/wpa" }
 
 [profile.release]
 panic = "abort"

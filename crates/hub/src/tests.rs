@@ -623,11 +623,6 @@ mod composed {
         m.router
             .outbox
             .push((qrtr::TYPE_DATA, 1, (MODEM_NODE, 7), alloc::vec![2]));
-        m.router.wlfw = Some(WifiFw {
-            dst: (MODEM_NODE, 83),
-            client: wlfw::Client::new(WLAN_MSA.0, WLAN_MSA.1),
-            board: 0xff,
-        });
         m.lost(&mut f);
         assert_eq!(m.status.modem, modem_ipc::modem::FAILED);
         assert!(m.router.radio_failed);
@@ -635,10 +630,6 @@ mod composed {
         assert_eq!(m.router.outbox.len(), 1);
         assert_eq!(m.router.outbox[0].2.0, 5);
         assert_eq!(m.router.hello_seen, [5]);
-        assert!(
-            m.router.wlfw.is_none(),
-            "the Wi-Fi client goes with the modem"
-        );
         assert!(m.router.rmtfs.is_some(), "RAM EFS survives");
         // a packet from the dead modem is ignored until a recovery resets
         m.handle(&mut f, &ns(VOICE, 77));
