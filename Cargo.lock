@@ -149,7 +149,7 @@ dependencies = [
 [[package]]
 name = "e32"
 version = "0.1.0"
-source = "git+https://github.com/NeoSymbian/e32-rs?rev=e97e2ebcb242f5365d1b3f9d520646603e1e9056#e97e2ebcb242f5365d1b3f9d520646603e1e9056"
+source = "git+https://github.com/NeoSymbian/e32-rs?rev=0489694ee55f6879a0f769d1e6d17077b22d4e32#0489694ee55f6879a0f769d1e6d17077b22d4e32"
 dependencies = [
  "e32-sys",
  "linked_list_allocator",
@@ -158,7 +158,7 @@ dependencies = [
 [[package]]
 name = "e32-sys"
 version = "0.1.0"
-source = "git+https://github.com/NeoSymbian/e32-rs?rev=e97e2ebcb242f5365d1b3f9d520646603e1e9056#e97e2ebcb242f5365d1b3f9d520646603e1e9056"
+source = "git+https://github.com/NeoSymbian/e32-rs?rev=0489694ee55f6879a0f769d1e6d17077b22d4e32#0489694ee55f6879a0f769d1e6d17077b22d4e32"
 
 [[package]]
 name = "hash32"
