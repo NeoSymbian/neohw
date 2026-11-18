@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Call audio and APR ring 2 (C6, A1-A8). HWHUB owns ADSP firmware and QRTR ring 1.
-use crate::NOT_READY;
+const NOT_READY: i32 = -18; // KErrNotReady
 use alloc::vec::Vec;
 use apr::Mode;
 use e32::{dprintln, time};
@@ -26,7 +26,7 @@ fn recv(buf: &mut [u8]) -> Option<usize> {
         return None;
     }
     if r < 0 {
-        dprintln!("[modemd] adsp: receive on ring {} failed ({})", RING_APR, r);
+        dprintln!("[audiod] adsp: receive on ring {} failed ({})", RING_APR, r);
         return None;
     }
     Some(r as usize)
@@ -166,7 +166,7 @@ impl CallAudio {
                 )
             };
             if r < 0 {
-                dprintln!("[modemd] media: copy into slot {} -> {}", slot, r);
+                dprintln!("[audiod] media: copy into slot {} -> {}", slot, r);
                 return;
             }
             // SAFETY: This AUDIO_MEM query/publish/completion uses scalar fields and no userspace buffer.
@@ -182,12 +182,12 @@ impl CallAudio {
                 )
             };
             if r < 0 {
-                dprintln!("[modemd] media: publish slot {} -> {}", slot, r);
+                dprintln!("[audiod] media: publish slot {} -> {}", slot, r);
                 return;
             }
             let p = self.apr.media_write(slot, info.b, info.buf);
             if let Err(e) = send(&p) {
-                dprintln!("[modemd] media: write slot {} not sent ({})", slot, e);
+                dprintln!("[audiod] media: write slot {} not sent ({})", slot, e);
                 self.apr.media_unsent(slot);
                 return;
             }
@@ -231,7 +231,7 @@ impl CallAudio {
         if self.apr.is() == Mode::Off && self.apr.idle() {
             self.ring_loaded = false;
         }
-        let mut log = |a: core::fmt::Arguments| dprintln!("[modemd] t={}ms {}", time::millis(), a);
+        let mut log = |a: core::fmt::Arguments| dprintln!("[audiod] t={}ms {}", time::millis(), a);
         for _ in 0..32 {
             let Some(n) = recv(buf) else {
                 break;
@@ -242,7 +242,7 @@ impl CallAudio {
             match self.apr.poll(time::millis(), &mut log) {
                 apr::Out::Send(p) => {
                     if let Err(e) = send(&p) {
-                        dprintln!("[modemd] apr: send failed ({})", e);
+                        dprintln!("[audiod] apr: send failed ({})", e);
                         self.apr.send_refused();
                     }
                     return; // its answer comes on a later step
@@ -279,7 +279,7 @@ impl CallAudio {
                     }
                     .0;
                     if r < 0 {
-                        dprintln!("[modemd] PCM completion failed {}", r);
+                        dprintln!("[audiod] PCM completion failed {}", r);
                         return;
                     }
                 }
@@ -322,16 +322,16 @@ impl CallAudio {
                     } else {
                         if core::mem::take(&mut self.hsmic_on) {
                             let m = audio(10, 0);
-                            dprintln!("[modemd] audio: headset mic off -> {}", m);
+                            dprintln!("[audiod] audio: headset mic off -> {}", m);
                         }
                         if core::mem::take(&mut self.jack_on) {
                             let j = audio(9, 0);
-                            dprintln!("[modemd] audio: headphones off -> {}", j);
+                            dprintln!("[audiod] audio: headphones off -> {}", j);
                         }
                         audio(2, 0)
                     };
                     dprintln!(
-                        "[modemd] audio: codecs {} -> {}",
+                        "[audiod] audio: codecs {} -> {}",
                         if on { "on" } else { "off" },
                         r
                     );
@@ -363,7 +363,7 @@ impl CallAudio {
             }
             .0;
             if r < 0 {
-                dprintln!("[modemd] rec: release slot {} -> {}", slot, r);
+                dprintln!("[audiod] rec: release slot {} -> {}", slot, r);
                 continue;
             }
             if n == 0 {
@@ -382,12 +382,12 @@ impl CallAudio {
                 )
             };
             if r < 0 {
-                dprintln!("[modemd] rec: copy out slot {} -> {}", slot, r);
+                dprintln!("[audiod] rec: copy out slot {} -> {}", slot, r);
                 continue;
             }
             if self.rec_logged < 8 {
                 self.rec_logged += 1;
-                dprintln!("[modemd] rec: slot {} gave {} bytes", slot, n);
+                dprintln!("[audiod] rec: slot {} gave {} bytes", slot, n);
             }
             mic.extend(
                 bytes[..n as usize]
@@ -412,14 +412,14 @@ impl CallAudio {
                 )
             };
             if r < 0 {
-                dprintln!("[modemd] rec: publish slot {} -> {}", slot, r);
+                dprintln!("[audiod] rec: publish slot {} -> {}", slot, r);
                 break;
             }
             let p = self.apr.rec_read(slot, info.b, info.buf);
             if self.rec_logged < 4 {
                 self.rec_logged += 1;
                 dprintln!(
-                    "[modemd] rec: read slot {} at +{:#x} ticket {} generation {}",
+                    "[audiod] rec: read slot {} at +{:#x} ticket {} generation {}",
                     slot,
                     off,
                     info.b,
@@ -427,7 +427,7 @@ impl CallAudio {
                 );
             }
             if let Err(e) = send(&p) {
-                dprintln!("[modemd] rec: read slot {} not sent ({})", slot, e);
+                dprintln!("[audiod] rec: read slot {} not sent ({})", slot, e);
                 self.apr.rec_unsent(slot);
                 break;
             }
@@ -444,16 +444,6 @@ impl CallAudio {
             Mode::Media | Mode::Duplex if self.apr.jack_is() => 3,
             Mode::Media | Mode::Duplex => self.media_route,
             _ => self.speaker as u32,
-        }
-    }
-
-    /// What NeoModem reports: `on` only for a call's audio (the volume keys act on it), never the test.
-    pub fn status(&self) -> modem_ipc::Audio {
-        modem_ipc::Audio {
-            on: self.apr.is() == Mode::Call && self.apr.running(),
-            muted: self.muted,
-            speaker: self.speaker,
-            volume: self.volume,
         }
     }
 }

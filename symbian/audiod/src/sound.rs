@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! NeoAudio (docs/hardware/audio.md): the audio service MODEMD serves next to NeoModem, because MODEMD owns the ADSP. One
+//! NeoAudio (docs/hardware/audio.md): the audio service AUDIOD serves; it owns APR (ADSP ring 2). One
 //! session is one stream ([`neoaudio`]); every step the streams are mixed into the ADSP's media periods
 //! ([`crate::adsp::CallAudio::media_feed`]) or, when nothing plays them (no audio DSP, a call, the ringtone, a start
 //! that failed), consumed in real time by the clock sink so players keep their pace. A WRITE waits while its stream's
@@ -48,6 +48,10 @@ pub struct Sound {
     pub preempted: bool,
     /// a route or volume change for the running media path, for the daemon to apply
     pub changed: bool,
+    /// MODEMD's latest op::CONTROL, for the daemon's next step
+    pub intent: Option<neoaudio::control::Intent>,
+    /// what the daemon did, answered to the next op::CONTROL
+    pub report: neoaudio::control::Report,
 }
 
 impl Sound {
@@ -64,6 +68,8 @@ impl Sound {
             sink: sink::CLOCK,
             preempted: false,
             changed: false,
+            intent: None,
+            report: Default::default(),
         }
     }
 
@@ -206,6 +212,23 @@ impl Service for Sound {
     }
 
     fn message(&mut self, session: &mut u32, msg: Message) {
+        if msg.function() == op::CONTROL {
+            // shortcut: any client may send it; check MODEMD's SID once e32 exposes the client's secure id
+            let mut b = [0u8; neoaudio::control::Intent::SIZE];
+            let r = match msg.read8(0, &mut b, 0) {
+                Ok(n) => match neoaudio::control::Intent::from_bytes(&b[..n]) {
+                    Some(i) => {
+                        self.intent = Some(i);
+                        msg.write8(1, &self.report.to_bytes(), 0)
+                            .map_or_else(|e| e, |_| err::KERR_NONE)
+                    }
+                    None => err::KERR_ARGUMENT,
+                },
+                Err(e) => e,
+            };
+            msg.complete(r);
+            return;
+        }
         let (route, master, mic) = (self.route, self.master, self.mic);
         let mut new_mic = None;
         let sink = self.sink;

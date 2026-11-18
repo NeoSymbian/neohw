@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! NeoAudio (docs/hardware/audio.md): the audio service MODEMD.EXE serves next to NeoModem, for native apps and for the old
+//! NeoAudio (docs/hardware/audio.md): the audio service AUDIOD.EXE serves (MODEMD.EXE until S4), for native apps and for the old
 //! apps' DevSound bridge. One session = one stream:
 //! - [`op::OPEN`] arg 0 = rate (8000..=96000 Hz), arg 1 = channels (1 or 2), arg 2 = [`flag`]s. Signed 16-bit
 //!   little-endian PCM, channels interleaved.
@@ -44,6 +44,124 @@ pub mod op {
     pub const MASTER: i32 = 9;
     /// arg 0 = the microphone: 0 the main one (the RT5514's DMIC1, calls use it), 1 DMIC2 (finding the top mic)
     pub const MIC: i32 = 10;
+    /// MODEMD only (docs hardware.md S4): arg 0 = des8 [`control::Intent`], arg 1 = writable des8 of
+    /// [`control::Report::SIZE`]. The call's voice path, the ringtone, Dev tools' test; AUDIOD reports back.
+    pub const CONTROL: i32 = 11;
+}
+
+/// MODEMD -> AUDIOD (S4): what the phone wants from the audio path; the PCM itself stays in AUDIOD.
+pub mod control {
+    /// What MODEMD wants now; sent whenever it changes (and every 100 ms).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Intent {
+        /// HWHUB reports the ADSP up (its APR may carry audio)
+        pub adsp_up: bool,
+        /// a connected call's voice path
+        pub call: bool,
+        /// the ringtone (an incoming call, or a new message's short tone)
+        pub ring: bool,
+        /// 0..=10 and silent: the ringtone's level
+        pub ring_volume: u8,
+        /// Dev tools' test: 0 none, 1 loudspeaker, 2 earpiece
+        pub test: u8,
+        /// the in-call buttons (kept across calls)
+        pub muted: bool,
+        pub speaker: bool,
+        /// in-call volume 0..=10
+        pub volume: u8,
+        /// recovery or no hub: everything off (a running sequence still finishes its teardown)
+        pub hold: bool,
+        /// counts MODEMD's resets (recovery, a lost hub): a new value stops everything first
+        pub epoch: u32,
+    }
+
+    impl Intent {
+        pub const SIZE: usize = 12;
+        pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+            let flags = u8::from(self.adsp_up)
+                | u8::from(self.call) << 1
+                | u8::from(self.ring) << 2
+                | u8::from(self.muted) << 3
+                | u8::from(self.speaker) << 4
+                | u8::from(self.hold) << 5;
+            let e = self.epoch.to_le_bytes();
+            [
+                flags,
+                self.ring_volume,
+                self.test,
+                self.volume,
+                e[0],
+                e[1],
+                e[2],
+                e[3],
+                0,
+                0,
+                0,
+                0,
+            ]
+        }
+        pub fn from_bytes(b: &[u8]) -> Option<Self> {
+            let b: &[u8; Self::SIZE] = b.try_into().ok()?;
+            if b[0] & !63 != 0 || b[1] > 10 || b[2] > 2 || b[3] > 10 {
+                return None;
+            }
+            Some(Self {
+                adsp_up: b[0] & 1 != 0,
+                call: b[0] & 2 != 0,
+                ring: b[0] & 4 != 0,
+                muted: b[0] & 8 != 0,
+                speaker: b[0] & 16 != 0,
+                hold: b[0] & 32 != 0,
+                ring_volume: b[1],
+                test: b[2],
+                volume: b[3],
+                epoch: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            })
+        }
+    }
+
+    /// What AUDIOD did with it.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Report {
+        /// the APR state machine is in (or heading for) the call's voice path
+        pub call: bool,
+        /// ... and it runs
+        pub call_running: bool,
+        /// the voice path or a codec control failed for good: MODEMD restarts the processors
+        pub failed: bool,
+        /// the last ringtone preparation error (0 = none), for NeoModem's result
+        pub ring_error: i32,
+        /// the epoch it has applied
+        pub epoch: u32,
+    }
+
+    impl Report {
+        pub const SIZE: usize = 12;
+        pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+            let flags = u32::from(self.call)
+                | u32::from(self.call_running) << 1
+                | u32::from(self.failed) << 2;
+            let mut b = [0; Self::SIZE];
+            b[..4].copy_from_slice(&flags.to_le_bytes());
+            b[4..8].copy_from_slice(&self.ring_error.to_le_bytes());
+            b[8..].copy_from_slice(&self.epoch.to_le_bytes());
+            b
+        }
+        pub fn from_bytes(b: &[u8]) -> Option<Self> {
+            let b: &[u8; Self::SIZE] = b.try_into().ok()?;
+            let flags = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            if flags & !7 != 0 {
+                return None;
+            }
+            Some(Self {
+                call: flags & 1 != 0,
+                call_running: flags & 2 != 0,
+                failed: flags & 4 != 0,
+                ring_error: i32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                epoch: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+            })
+        }
+    }
 }
 
 pub mod flag {
@@ -396,6 +514,39 @@ fn sin_turns(phase: u32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn control_round_trips_and_rejects_garbage() {
+        use super::control::{Intent, Report};
+        let i = Intent {
+            adsp_up: true,
+            call: true,
+            ring: false,
+            ring_volume: 7,
+            test: 2,
+            muted: true,
+            speaker: false,
+            volume: 10,
+            hold: true,
+            epoch: 0x0102_0304,
+        };
+        assert_eq!(Intent::from_bytes(&i.to_bytes()), Some(i));
+        assert_eq!(Intent::from_bytes(&i.to_bytes()[..11]), None);
+        let mut bad = i.to_bytes();
+        bad[2] = 3;
+        assert_eq!(Intent::from_bytes(&bad), None);
+        let r = Report {
+            call: true,
+            call_running: false,
+            failed: true,
+            ring_error: -18,
+            epoch: 9,
+        };
+        assert_eq!(Report::from_bytes(&r.to_bytes()), Some(r));
+        let mut bad = r.to_bytes();
+        bad[0] = 8;
+        assert_eq!(Report::from_bytes(&bad), None);
+    }
+
     use super::*;
 
     fn pcm(samples: &[i16]) -> Vec<u8> {
