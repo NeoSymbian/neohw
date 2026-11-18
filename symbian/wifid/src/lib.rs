@@ -33,6 +33,8 @@ use wifi::kernel::{Link, LinkState, Saved, Scan};
 const LOOP_MS: u64 = 10;
 /// The remembered networks, in WIFID's private directory
 const SAVED: &str = "C:\\private\\e0004002\\wifi.dat";
+/// The SSID the user disconnected from (empty: none), so a reboot doesn't rejoin it
+const LEFT: &str = "C:\\private\\e0004002\\left.dat";
 /// where SYSSTART kept them before S5 (read once, if ours is missing)
 const OLD_SAVED: &str = "C:\\private\\e0002001\\wifi.dat";
 /// A remembered network seen while nothing is joined is tried again after this long; and the background scan's period
@@ -41,6 +43,8 @@ const RETRY_MS: u64 = 60_000;
 /// deauthentication left the WCN3990 firmware half-joined for a minute until its station health monitor asserted and
 /// took the whole modem down (2026-11-13, `wlan_ps_sta_health_monitor_timeout`).
 const HANDSHAKE_MS: u64 = 10_000;
+/// The kernel's join (finishing a scan, then up to 3 tries for each frame) ends well within this
+const JOIN_MS: u64 = 30_000;
 
 /// Why the supplicant thread gave up (0 = it ended with the link); shared with the thread (leaked: it lives as long
 /// as WIFID, and Arc needs compare-and-swap, which ARMv5TE lacks)
@@ -65,6 +69,8 @@ struct Daemon {
     /// when the latest scan completed (its counter changed), and when a background scan was asked
     listed_at: Option<u64>,
     asked_at: Option<u64>,
+    /// when the kernel's scan record is read next (every 5 s, for anyone's scan)
+    next_read: u64,
     next_session: u32,
 }
 
@@ -159,13 +165,27 @@ impl Daemon {
     /// Start joining `bssid` with this PMK (`None`: an open network); a running join is left first.
     fn start(&mut self, bssid: [u8; 6], ssid: &[u8], pmk: Option<[u8; 32]>, now: u64) {
         self.stop();
-        self.left = None;
+        self.set_left(None);
         set(self.failed, 0);
         let failed = self.failed;
         dprintln!("[wifid] joining {:02x?}", bssid);
         match e32::thread::spawn(move || supplicant(bssid, pmk, failed)) {
             Ok(h) => self.join = Some((h, ssid.to_vec(), pmk, now)),
             Err(e) => dprintln!("[wifid] no supplicant thread ({})", e),
+        }
+    }
+
+    /// Remember the SSID the user left (or none), on C: too, so a reboot keeps it.
+    fn set_left(&mut self, ssid: Option<Vec<u8>>) {
+        if self.left != ssid {
+            if let Err(e) = sys::save_private(
+                "C:\\private\\e0004002\\",
+                "left.dat",
+                ssid.as_deref().unwrap_or(&[]),
+            ) {
+                dprintln!("[wifid] saving the left network failed ({})", e);
+            }
+            self.left = ssid;
         }
     }
 
@@ -250,7 +270,8 @@ impl Daemon {
             if let Ok(n) = hal::scan(true, &mut b) {
                 self.seen(&b[..n], now);
             }
-        } else if now % 5000 < LOOP_MS {
+        } else if now >= self.next_read {
+            self.next_read = now + 5000;
             let mut b = vec![0u8; wifi::kernel::SCAN_SIZE];
             if let Ok(n) = hal::scan(false, &mut b) {
                 self.seen(&b[..n], now);
@@ -318,13 +339,19 @@ impl Service for Daemon {
                         self.saved.forget(&ssid);
                         store(&self.saved);
                     }
-                    self.left = Some(ssid);
+                    self.set_left(Some(ssid));
                 }
                 self.next_link = 0;
                 err::KERR_NONE
             }
             op::RADIO => {
                 self.radio_on = msg.int(0) != 0;
+                if !self.radio_on {
+                    // off leaves the network too (the radio itself stays up); on rejoins a remembered one
+                    self.stop();
+                    let _ = hal::leave();
+                    self.next_link = 0;
+                }
                 err::KERR_NONE
             }
             _ => err::KERR_NOT_SUPPORTED,
@@ -352,6 +379,7 @@ fn supplicant(bssid: [u8; 6], pmk: Option<[u8; 32]>, failed: Failed) -> i32 {
     let mut hs: Option<wpa::Handshake> = None;
     let mut frame = [0u8; 512];
     let mut handshake_since: Option<u64> = None;
+    let joined_at = time::millis();
     loop {
         time::sleep(10_000);
         let mut b = [0u8; wifi::kernel::LINK_SIZE];
@@ -360,6 +388,10 @@ fn supplicant(bssid: [u8; 6], pmk: Option<[u8; 32]>, failed: Failed) -> i32 {
         };
         match link.state {
             LinkState::Idle | LinkState::Lost | LinkState::Error => return 0,
+            // never wait on the kernel's join for ever: a reset or a leave waits on this thread
+            LinkState::Joining if time::millis().saturating_sub(joined_at) > JOIN_MS => {
+                return fail(fail::HAL);
+            }
             LinkState::Joining => continue,
             LinkState::Handshake => {
                 let now = time::millis();
@@ -468,13 +500,14 @@ fn main() -> i32 {
         saved,
         failed: Mutex::new(0).ok().map(|m| &*Box::leak(Box::new(m))),
         join: None,
-        left: None,
+        left: read(LEFT).ok().filter(|b| !b.is_empty()),
         radio_on: true,
         link: Link::default(),
         next_link: 0,
         last: None,
         listed_at: None,
         asked_at: None,
+        next_read: 0,
         next_session: 0,
     };
     rt::block_on(async {

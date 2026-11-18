@@ -3,4 +3,4 @@ MODEMD.EXE     0xE0003001  libmodemd.a
 HWHUB.EXE      0xE0003002  libhwhub.a
 AUDIOD.EXE     0xE0003003  libaudiod.a
 NEONET.EXE     0xE0004001  libneonet.a  stack=0x10000
-WIFID.EXE      0xE0004002  libwifid.a
+WIFID.EXE      0xE0004002  libwifid.a   stack=0x10000
