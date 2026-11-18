@@ -9,7 +9,6 @@ publish = false
 [dependencies]
 qrtr = { path = "../qrtr" }
 hub-ipc = { path = "../hub-ipc" }
-wlfw = { path = "../wlfw" }
 
 [dev-dependencies]
 modem = { path = "../modem" }

@@ -4,7 +4,7 @@
 #![no_std]
 extern crate alloc;
 mod adsp;
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{vec, vec::Vec};
 use core::{fmt, ops::ControlFlow, pin::pin};
 use e32::rt::{self, Either};
 use e32::server::{self, Message, Server, Service};
@@ -15,7 +15,7 @@ use hub::{Platform, Router};
 use hub_ipc::{Bus, Event, SessionQueue, Snapshot, op};
 use sys::{
     BOOT, IPA_START, Io, PART_READ, RECV, RMTFS_MEM, RPROC_STATE, RPROC_STOP, SEND, STATE,
-    WLAN_MSA, WLAN_START, ext4_err, fs_size, fw_read, hal, hal_io, ipa_firmware, vendor_file,
+    ext4_err, fs_size, fw_read, hal, hal_io, ipa_firmware, vendor_file,
 };
 const NOT_READY: i32 = -18;
 const PART_SIZES: [usize; 4] = [0x20_0000, 0x20_0000, 0x20_0000, 0x2_0000];
@@ -114,61 +114,6 @@ impl Platform for Hal {
             },
             None => fw_read(path, offset, buf),
         }
-    }
-
-    fn wlan_start(&mut self) -> Result<(), i32> {
-        // SAFETY: WLAN_START takes no arguments or buffers.
-        match unsafe { hal(WLAN_START, core::ptr::null_mut(), core::ptr::null_mut()) } {
-            r if r < 0 => Err(r),
-            _ => Ok(()),
-        }
-    }
-
-    fn wlan_msa(&mut self, regions: &[hub::wlfw::Region]) -> Result<(), i32> {
-        for r in regions {
-            let io = Io {
-                a: 1,
-                b: r.addr as u32,
-                len: r.size,
-                buf: r.secure as u32,
-            };
-            // SAFETY: WLAN_MSA uses scalar region address/size/security fields.
-            let e = unsafe { hal_io(WLAN_MSA, io) }.0;
-            if e < 0 {
-                return Err(e);
-            }
-        }
-        Ok(())
-    }
-
-    /// The board data on vendor_a: Pixel 3a XL's `firmware/bdwlan-bonito.bin` (the factory image also has -ROW,
-    /// -USA, -JPN, -VZW regional variants and the 3a's -sargo set), else the generic names.
-    /// shortcut: the board name and the default (non-regional) file are fixed; pick by device and region before release.
-    fn board_data(&mut self, board_id: u32) -> Vec<u8> {
-        let names = [
-            String::from("firmware/bdwlan-bonito.bin"),
-            alloc::format!("firmware/bdwlan.b{:02x}", board_id & 0xff),
-            String::from("firmware/bdwlan.bin"),
-        ];
-        for n in &names {
-            // SAFETY: Only the daemon's one loop thread accesses the vendor cache.
-            let got = unsafe {
-                vendor_file(n, |fs, f| {
-                    if f.size > 0x10_0000 {
-                        return Err(-9); // KErrOverflow: a board file is tens of KB
-                    }
-                    fs.read(f).map_err(ext4_err)
-                })
-            };
-            match got {
-                Ok(d) => {
-                    dprintln!("[hwhub] wlfw: board data from {n}");
-                    return d;
-                }
-                Err(e) => dprintln!("[hwhub] wlfw: no {n} ({e})"),
-            }
-        }
-        Vec::new()
     }
 }
 

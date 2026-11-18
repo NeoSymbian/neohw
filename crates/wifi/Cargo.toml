@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "wifi"
+description = "The Wi-Fi firmware's start (WLFW over NeoHub) and the NeoWifi contract (WIFID.EXE <-> neoui): scan, join, saved networks"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+hub-ipc = { path = "../hub-ipc" }
+qrtr = { path = "../qrtr" }
+wlfw = { path = "../wlfw" }
