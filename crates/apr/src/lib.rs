@@ -9,6 +9,10 @@
 //! One command at a time: the next goes out when the last is acked (or timed out). The codecs are powered between
 //! the ports and the voice path (Out::Codecs), because the amps' PLLs lock to the TDM bit clock.
 
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
 use alloc::vec::Vec;
 
 const DOMAIN_ADSP: u8 = 4;

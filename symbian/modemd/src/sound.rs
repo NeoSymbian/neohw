@@ -11,7 +11,7 @@ use e32::dprintln;
 use e32::server::{Message, Service};
 use e32::sys::err;
 use e32::sys::ipc::TVersion;
-use modem_proto::neoaudio::{self, Info, Stream, op, sink, state};
+use neoaudio::{self, Info, Stream, op, sink, state};
 
 /// Media stays wanted this long after the last sound, so short gaps don't power the amps down and up.
 const LINGER_MS: u64 = 2_000;

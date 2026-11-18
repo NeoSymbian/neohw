@@ -4,17 +4,14 @@
 //! router as the modem's: the audio PD asks our locator for avs/audio) and APR (the audio services).
 //! The load runs in steps of the daemon's loop (256 KB each), so NeoModem and the modem keep being served.
 
-use crate::{Io, NOT_READY, Vendor, hal_io};
+use crate::NOT_READY;
 use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
+use apr::Mode;
 use e32::{dprintln, time};
-use modem_proto::apr::Mode;
+use sys::{ADSP_LOAD, ADSP_STATE, AUDIO, AUDIO_MEM, CHAN_RECV, CHAN_SEND, Io, Vendor, hal, hal_io};
 
-const ADSP_LOAD: i32 = 0x4e14;
-const ADSP_STATE: i32 = 0x4e15;
-pub const CHAN_SEND: i32 = 0x4e16;
-pub const CHAN_RECV: i32 = 0x4e17;
 /// the kernel's receive rings: the ADSP's IPCRTR and APR
 pub const RING_QRTR: u32 = 1;
 pub const RING_APR: u32 = 2;
@@ -47,22 +44,26 @@ pub enum Adsp {
 }
 
 fn adsp_load(op: u32, seg: usize, offset: u32, data: &[u8]) -> i32 {
-    hal_io(
-        ADSP_LOAD,
-        Io {
-            a: op | (seg as u32) << 8,
-            b: offset,
-            len: data.len() as u32,
-            buf: data.as_ptr() as u32,
-        },
-    )
+    // SAFETY: The segment bytes stay alive while ADSP_LOAD reads their declared length.
+    unsafe {
+        hal_io(
+            ADSP_LOAD,
+            Io {
+                a: op | (seg as u32) << 8,
+                b: offset,
+                len: data.len() as u32,
+                buf: data.as_ptr() as u32,
+            },
+        )
+    }
     .0
 }
 
 /// step, error, SMP2P slave-kernel bits, open channels (bit 0 IPCRTR, bit 1 APR)
 pub fn processor_state() -> Result<[u32; 4], i32> {
     let mut s = [0u32; 4];
-    let r = crate::hal(ADSP_STATE, s.as_mut_ptr().cast(), core::ptr::null_mut());
+    // SAFETY: ADSP_STATE writes the live four-word array and takes no second argument.
+    let r = unsafe { hal(ADSP_STATE, s.as_mut_ptr().cast(), core::ptr::null_mut()) };
     if r < 0 { Err(r) } else { Ok(s) }
 }
 
@@ -253,15 +254,18 @@ impl Load {
 
 /// One message from kernel ring `ring` into `buf`: its length, or None when the ring is empty.
 pub fn recv(ring: u32, buf: &mut [u8]) -> Option<usize> {
-    let (r, _) = hal_io(
-        CHAN_RECV,
-        Io {
-            a: ring,
-            b: 0,
-            len: buf.len() as u32,
-            buf: buf.as_mut_ptr() as u32,
-        },
-    );
+    // SAFETY: CHAN_RECV writes at most buf.len() bytes to the live receive slice.
+    let (r, _) = unsafe {
+        hal_io(
+            CHAN_RECV,
+            Io {
+                a: ring,
+                b: 0,
+                len: buf.len() as u32,
+                buf: buf.as_mut_ptr() as u32,
+            },
+        )
+    };
     if r == NOT_READY {
         return None;
     }
@@ -275,15 +279,18 @@ pub fn recv(ring: u32, buf: &mut [u8]) -> Option<usize> {
 /// One message to the ADSP on ring `ring` (KErrNotReady until it gave a receive intent: retried briefly).
 pub fn send(ring: u32, data: &[u8]) -> Result<(), i32> {
     for _ in 0..20 {
-        let (r, _) = hal_io(
-            CHAN_SEND,
-            Io {
-                a: ring,
-                b: 0,
-                len: data.len() as u32,
-                buf: data.as_ptr() as u32,
-            },
-        );
+        // SAFETY: CHAN_SEND reads data.len() bytes from the live packet slice.
+        let (r, _) = unsafe {
+            hal_io(
+                CHAN_SEND,
+                Io {
+                    a: ring,
+                    b: 0,
+                    len: data.len() as u32,
+                    buf: data.as_ptr() as u32,
+                },
+            )
+        };
         match r {
             NOT_READY => time::sleep(5_000), // e32 sleeps in microseconds: 5 ms
             r if r < 0 => return Err(r),
@@ -293,31 +300,32 @@ pub fn send(ring: u32, data: &[u8]) -> Result<(), i32> {
     Err(NOT_READY)
 }
 
-const AUDIO: i32 = 0x4e18;
-
 /// HAL Audio (the kernel's board codecs, a64_audio.cpp): 1 start(route), 2 stop, 3 route, 4 volume, 5 mic mute.
 pub fn audio(op: u32, arg: u32) -> i32 {
-    hal_io(
-        AUDIO,
-        Io {
-            a: op,
-            b: arg,
-            len: 0,
-            buf: 0,
-        },
-    )
+    // SAFETY: AUDIO takes scalar operation/argument fields and no buffer.
+    unsafe {
+        hal_io(
+            AUDIO,
+            Io {
+                a: op,
+                b: arg,
+                len: 0,
+                buf: 0,
+            },
+        )
+    }
     .0
 }
 
-/// The audio (C6): the APR state machine (modem_proto::apr) with its codecs step, the call buttons' settings (kept
+/// The audio (C6): the APR state machine (apr) with its codecs step, the call buttons' settings (kept
 /// across calls), and Dev tools' test (Some(loudspeaker) while it is wanted; its route never touches the call's).
 pub struct CallAudio {
-    pub apr: modem_proto::apr::Audio,
+    pub apr: apr::Audio,
     pub muted: bool,
     pub speaker: bool,
     pub volume: u8,
     pub test: Option<bool>,
-    pub ring: modem_proto::modem_ipc::Ring,
+    pub ring: modem_ipc::Ring,
     ring_loaded: bool,
     /// NeoAudio's media: the kernel route (0 earpiece, 1 both amps, 2 bottom) and amp volume 0..=10
     pub media_route: u32,
@@ -353,7 +361,8 @@ impl CallAudio {
         if self.apr.pcm_phys != 0 {
             return Ok(());
         }
-        let (r, info) = hal_io(crate::AUDIO_MEM, Io::default());
+        // SAFETY: This AUDIO_MEM query/publish/completion uses scalar fields and no userspace buffer.
+        let (r, info) = unsafe { hal_io(AUDIO_MEM, Io::default()) };
         if r < 0 {
             return Err(r);
         }
@@ -365,7 +374,7 @@ impl CallAudio {
     /// Media runs on the ADSP: fill every free period with `fill` (48 kHz mono), copy it into its range of the
     /// kernel region, publish that range and send its ASM WRITE.
     pub fn media_feed(&mut self, mut fill: impl FnMut(&mut [i16])) {
-        use modem_proto::apr::{self, MEDIA_PERIOD};
+        use apr::{self, MEDIA_PERIOD};
         let mut pcm = [0i16; MEDIA_PERIOD / 2];
         let mut bytes = [0u8; MEDIA_PERIOD];
         // on headphones the amps' volume does nothing: the media volume scales the PCM (the amps' -30..0 dB in 3 dB
@@ -388,28 +397,34 @@ impl CallAudio {
                 *b = s.to_le_bytes();
             }
             let off = apr::Audio::media_offset(slot);
-            let (r, _) = hal_io(
-                crate::AUDIO_MEM,
-                Io {
-                    a: 1,
-                    b: off,
-                    len: MEDIA_PERIOD as u32,
-                    buf: bytes.as_ptr() as u32,
-                },
-            );
+            // SAFETY: AUDIO_MEM copy-in reads the live PCM buffer for its stated byte length.
+            let (r, _) = unsafe {
+                hal_io(
+                    AUDIO_MEM,
+                    Io {
+                        a: 1,
+                        b: off,
+                        len: MEDIA_PERIOD as u32,
+                        buf: bytes.as_ptr() as u32,
+                    },
+                )
+            };
             if r < 0 {
                 dprintln!("[modemd] media: copy into slot {} -> {}", slot, r);
                 return;
             }
-            let (r, info) = hal_io(
-                crate::AUDIO_MEM,
-                Io {
-                    a: 2,
-                    b: off,
-                    len: MEDIA_PERIOD as u32,
-                    buf: 0,
-                },
-            );
+            // SAFETY: This AUDIO_MEM query/publish/completion uses scalar fields and no userspace buffer.
+            let (r, info) = unsafe {
+                hal_io(
+                    AUDIO_MEM,
+                    Io {
+                        a: 2,
+                        b: off,
+                        len: MEDIA_PERIOD as u32,
+                        buf: 0,
+                    },
+                )
+            };
             if r < 0 {
                 dprintln!("[modemd] media: publish slot {} -> {}", slot, r);
                 return;
@@ -428,20 +443,24 @@ impl CallAudio {
         if self.ring_loaded {
             return Ok(());
         }
-        let (r, info) = hal_io(crate::AUDIO_MEM, Io::default());
+        // SAFETY: This AUDIO_MEM query/publish/completion uses scalar fields and no userspace buffer.
+        let (r, info) = unsafe { hal_io(AUDIO_MEM, Io::default()) };
         if r < 0 {
             return Err(r);
         }
-        let pcm = modem_proto::apr::ring_pcm(self.ring.volume);
-        let (r, _) = hal_io(
-            crate::AUDIO_MEM,
-            Io {
-                a: 1,
-                b: 0,
-                len: pcm.len() as u32,
-                buf: pcm.as_ptr() as u32,
-            },
-        );
+        let pcm = apr::ring_pcm(self.ring.volume);
+        // SAFETY: AUDIO_MEM copy-in reads the live PCM buffer for its stated byte length.
+        let (r, _) = unsafe {
+            hal_io(
+                AUDIO_MEM,
+                Io {
+                    a: 1,
+                    b: 0,
+                    len: pcm.len() as u32,
+                    buf: pcm.as_ptr() as u32,
+                },
+            )
+        };
         if r < 0 {
             return Err(r);
         }
@@ -465,44 +484,50 @@ impl CallAudio {
         }
         loop {
             match self.apr.poll(time::millis(), &mut log) {
-                modem_proto::apr::Out::Send(p) => {
+                apr::Out::Send(p) => {
                     if let Err(e) = send(RING_APR, &p) {
                         dprintln!("[modemd] apr: send failed ({})", e);
                         self.apr.send_refused();
                     }
                     return; // its answer comes on a later step
                 }
-                modem_proto::apr::Out::Publish => {
-                    let (r, info) = hal_io(
-                        crate::AUDIO_MEM,
-                        Io {
-                            a: 2,
-                            ..Io::default()
-                        },
-                    );
+                apr::Out::Publish => {
+                    // SAFETY: This AUDIO_MEM query/publish/completion uses scalar fields and no userspace buffer.
+                    let (r, info) = unsafe {
+                        hal_io(
+                            AUDIO_MEM,
+                            Io {
+                                a: 2,
+                                ..Io::default()
+                            },
+                        )
+                    };
                     self.apr
                         .publish_done(if r < 0 { Err(r) } else { Ok(info.b) });
                     if r < 0 {
                         return;
                     }
                 }
-                modem_proto::apr::Out::Complete(ticket, generation) => {
-                    let r = hal_io(
-                        crate::AUDIO_MEM,
-                        Io {
-                            a: 3,
-                            b: ticket,
-                            buf: generation,
-                            ..Io::default()
-                        },
-                    )
+                apr::Out::Complete(ticket, generation) => {
+                    // SAFETY: This AUDIO_MEM query/publish/completion uses scalar fields and no userspace buffer.
+                    let r = unsafe {
+                        hal_io(
+                            AUDIO_MEM,
+                            Io {
+                                a: 3,
+                                b: ticket,
+                                buf: generation,
+                                ..Io::default()
+                            },
+                        )
+                    }
                     .0;
                     if r < 0 {
                         dprintln!("[modemd] PCM completion failed {}", r);
                         return;
                     }
                 }
-                modem_proto::apr::Out::Codecs(on) => {
+                apr::Out::Codecs(on) => {
                     let r = if on {
                         let v = match self.apr.is() {
                             Mode::Ring => self.ring.volume,
@@ -556,7 +581,7 @@ impl CallAudio {
                     );
                     self.apr.codecs_done(r >= 0, &mut log);
                 }
-                modem_proto::apr::Out::Nothing => return,
+                apr::Out::Nothing => return,
             }
         }
     }
@@ -564,19 +589,22 @@ impl CallAudio {
     /// Recording runs on the ADSP: hand it every free read buffer, then release the filled ones and copy them out.
     /// What was recorded (48 kHz mono), in order.
     pub fn rec_feed(&mut self) -> Vec<i16> {
-        use modem_proto::apr::{self, MEDIA_PERIOD};
+        use apr::{self, MEDIA_PERIOD};
         let mut mic = Vec::new();
         let mut bytes = [0u8; MEDIA_PERIOD];
         for (slot, ticket, generation, n) in self.apr.take_recorded() {
-            let r = hal_io(
-                crate::AUDIO_MEM,
-                Io {
-                    a: 3,
-                    b: ticket,
-                    buf: generation,
-                    ..Io::default()
-                },
-            )
+            // SAFETY: This AUDIO_MEM query/publish/completion uses scalar fields and no userspace buffer.
+            let r = unsafe {
+                hal_io(
+                    AUDIO_MEM,
+                    Io {
+                        a: 3,
+                        b: ticket,
+                        buf: generation,
+                        ..Io::default()
+                    },
+                )
+            }
             .0;
             if r < 0 {
                 dprintln!("[modemd] rec: release slot {} -> {}", slot, r);
@@ -585,15 +613,18 @@ impl CallAudio {
             if n == 0 {
                 continue;
             }
-            let (r, _) = hal_io(
-                crate::AUDIO_MEM,
-                Io {
-                    a: 4,
-                    b: apr::Audio::rec_offset(slot),
-                    len: n,
-                    buf: bytes.as_mut_ptr() as u32,
-                },
-            );
+            // SAFETY: AUDIO_MEM copy-out writes the live period buffer, bounded by the APR period size.
+            let (r, _) = unsafe {
+                hal_io(
+                    AUDIO_MEM,
+                    Io {
+                        a: 4,
+                        b: apr::Audio::rec_offset(slot),
+                        len: n,
+                        buf: bytes.as_mut_ptr() as u32,
+                    },
+                )
+            };
             if r < 0 {
                 dprintln!("[modemd] rec: copy out slot {} -> {}", slot, r);
                 continue;
@@ -612,15 +643,18 @@ impl CallAudio {
         }
         while let Some(slot) = self.apr.rec_slot() {
             let off = apr::Audio::rec_offset(slot);
-            let (r, info) = hal_io(
-                crate::AUDIO_MEM,
-                Io {
-                    a: 2,
-                    b: off,
-                    len: MEDIA_PERIOD as u32,
-                    buf: 0,
-                },
-            );
+            // SAFETY: This AUDIO_MEM query/publish/completion uses scalar fields and no userspace buffer.
+            let (r, info) = unsafe {
+                hal_io(
+                    AUDIO_MEM,
+                    Io {
+                        a: 2,
+                        b: off,
+                        len: MEDIA_PERIOD as u32,
+                        buf: 0,
+                    },
+                )
+            };
             if r < 0 {
                 dprintln!("[modemd] rec: publish slot {} -> {}", slot, r);
                 break;
@@ -658,8 +692,8 @@ impl CallAudio {
     }
 
     /// What NeoModem reports: `on` only for a call's audio (the volume keys act on it), never the test.
-    pub fn status(&self) -> modem_proto::modem_ipc::Audio {
-        modem_proto::modem_ipc::Audio {
+    pub fn status(&self) -> modem_ipc::Audio {
+        modem_ipc::Audio {
             on: self.apr.is() == Mode::Call && self.apr.running(),
             muted: self.muted,
             speaker: self.speaker,

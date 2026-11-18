@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! MODEMD.EXE (docs/hardware/modem.md C4, C5): reads the modem's EFS partitions, boots the modem, runs the apps side of
-//! QRTR (modem_proto::Modem) over the kernel's telephony HAL functions (kernel qcom_telhal.cpp, 0x4e0d..0x4e12), and
+//! QRTR (hub::Router + modem::Cellular) over the kernel's telephony HAL functions (kernel qcom_telhal.cpp, 0x4e0d..0x4e12), and
 //! serves the NeoModem IPC API (modem_ipc: status, dial, answer, hang up). neoui's SYSSTART starts it at boot; a
 //! second copy (Terminal `modemd`) finds the server name taken and exits.
 //! The server answers all the time: the partition reads and the boot wait are steps of the loop, never a long block.
@@ -9,11 +9,13 @@
 extern crate alloc;
 
 mod adsp;
+mod inprocess;
 mod sound;
 
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use apr::Mode;
 use core::fmt;
 use core::ops::ControlFlow;
 use core::pin::pin;
@@ -22,38 +24,16 @@ use e32::server::{self, Message, Server, Service};
 use e32::sys::err;
 use e32::sys::ipc::TVersion;
 use e32::{dprintln, time};
-use modem_proto::apr::Mode;
-use modem_proto::modem_ipc::{self, Status, op};
-use modem_proto::neoaudio;
-use modem_proto::recovery::{self, StopProgress};
-use modem_proto::{Modem, Platform};
+use hub::Platform;
+use hub::recovery::{self, StopProgress};
+use inprocess::Modem;
+use modem_ipc::{self, Status, op};
+use sys::{
+    BOOT, HAPTIC, IPA_START, Io, PART_READ, RECV, RMTFS_MEM, RPROC_STATE, RPROC_STOP, SEND, STATE,
+    WLAN_MSA, WLAN_START, ext4_err, fs_size, fw_read, hal, hal_io, ipa_firmware, save_private,
+    vendor_file,
+};
 
-const GROUP_VARIANT: i32 = 1;
-const BOOT: i32 = 0x4e0d;
-const STATE: i32 = 0x4e0e;
-const SEND: i32 = 0x4e0f;
-const RECV: i32 = 0x4e10;
-const PART_READ: i32 = 0x4e11;
-const RMTFS_MEM: i32 = 0x4e12;
-const IPA_START: i32 = 0x4e13;
-/// a file of modem_a's FAT16 (kernel qcom_telhal.cpp FwRead): TFTP's /readonly/firmware/image/ (Wi-Fi W0)
-const FW_READ: i32 = 0x4e1b;
-/// the Wi-Fi firmware's MSA regions to its VMIDs (kernel qcom_telhal.cpp WlanMsa, Wi-Fi W1)
-const WLAN_MSA: i32 = 0x4e1c;
-/// the copy engines, HTC and WMI on the kernel's own thread (qcom_wcn3990.cpp, Wi-Fi W2)
-const WLAN_START: i32 = 0x4e1d;
-// C7's HALs (kernel qcom_telhal.cpp): after Wi-Fi's 0x4e1b-0x4e1f, UsbNet's reserved 0x4e20-0x4e22 and Prng 0x4e23
-/// stop the modem and/or the ADSP {mask 1 MSS, 2 ADSP}, asynchronously
-const RPROC_STOP: i32 = 0x4e24;
-/// that stop's progress {phase, error, mss generation, adsp generation}
-const RPROC_STATE: i32 = 0x4e25;
-/// the ringtone's audio memory for the ADSP (adsp.rs)
-pub(crate) const AUDIO_MEM: i32 = 0x4e26;
-/// the vibration motor {ms, amplitude}; 0 stops it
-const HAPTIC: i32 = 0x4e27;
-/// PartRead's index of vendor_a (the IPA firmware, read-only through ext4ro)
-const VENDOR: u32 = 4;
-const SECTOR: u64 = 512;
 const NOT_READY: i32 = -18;
 /// modemst1, modemst2, fsg, fsc (the phone's GPT, docs/hardware/modem.md C0)
 const PART_SIZES: [usize; 4] = [0x20_0000, 0x20_0000, 0x20_0000, 0x2_0000];
@@ -66,35 +46,18 @@ const BOOT_TIMEOUT_MS: u64 = 60_000;
 const LOOP_US: i32 = 10_000;
 const STATUS_LOG_MS: u64 = 30_000;
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Io {
-    a: u32,
-    b: u32,
-    len: u32,
-    buf: u32,
-}
-
-fn hal(function: i32, a1: *mut u8, a2: *mut u8) -> i32 {
-    // SAFETY: the telephony HAL functions read/write only the buffers passed, with the lengths given.
-    unsafe { e32::sys::ui::hal_function(GROUP_VARIANT, function, a1, a2) }
-}
-
-fn hal_io(function: i32, mut io: Io) -> (i32, Io) {
-    let r = hal(function, (&mut io as *mut Io).cast(), core::ptr::null_mut());
-    (r, io)
-}
-
 /// boot step, error, SMP2P slave-kernel bits, IPCRTR open
 fn state() -> Result<[u32; 4], i32> {
     let mut s = [0u32; 4];
-    let r = hal(STATE, s.as_mut_ptr().cast(), core::ptr::null_mut());
+    // SAFETY: STATE writes the live four-word array and takes no second argument.
+    let r = unsafe { hal(STATE, s.as_mut_ptr().cast(), core::ptr::null_mut()) };
     if r < 0 { Err(r) } else { Ok(s) }
 }
 
 fn processor_stop_state() -> Result<[u32; 4], i32> {
     let mut s = [0u32; 4];
-    let r = hal(RPROC_STATE, s.as_mut_ptr().cast(), core::ptr::null_mut());
+    // SAFETY: RPROC_STATE writes the live four-word array and takes no second argument.
+    let r = unsafe { hal(RPROC_STATE, s.as_mut_ptr().cast(), core::ptr::null_mut()) };
     if r < 0 { Err(r) } else { Ok(s) }
 }
 
@@ -107,7 +70,8 @@ impl Platform for Hal {
         }
         // No userspace retry sleeps: mandatory packets use the ordered outbox. The synchronous kernel HAL
         // may still wait for a receive intent; this is not a hard real-time send deadline.
-        match hal(SEND, packet.as_ptr() as *mut u8, packet.len() as *mut u8) {
+        // SAFETY: SEND reads packet.len() bytes from the live packet slice.
+        match unsafe { hal(SEND, packet.as_ptr() as *mut u8, packet.len() as *mut u8) } {
             r if r < 0 => Err(r),
             _ => Ok(()),
         }
@@ -120,7 +84,8 @@ impl Platform for Hal {
             len: buf.len() as u32,
             buf: buf.as_mut_ptr() as u32,
         };
-        match hal_io(RMTFS_MEM, io).0 {
+        // SAFETY: RMTFS_MEM receives the live slice address and its exact length for this synchronous copy.
+        match unsafe { hal_io(RMTFS_MEM, io) }.0 {
             r if r < 0 => Err(r),
             _ => Ok(()),
         }
@@ -133,7 +98,8 @@ impl Platform for Hal {
             len: data.len() as u32,
             buf: data.as_ptr() as u32,
         };
-        match hal_io(RMTFS_MEM, io).0 {
+        // SAFETY: RMTFS_MEM receives the live slice address and its exact length for this synchronous copy.
+        match unsafe { hal_io(RMTFS_MEM, io) }.0 {
             r if r < 0 => Err(r),
             _ => Ok(()),
         }
@@ -153,28 +119,33 @@ impl Platform for Hal {
 
     fn fw_size(&mut self, path: &str) -> Result<usize, i32> {
         match path.strip_prefix("vendor/") {
-            Some(p) => vendor_file(p, |fs, f| Ok(fs_size(fs, f))),
+            // SAFETY: Only the daemon's one loop thread accesses the vendor cache.
+            Some(p) => unsafe { vendor_file(p, |fs, f| Ok(fs_size(fs, f))) },
             None => fw_read(path, 0, &mut []),
         }
     }
 
     fn fw_read(&mut self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, i32> {
         match path.strip_prefix("vendor/") {
-            Some(p) => vendor_file(p, |fs, f| {
-                fs.read_at(f, offset as u64, buf).map_err(ext4_err)
-            }),
+            // SAFETY: Only the daemon's one loop thread accesses the vendor cache.
+            Some(p) => unsafe {
+                vendor_file(p, |fs, f| {
+                    fs.read_at(f, offset as u64, buf).map_err(ext4_err)
+                })
+            },
             None => fw_read(path, offset, buf),
         }
     }
 
     fn wlan_start(&mut self) -> Result<(), i32> {
-        match hal(WLAN_START, core::ptr::null_mut(), core::ptr::null_mut()) {
+        // SAFETY: WLAN_START takes no arguments or buffers.
+        match unsafe { hal(WLAN_START, core::ptr::null_mut(), core::ptr::null_mut()) } {
             r if r < 0 => Err(r),
             _ => Ok(()),
         }
     }
 
-    fn wlan_msa(&mut self, regions: &[modem_proto::wlfw::Region]) -> Result<(), i32> {
+    fn wlan_msa(&mut self, regions: &[hub::wlfw::Region]) -> Result<(), i32> {
         for r in regions {
             let io = Io {
                 a: 1,
@@ -182,7 +153,8 @@ impl Platform for Hal {
                 len: r.size,
                 buf: r.secure as u32,
             };
-            let e = hal_io(WLAN_MSA, io).0;
+            // SAFETY: WLAN_MSA uses scalar region address/size/security fields.
+            let e = unsafe { hal_io(WLAN_MSA, io) }.0;
             if e < 0 {
                 return Err(e);
             }
@@ -200,12 +172,15 @@ impl Platform for Hal {
             String::from("firmware/bdwlan.bin"),
         ];
         for n in &names {
-            let got = vendor_file(n, |fs, f| {
-                if f.size > 0x10_0000 {
-                    return Err(-9); // KErrOverflow: a board file is tens of KB
-                }
-                fs.read(f).map_err(ext4_err)
-            });
+            // SAFETY: Only the daemon's one loop thread accesses the vendor cache.
+            let got = unsafe {
+                vendor_file(n, |fs, f| {
+                    if f.size > 0x10_0000 {
+                        return Err(-9); // KErrOverflow: a board file is tens of KB
+                    }
+                    fs.read(f).map_err(ext4_err)
+                })
+            };
             match got {
                 Ok(d) => {
                     dprintln!("[modemd] wlfw: board data from {n}");
@@ -215,58 +190,6 @@ impl Platform for Hal {
             }
         }
         Vec::new()
-    }
-}
-
-fn ext4_err(e: ext4ro::Error) -> i32 {
-    match e {
-        ext4ro::Error::Io(e) => e,
-        ext4ro::Error::NotFound => -1, // KErrNotFound
-        _ => -20,                      // KErrCorrupt
-    }
-}
-
-fn fs_size(_: &mut ext4ro::Fs<Vendor>, f: &ext4ro::Inode) -> usize {
-    f.size as usize
-}
-
-/// The vendor_a file the modem is reading, kept open between its TFTP blocks (one lookup per file, not per block)
-struct OpenFile(core::cell::RefCell<Option<(String, ext4ro::Fs<Vendor>, ext4ro::Inode)>>);
-// SAFETY: only the daemon's one thread serves TFTP (Platform calls come from its loop).
-unsafe impl Sync for OpenFile {}
-static OPEN: OpenFile = OpenFile(core::cell::RefCell::new(None));
-
-fn vendor_file<T>(
-    path: &str,
-    f: impl FnOnce(&mut ext4ro::Fs<Vendor>, &ext4ro::Inode) -> Result<T, i32>,
-) -> Result<T, i32> {
-    let mut open = OPEN.0.borrow_mut();
-    if open.as_ref().is_none_or(|o| o.0 != path) {
-        *open = None;
-        let mut fs = ext4ro::Fs::open(Vendor).map_err(ext4_err)?;
-        let file = fs.find(path).map_err(ext4_err)?;
-        *open = Some((String::from(path), fs, file));
-    }
-    let o = open.as_mut().ok_or(-1)?;
-    f(&mut o.1, &o.2)
-}
-
-/// HAL FwRead: `path` ("IMAGE/WLANMDSP.MBN") as a NUL-terminated 32-byte buffer; an empty `buf` asks for the size
-fn fw_read(path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, i32> {
-    let mut name = [0u8; 32];
-    if path.len() >= name.len() {
-        return Err(-6); // KErrArgument
-    }
-    name[..path.len()].copy_from_slice(path.as_bytes());
-    let mut io = Io {
-        a: 0,
-        b: offset as u32,
-        len: buf.len() as u32,
-        buf: buf.as_mut_ptr() as u32,
-    };
-    match hal(FW_READ, (&mut io as *mut Io).cast(), name.as_mut_ptr()) {
-        r if r < 0 => Err(r),
-        r => Ok(r as usize),
     }
 }
 
@@ -398,7 +321,7 @@ impl Daemon {
         let mask = 1;
         // nothing more goes to the processors being stopped; the ADSP side survives for a modem-only stop
         if let Some(m) = &mut self.modem {
-            m.lost();
+            m.lost(&mut Hal);
         }
         if self.recovery_attempt >= 3 {
             self.phase = Phase::Failed;
@@ -408,7 +331,8 @@ impl Daemon {
         self.recovery_attempt += 1;
         self.dtmf_stop = None;
         self.healthy_since = 0;
-        let haptic = hal_io(HAPTIC, Io::default()).0;
+        // SAFETY: HAPTIC uses scalar duration/amplitude fields and no buffer.
+        let haptic = unsafe { hal_io(HAPTIC, Io::default()) }.0;
         if haptic < 0 {
             dprintln!(
                 "[modemd t={}ms] recovery vibration stop failed ({})",
@@ -435,21 +359,6 @@ impl Daemon {
         );
     }
 
-    /// Replace `name` in our private directory (C:\\private\\e0003001\\) with `data`.
-    fn save_private(name: &str, data: &[u8]) -> Result<(), i32> {
-        use e32::fs::{File, Fs, mode};
-        let fs = Fs::connect()?;
-        for path in ["C:\\private\\", "C:\\private\\e0003001\\"] {
-            if let Err(e) = fs.mkdir(path)
-                && e != err::KERR_ALREADY_EXISTS
-            {
-                return Err(e);
-            }
-        }
-        let path = alloc::format!("C:\\private\\e0003001\\{name}");
-        File::replace(&fs, &path, mode::SHARE_EXCLUSIVE)?.write(data)
-    }
-
     /// settings.bin: the C8 record (C7's plus caller ID and the log's days); C7 files still load.
     fn save_settings(&self) -> Result<(), i32> {
         let s = self.status();
@@ -457,7 +366,8 @@ impl Daemon {
             .modem
             .as_ref()
             .map_or((0, 30), |m| (m.clir as u8, m.log.days));
-        Self::save_private(
+        save_private(
+            "C:\\private\\e0003001\\",
             "settings.bin",
             &[
                 b'C',
@@ -480,7 +390,7 @@ impl Daemon {
             return;
         }
         m.log.dirty = false;
-        if let Err(e) = Self::save_private("calls.db", &m.log.encode()) {
+        if let Err(e) = save_private("C:\\private\\e0003001\\", "calls.db", &m.log.encode()) {
             dprintln!("[modemd] calls.db not saved ({})", e);
         }
     }
@@ -490,7 +400,7 @@ impl Daemon {
         let Some(m) = &mut self.modem else { return };
         if m.sms.dirty {
             m.sms.dirty = false;
-            if let Err(e) = Self::save_private("sms.db", &m.sms.encode()) {
+            if let Err(e) = save_private("C:\\private\\e0003001\\", "sms.db", &m.sms.encode()) {
                 // not acknowledged: the network sends it again
                 dprintln!("[modemd] sms.db not saved ({})", e);
                 m.sms.dirty = true;
@@ -505,7 +415,7 @@ impl Daemon {
         let Some(m) = &self.modem else {
             return NOT_READY;
         };
-        Self::save_private("block.db", &m.block.encode(true))
+        save_private("C:\\private\\e0003001\\", "block.db", &m.block.encode(true))
             .err()
             .unwrap_or(0)
     }
@@ -515,7 +425,7 @@ impl Daemon {
         self.phase = Phase::Failed;
         self.status.modem = modem_ipc::modem::FAILED;
         if let Some(m) = &mut self.modem {
-            m.lost();
+            m.lost(&mut Hal);
         }
         if self.modem.is_some() && self.recovery_attempt < 3 {
             // a modem failure restarts the modem only: the ADSP's TrustZone shutdown (PAS) never returned on the phone
@@ -537,15 +447,18 @@ impl Daemon {
             Phase::Ipa => {
                 match ipa_firmware() {
                     Ok((image, mdt_len)) => {
-                        let (r, _) = hal_io(
-                            IPA_START,
-                            Io {
-                                a: mdt_len as u32,
-                                b: 0,
-                                len: image.len() as u32,
-                                buf: image.as_ptr() as u32,
-                            },
-                        );
+                        // SAFETY: The image stays alive while IPA_START reads its declared length.
+                        let (r, _) = unsafe {
+                            hal_io(
+                                IPA_START,
+                                Io {
+                                    a: mdt_len as u32,
+                                    b: 0,
+                                    len: image.len() as u32,
+                                    buf: image.as_ptr() as u32,
+                                },
+                            )
+                        };
                         dprintln!(
                             "[modemd] ipa: firmware {} bytes (mdt {}), IPA bring-up -> {}",
                             image.len(),
@@ -571,15 +484,18 @@ impl Daemon {
             Phase::Read(i) => {
                 let n = PART_SIZES[i];
                 let mut v = vec![0u8; n];
-                let (r, _) = hal_io(
-                    PART_READ,
-                    Io {
-                        a: i as u32,
-                        b: 0,
-                        len: n as u32,
-                        buf: v.as_mut_ptr() as u32,
-                    },
-                );
+                // SAFETY: PART_READ writes only the live buffer described by this Io.
+                let (r, _) = unsafe {
+                    hal_io(
+                        PART_READ,
+                        Io {
+                            a: i as u32,
+                            b: 0,
+                            len: n as u32,
+                            buf: v.as_mut_ptr() as u32,
+                        },
+                    )
+                };
                 if r == err::KERR_NOT_SUPPORTED && !matches!(self.adsp, adsp::Adsp::Up) {
                     return Err(r);
                 }
@@ -664,13 +580,16 @@ impl Daemon {
                         }
                         return Ok(());
                     }
-                    let r = hal_io(
-                        RPROC_STOP,
-                        Io {
-                            a: mask,
-                            ..Io::default()
-                        },
-                    )
+                    // SAFETY: RPROC_STOP takes the processor mask and no buffer.
+                    let r = unsafe {
+                        hal_io(
+                            RPROC_STOP,
+                            Io {
+                                a: mask,
+                                ..Io::default()
+                            },
+                        )
+                    }
                     .0;
                     if r < 0 {
                         self.fail("processor stop", r);
@@ -713,7 +632,7 @@ impl Daemon {
                                 now.saturating_sub(since)
                             );
                             if let Some(m) = &mut self.modem {
-                                m.reset(mask & 2 == 0);
+                                m.reset(&mut Hal, mask & 2 == 0);
                             }
                             self.audio = adsp::CallAudio::new();
                             // fatal_seen stays: a FATAL bit the kernel left set is not a new fault
@@ -860,7 +779,8 @@ impl Daemon {
     }
 
     fn boot(&mut self) {
-        let (r, info) = hal_io(RMTFS_MEM, Io::default());
+        // SAFETY: RMTFS_MEM operation zero only writes the descriptor with region information.
+        let (r, info) = unsafe { hal_io(RMTFS_MEM, Io::default()) };
         if r < 0 {
             self.fail("rmtfs carve-out", r);
             return;
@@ -880,7 +800,7 @@ impl Daemon {
                 self.fail("radio storage attachment", e);
                 return;
             }
-            modem.ipa_up = self.ipa_up;
+            modem.router.ipa_up = self.ipa_up;
         }
         self.boot_modem();
     }
@@ -890,7 +810,8 @@ impl Daemon {
             self.phase = Phase::Disabled;
             return;
         }
-        let r = hal(BOOT, core::ptr::null_mut(), core::ptr::null_mut());
+        // SAFETY: BOOT takes no arguments or buffers.
+        let r = unsafe { hal(BOOT, core::ptr::null_mut(), core::ptr::null_mut()) };
         if r < 0 {
             self.fail("modem boot start", r);
             return;
@@ -958,7 +879,8 @@ impl Daemon {
             if !matches!(self.phase, Phase::Running) {
                 break;
             }
-            let r = hal(RECV, buf.as_mut_ptr(), buf.len() as *mut u8);
+            // SAFETY: RECV writes at most buf.len() bytes to the live receive buffer.
+            let r = unsafe { hal(RECV, buf.as_mut_ptr(), buf.len() as *mut u8) };
             if r == NOT_READY {
                 break;
             }
@@ -1018,14 +940,17 @@ impl Daemon {
         let now = time::millis();
         if ringing && !talking && !modem.status.airplane && modem.status.ring.vibrate {
             if now >= self.haptic_at {
-                let r = hal_io(
-                    HAPTIC,
-                    Io {
-                        a: 700,
-                        b: 70,
-                        ..Io::default()
-                    },
-                )
+                // SAFETY: HAPTIC uses scalar duration/amplitude fields and no buffer.
+                let r = unsafe {
+                    hal_io(
+                        HAPTIC,
+                        Io {
+                            a: 700,
+                            b: 70,
+                            ..Io::default()
+                        },
+                    )
+                }
                 .0;
                 if self.haptic_at == 0 || r != self.haptic_error {
                     dprintln!("[modemd t={}ms] incoming vibration start -> {}", now, r);
@@ -1034,7 +959,8 @@ impl Daemon {
                 self.haptic_at = now + 1500;
             }
         } else if self.haptic_at != 0 {
-            let r = hal_io(HAPTIC, Io::default()).0;
+            // SAFETY: HAPTIC uses scalar duration/amplitude fields and no buffer.
+            let r = unsafe { hal_io(HAPTIC, Io::default()) }.0;
             dprintln!("[modemd t={}ms] incoming vibration stop -> {}", now, r);
             self.haptic_error = r;
             self.haptic_at = 0;
@@ -1049,14 +975,17 @@ impl Daemon {
         if waiting != self.waiting_alert {
             self.waiting_alert = waiting;
             if waiting.is_some() && talking && !modem.status.airplane && modem.status.ring.vibrate {
-                let r = hal_io(
-                    HAPTIC,
-                    Io {
-                        a: 150,
-                        b: 60,
-                        ..Io::default()
-                    },
-                )
+                // SAFETY: HAPTIC uses scalar duration/amplitude fields and no buffer.
+                let r = unsafe {
+                    hal_io(
+                        HAPTIC,
+                        Io {
+                            a: 150,
+                            b: 60,
+                            ..Io::default()
+                        },
+                    )
+                }
                 .0;
                 if r < 0 {
                     dprintln!("[modemd] waiting-call vibration failed ({})", r);
@@ -1072,14 +1001,17 @@ impl Daemon {
                 && !modem.status.airplane
                 && mode != modem_ipc::sms::ALERT_SILENT
             {
-                let r = hal_io(
-                    HAPTIC,
-                    Io {
-                        a: 150,
-                        b: 60,
-                        ..Io::default()
-                    },
-                )
+                // SAFETY: HAPTIC uses scalar duration/amplitude fields and no buffer.
+                let r = unsafe {
+                    hal_io(
+                        HAPTIC,
+                        Io {
+                            a: 150,
+                            b: 60,
+                            ..Io::default()
+                        },
+                    )
+                }
                 .0;
                 if r < 0 {
                     dprintln!("[modemd] message vibration failed ({})", r);
@@ -1095,14 +1027,17 @@ impl Daemon {
         }
         if self.sms_buzz_at != 0 && now >= self.sms_buzz_at {
             self.sms_buzz_at = 0;
-            let _ = hal_io(
-                HAPTIC,
-                Io {
-                    a: 150,
-                    b: 60,
-                    ..Io::default()
-                },
-            );
+            // SAFETY: HAPTIC uses scalar duration/amplitude fields and no buffer.
+            let _ = unsafe {
+                hal_io(
+                    HAPTIC,
+                    Io {
+                        a: 150,
+                        b: 60,
+                        ..Io::default()
+                    },
+                )
+            };
         }
         let chime = now < self.sms_tone_until && !talking && !modem.status.airplane;
         // a minute of a *running* modem earns new recovery attempts: run() also runs while a failing modem boots,
@@ -1206,83 +1141,6 @@ impl Daemon {
             self.recover(3);
         }
     }
-}
-
-/// vendor_a through the kernel's read-only, sector-aligned PartRead.
-struct Vendor;
-
-impl ext4ro::Disk for Vendor {
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), i32> {
-        let first = offset / SECTOR * SECTOR;
-        let end = (offset + buf.len() as u64).div_ceil(SECTOR) * SECTOR;
-        let mut tmp = vec![0u8; (end - first) as usize];
-        let (r, _) = hal_io(
-            PART_READ,
-            Io {
-                a: VENDOR,
-                b: first as u32,
-                len: tmp.len() as u32,
-                buf: tmp.as_mut_ptr() as u32,
-            },
-        );
-        if r < 0 {
-            return Err(r);
-        }
-        let at = (offset - first) as usize;
-        buf.copy_from_slice(&tmp[at..at + buf.len()]);
-        Ok(())
-    }
-}
-
-/// IPA's GSI firmware as one ELF image: ipa_fws.mdt (headers + hash) with each ipa_fws.bNN at its p_offset, as
-/// Linux's mdt loader reads the split files; and the .mdt's length (the metadata TrustZone checks).
-fn ipa_firmware() -> Result<(Vec<u8>, usize), ext4ro::Error> {
-    let mut fs = ext4ro::Fs::open(Vendor)?;
-    let mdt = fs.find("firmware/ipa_fws.mdt")?;
-    let mdt = fs.read(&mdt)?;
-    let word =
-        |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize;
-    if mdt.len() < 0x34 || &mdt[..4] != b"\x7fELF" {
-        return Err(ext4ro::Error::Unsupported);
-    }
-    let (phoff, phnum) = (
-        word(&mdt, 28),
-        u16::from_le_bytes([mdt[44], mdt[45]]) as usize,
-    );
-    if phoff + 32 * phnum > mdt.len() {
-        return Err(ext4ro::Error::Unsupported);
-    }
-    // (p_type, p_offset, p_filesz, p_flags) of program header i
-    let ph = |i: usize| {
-        let at = phoff + 32 * i;
-        (
-            word(&mdt, at),
-            word(&mdt, at + 4),
-            word(&mdt, at + 16),
-            word(&mdt, at + 24),
-        )
-    };
-    // only PT_LOAD segments that aren't the hash: those come from .bNN at their p_offset, past the .mdt. The hash
-    // segment's p_offset falls inside the .mdt's bytes (its copy is packed there); writing .b01 over it corrupted
-    // the metadata TrustZone checks (C5b: init_image refused, -0x300045).
-    let loadable = |i: usize| ph(i).0 == 1 && ph(i).3 & (7 << 24) != 2 << 24 && ph(i).2 > 0;
-    let len = (0..phnum)
-        .filter(|&i| loadable(i))
-        .map(|i| ph(i).1 + ph(i).2)
-        .fold(mdt.len(), usize::max);
-    let mut image = vec![0u8; len];
-    image[..mdt.len()].copy_from_slice(&mdt);
-    for i in (0..phnum).filter(|&i| loadable(i)) {
-        let (_, off, size, _) = ph(i);
-        if off < mdt.len() {
-            return Err(ext4ro::Error::Unsupported); // would overwrite the metadata
-        }
-        let seg = fs.find(&alloc::format!("firmware/ipa_fws.b{i:02}"))?;
-        let seg = fs.read(&seg)?;
-        let n = seg.len().min(size);
-        image[off..off + n].copy_from_slice(&seg[..n]);
-    }
-    Ok((image, mdt.len()))
 }
 
 impl Service for Daemon {
@@ -1571,7 +1429,7 @@ impl Service for Daemon {
                     (None, _) => NOT_READY,
                     (_, Err(e)) => e,
                     (Some(m), Ok(b)) if msg.function() == op::BLOCK_SET => {
-                        match modem_proto::phone_rules::block::List::decode(&b) {
+                        match modem::phone_rules::block::List::decode(&b) {
                             Some(list) => {
                                 let known = core::mem::take(&mut m.block.known);
                                 m.block = list;
@@ -1683,7 +1541,8 @@ impl Service for Daemon {
                     target as u8
                 }
             });
-            let haptic = hal_io(HAPTIC, Io::default()).0;
+            // SAFETY: HAPTIC uses scalar duration/amplitude fields and no buffer.
+            let haptic = unsafe { hal_io(HAPTIC, Io::default()) }.0;
             dprintln!(
                 "[modemd t={}ms] answered/ended/silenced vibration stop -> {}",
                 time::millis(),
@@ -1732,8 +1591,8 @@ fn main() -> i32 {
         images: Default::default(),
         modem: Some({
             let mut router = Modem::support_only();
-            router.radio_enabled = !cfg!(feature = "radio-disabled");
-            router.trace = cfg!(feature = "qrtr-trace"); // every QRTR packet in the log (Wi-Fi W0)
+            router.router.radio_enabled = !cfg!(feature = "radio-disabled");
+            router.router.trace = cfg!(feature = "qrtr-trace"); // every QRTR packet in the log (Wi-Fi W0)
             router
         }),
         rx: vec![0u8; 0x2000],
@@ -1798,7 +1657,7 @@ fn main() -> i32 {
         {
             let mut b = vec![0u8; 10 + modem_ipc::MAX_LOG * modem_ipc::LogEntry::SIZE];
             let n = f.read_at(0, &mut b).unwrap_or(0);
-            if let Some(mut log) = modem_proto::calllog::CallLog::decode(&b[..n]) {
+            if let Some(mut log) = modem::calllog::CallLog::decode(&b[..n]) {
                 log.days = m.log.days;
                 m.log = log;
             }
@@ -1814,7 +1673,7 @@ fn main() -> i32 {
             let size = f.size().unwrap_or(0).clamp(0, 4 << 20) as usize;
             let mut b = vec![0u8; size];
             let n = f.read_at(0, &mut b).unwrap_or(0);
-            match modem_proto::messages::Store::decode(&b[..n]) {
+            match modem::messages::Store::decode(&b[..n]) {
                 Some(mut store) => {
                     store.restarted();
                     m.sms = store;
@@ -1835,7 +1694,7 @@ fn main() -> i32 {
         {
             let mut b = vec![0u8; modem_ipc::MAX_BLOCK_BYTES + modem_ipc::MAX_KNOWN_BYTES];
             let n = f.read_at(0, &mut b).unwrap_or(0);
-            if let Some(list) = modem_proto::phone_rules::block::List::decode(&b[..n]) {
+            if let Some(list) = modem::phone_rules::block::List::decode(&b[..n]) {
                 m.block = list;
             }
         }
@@ -1849,8 +1708,7 @@ fn main() -> i32 {
     rt::block_on(async {
         let mut receive = pin!(server.receive());
         let mut audio_receive = pin!(audio_server.receive());
-        let mut pump =
-            modem_proto::schedule::PumpDeadline::new(time::millis(), (LOOP_US / 1000) as u64);
+        let mut pump = hub::schedule::PumpDeadline::new(time::millis(), (LOOP_US / 1000) as u64);
         loop {
             if pump.due(time::millis()) {
                 if let Err(e) = d.step() {

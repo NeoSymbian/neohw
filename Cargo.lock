@@ -23,6 +23,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "apr"
+version = "0.1.0"
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -194,6 +198,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hub"
+version = "0.1.0"
+dependencies = [
+ "hub-ipc",
+ "modem",
+ "qrtr",
+ "wlfw",
+]
+
+[[package]]
+name = "hub-ipc"
+version = "0.1.0"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -230,19 +248,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
-name = "modem-ipc"
-version = "0.1.0"
-
-[[package]]
-name = "modem-proto"
+name = "modem"
 version = "0.1.0"
 dependencies = [
+ "hub",
+ "hub-ipc",
  "modem-ipc",
- "neoaudio",
  "phone-rules",
+ "qrtr",
  "sms",
- "wlfw",
 ]
+
+[[package]]
+name = "modem-ipc"
+version = "0.1.0"
 
 [[package]]
 name = "neoaudio"
@@ -288,6 +307,10 @@ checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "qrtr"
+version = "0.1.0"
 
 [[package]]
 name = "quote"
