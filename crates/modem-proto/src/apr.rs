@@ -41,6 +41,24 @@ const RING_PORT: u16 = 0x0101;
 pub const RING_BYTES: usize = 192_000;
 /// The ASM-mapped region (the kernel's KAudioBytes).
 pub const RING_REGION: u32 = 0x40000;
+/// Media (NeoAudio, docs/audio.md): [`MEDIA_SLOTS`] periods of [`MEDIA_PERIOD`] bytes, after the ringtone's bytes in
+/// the same region, each published to the ADSP on its own (the kernel's per-range AudioMem tickets).
+pub const MEDIA_OFFSET: u32 = 0x30000;
+/// 20 ms of 48 kHz mono S16
+pub const MEDIA_PERIOD: usize = 1920;
+pub const MEDIA_SLOTS: usize = 8;
+/// Leaving media waits this long for the periods in flight to come back before closing the stream anyway.
+const MEDIA_DRAIN_MS: u64 = 1000;
+/// Recording (A5): [`MEDIA_SLOTS`] read buffers of [`MEDIA_PERIOD`] bytes after the media periods; a second ASM
+/// session (port 0x0201) reads the mic's TX path (ADM from PRIMARY_TDM_TX), 48 kHz mono S16.
+pub const REC_OFFSET: u32 = 0x34000;
+const REC_PORT: u16 = 0x0201;
+// Wire facts: Linux sound/soc/qcom/qdsp6/q6asm.c (open read v3, the PCM encoder config block, read v2, read done v2)
+const ASM_OPEN_READ: u32 = 0x10db4;
+const ASM_READ: u32 = 0x10dac; // ASM_DATA_CMD_READ_V2 (WRITE_V2 is 0x10dab); 0x10db5 is unsupported (status 3)
+const ASM_READ_DONE: u32 = 0x10d9a;
+const ASM_ENCDEC: u32 = 0x10c10;
+const ASM_ENC_CFG_PCM: u32 = 0x10da3;
 
 const RATE: f32 = 48_000.0;
 
@@ -130,6 +148,15 @@ const DESTROY_SESSION: u32 = 0x0001_003c;
 /// The ports: PRIMARY_TDM_TX_0 (the mic, RT5514) and SECONDARY_TDM_RX_0 (the amps), (AFE index, port id, clock id)
 pub const MIC: (u16, u16, u32) = (25, 0x9001, 0x200);
 pub const SPK: (u16, u16, u32) = (40, 0x9010, 0x202);
+/// The 3.5 mm jack (A8): headphones on INT0 MI2S RX (port 0x102e, bit clock 0x10f, 48 kHz x 16 x 2 = 1.536 MHz),
+/// the internal codec's 9.6 MHz MCLK (0x305, a service clock). Linux q6afe.c / q6afe-dai.c facts; the bonito DTB's
+/// dai 0x89 and clock 0x33.
+pub const HPH: (u16, u16, u32) = (0x89, 0x102e, 0x10f);
+const MCLK: (u16, u16, u32) = (0x33, 0, 0x305);
+/// The headset's mic (A8): INT3 MI2S TX (port 0x1035, bit clock 0x112), the same I2S format; the DTB's dai 0x90.
+pub const HSMIC: (u16, u16, u32) = (0x90, 0x1035, 0x112);
+const I2S_BCLK_HZ: u32 = 1_536_000;
+const MCLK_HZ: u32 = 9_600_000;
 const BCLK_HZ: u32 = 6_144_000; // 48 kHz x 8 slots x 16 bits
 /// VoiceMMode1: our APR port for the voice sessions, and the modem's session name
 const VOICE_PATH: u16 = 6;
@@ -236,6 +263,36 @@ pub fn afe_clock(port: (u16, u16, u32), on: bool) -> Vec<u8> {
     le32(&mut pl, 12 + d.len() as u32);
     pl.extend_from_slice(&param(0x0001_028f, 0x0001_0290, &d)); // after the u32 size: lsw, msw, handle, module...
     packet(SVC_AFE, 0, 0, port.0 as u32, AFE_SVC_SET_PARAM, &pl)
+}
+
+/// AFE CLOCK_SET for an I2S port's bit clock or the codec's MCLK: `hz`, attribute 1 (COUPLE_NO), root 0.
+pub fn afe_clock_hz(port: (u16, u16, u32), hz: u32, on: bool) -> Vec<u8> {
+    let mut d = Vec::new();
+    le32(&mut d, 1);
+    le32(&mut d, port.2);
+    le32(&mut d, if on { hz } else { 0 });
+    le16(&mut d, 1);
+    le16(&mut d, 0);
+    le32(&mut d, on as u32);
+    let mut pl = Vec::new();
+    le32(&mut pl, 12 + d.len() as u32);
+    pl.extend_from_slice(&param(0x0001_028f, 0x0001_0290, &d));
+    packet(SVC_AFE, 0, 0, port.0 as u32, AFE_SVC_SET_PARAM, &pl)
+}
+
+/// AFE I2S config: 16 bits, SD0, stereo, word select from the ADSP, 48 kHz, PCM; padded to the port-config union
+/// (36 bytes) as Linux.
+pub fn afe_i2s_config(port: (u16, u16, u32)) -> Vec<u8> {
+    let mut d = Vec::new();
+    le32(&mut d, 1);
+    for x in [16u16, 1, 1, 1] {
+        le16(&mut d, x);
+    }
+    le32(&mut d, 48_000);
+    le16(&mut d, 0);
+    le16(&mut d, 0);
+    d.resize(36, 0);
+    afe_port_param(port, 0x0001_020c, 0x0001_020d, &d)
 }
 
 fn afe_port_param(port: (u16, u16, u32), module: u32, id: u32, data: &[u8]) -> Vec<u8> {
@@ -388,6 +445,17 @@ enum Cmd {
     AsmClose,
     AsmUnmap,
     AdmClose,
+    /// a clock at a frequency (the jack's MCLK and bit clock), on or off
+    ClockHz((u16, u16, u32), u32, bool),
+    I2sConfig((u16, u16, u32)),
+    AsmOpenRead,
+    AsmEncCfg,
+    AdmOpenTx,
+    AdmRouteTx,
+    AsmRunRead,
+    AsmPauseRead,
+    AsmCloseRead,
+    AdmCloseTx,
 }
 
 /// What the daemon does next.
@@ -412,6 +480,10 @@ pub enum Mode {
     Call,
     Test,
     Ring,
+    /// NeoAudio's mix, streamed in periods
+    Media,
+    /// Media and recording: the mic read in periods too (A5)
+    Duplex,
 }
 
 /// The audio state machine. Callers only say what they want ([`Audio::set`]); a running sequence is never cut
@@ -438,6 +510,28 @@ pub struct Audio {
     ticket: u32,
     release: bool,
     last_token: u32,
+    /// media periods the ADSP holds: (ticket, generation) per slot
+    slots: [Option<(u32, u32)>; MEDIA_SLOTS],
+    /// media periods it gave back, to release in the kernel
+    releases: Vec<(u32, u32)>,
+    /// when leaving media started waiting for the periods in flight
+    drain_since: Option<u64>,
+    /// the TX path's COPP (recording)
+    copp_tx: u16,
+    /// recording buffers the ADSP holds: (ticket, generation) per slot
+    rec: [Option<(u32, u32)>; MEDIA_SLOTS],
+    /// recorded buffers it gave back: (slot, ticket, generation, bytes), for the daemon to release and copy out
+    recorded: Vec<(usize, u32, u32, u32)>,
+    /// unmatched stream events logged (bounded)
+    unmatched: u32,
+    /// headphones are plugged in: media goes to the jack (the daemon sets it; a change restarts media)
+    pub jack: bool,
+    /// the running media path's output is the jack
+    jack_is: bool,
+    /// a headset with a mic is plugged in: recordings use it (the daemon sets it; a change restarts recording)
+    pub headset: bool,
+    /// the running duplex path records from the headset's mic
+    headset_is: bool,
 }
 
 impl Audio {
@@ -480,8 +574,221 @@ impl Audio {
         }
     }
 
+    /// Media: a free period slot to fill now (media runs and is staying), else None.
+    pub fn media_slot(&self) -> Option<usize> {
+        if !self.streaming() {
+            return None;
+        }
+        self.slots.iter().position(Option::is_none)
+    }
+
+    /// The port media plays on: the jack's while headphones are in (Ring and calls stay on the TDM amps).
+    fn out(&self) -> (u16, u16, u32) {
+        if matches!(self.is, Mode::Media | Mode::Duplex) && self.jack_is {
+            HPH
+        } else {
+            SPK
+        }
+    }
+
+    /// The port recordings come from: the headset's mic while the running duplex path uses it, else the DMIC.
+    fn mic_port(&self) -> (u16, u16, u32) {
+        if self.headset_is { HSMIC } else { MIC }
+    }
+
+    /// The running duplex path records from the headset's mic.
+    pub fn headset_is(&self) -> bool {
+        self.headset_is && self.is == Mode::Duplex
+    }
+
+    /// The running media path plays on the jack.
+    pub fn jack_is(&self) -> bool {
+        self.jack_is && matches!(self.is, Mode::Media | Mode::Duplex)
+    }
+
+    /// Media (or media and recording) runs and is staying.
+    fn streaming(&self) -> bool {
+        matches!(self.is, Mode::Media | Mode::Duplex)
+            && self.want == self.is
+            && self.jack == self.jack_is
+            && (self.is != Mode::Duplex || (self.jack && self.headset) == self.headset_is)
+            && self.idle()
+            && !self.broken
+    }
+
+    /// Recording: a free read buffer to hand the ADSP now, else None.
+    pub fn rec_slot(&self) -> Option<usize> {
+        if self.is != Mode::Duplex || !self.streaming() {
+            return None;
+        }
+        self.rec.iter().position(Option::is_none)
+    }
+
+    /// Where a read buffer is in the region.
+    pub fn rec_offset(slot: usize) -> u32 {
+        REC_OFFSET + (slot * MEDIA_PERIOD) as u32
+    }
+
+    pub fn rec_in_flight(&self) -> usize {
+        self.rec.iter().flatten().count()
+    }
+
+    /// The daemon published read buffer `slot` (ticket, generation): the ASM READ to send.
+    pub fn rec_read(&mut self, slot: usize, ticket: u32, generation: u32) -> Vec<u8> {
+        self.rec[slot] = Some((ticket, generation));
+        let mut v = Vec::new();
+        for w in [
+            self.pcm_phys + Self::rec_offset(slot),
+            ASM_SID,
+            self.map_handle,
+            MEDIA_PERIOD as u32,
+            ticket,
+        ] {
+            v.extend_from_slice(&w.to_le_bytes());
+        }
+        packet(SVC_ASM, REC_PORT, REC_PORT, ticket, ASM_READ, &v)
+    }
+
+    /// The daemon could not send a READ: the buffer is not the ADSP's.
+    pub fn rec_unsent(&mut self, slot: usize) {
+        if let Some((t, g)) = self.rec[slot].take() {
+            self.releases.push((t, g));
+        }
+    }
+
+    /// Buffers the ADSP filled: (slot, ticket, generation, bytes). Release each ticket, then copy the bytes out.
+    pub fn take_recorded(&mut self) -> Vec<(usize, u32, u32, u32)> {
+        core::mem::take(&mut self.recorded)
+    }
+
+    /// An error answer to one of our READs or WRITEs (by its token): release that buffer. False if it is not one.
+    fn stream_refused(&mut self, r: &Rsp) -> bool {
+        let Some((op, status)) = r.result() else {
+            return false;
+        };
+        if status == 0 || !matches!(op, ASM_READ | ASM_WRITE) {
+            return false;
+        }
+        if op == ASM_READ
+            && let Some(i) =
+                (0..MEDIA_SLOTS).find(|&i| self.rec[i].is_some_and(|(t, _)| t == r.token))
+        {
+            let (t, g) = self.rec[i].take().unwrap();
+            self.recorded.push((i, t, g, 0));
+            return self.unmatched_log_left();
+        }
+        if op == ASM_WRITE
+            && let Some(i) =
+                (0..MEDIA_SLOTS).find(|&i| self.slots[i].is_some_and(|(t, _)| t == r.token))
+        {
+            self.releases.push(self.slots[i].take().unwrap());
+            return self.unmatched_log_left();
+        }
+        false
+    }
+
+    /// Whether a refused buffer should also be logged (the first few): false = logged below by the caller.
+    fn unmatched_log_left(&self) -> bool {
+        self.unmatched >= 20
+    }
+
+    /// A READ_DONE for one of the read buffers: {status, address (2 words), handle, size, offset, ...}.
+    fn read_done(&mut self, r: &Rsp) -> bool {
+        let word = |i: usize| {
+            r.payload
+                .get(i..i + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        let (Some(status), Some(addr), Some(high), Some(size), Some(off)) =
+            (word(0), word(4), word(8), word(16), word(20))
+        else {
+            return false;
+        };
+        if high != ASM_SID {
+            return false;
+        }
+        let Some(i) = (0..MEDIA_SLOTS).find(|&i| {
+            self.pcm_phys + Self::rec_offset(i) == addr
+                && self.rec[i].is_some_and(|(t, _)| t == r.token)
+        }) else {
+            return false;
+        };
+        let (t, g) = self.rec[i].take().unwrap();
+        // a failed or odd read gives nothing; the buffer is released either way
+        let n = if status == 0 && off == 0 {
+            size.min(MEDIA_PERIOD as u32)
+        } else {
+            0
+        };
+        self.recorded.push((i, t, g, n));
+        true
+    }
+
+    /// Where a period slot is in the region.
+    pub fn media_offset(slot: usize) -> u32 {
+        MEDIA_OFFSET + (slot * MEDIA_PERIOD) as u32
+    }
+
+    pub fn media_in_flight(&self) -> usize {
+        self.slots.iter().flatten().count()
+    }
+
+    /// The daemon copied a period into `slot` and published it (ticket, generation): the ASM WRITE to send.
+    pub fn media_write(&mut self, slot: usize, ticket: u32, generation: u32) -> Vec<u8> {
+        self.slots[slot] = Some((ticket, generation));
+        let mut v = Vec::new();
+        for w in [
+            self.pcm_phys + Self::media_offset(slot),
+            ASM_SID,
+            self.map_handle,
+            MEDIA_PERIOD as u32,
+            ticket,
+            0,
+            0,
+            0,
+        ] {
+            v.extend_from_slice(&w.to_le_bytes());
+        }
+        packet(SVC_ASM, RING_PORT, RING_PORT, ticket, ASM_WRITE, &v)
+    }
+
+    /// The daemon could not send a media WRITE: the period is not the ADSP's, release it.
+    pub fn media_unsent(&mut self, slot: usize) {
+        if let Some(t) = self.slots[slot].take() {
+            self.releases.push(t);
+        }
+    }
+
+    /// A WRITE_DONE for one of the media periods (its address and ticket): released. False if it is not one.
+    fn media_written(&mut self, r: &Rsp) -> bool {
+        let word = |i: usize| {
+            r.payload
+                .get(i..i + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        let (Some(addr), Some(high)) = (word(0), word(4)) else {
+            return false;
+        };
+        if high != ASM_SID {
+            return false;
+        }
+        let Some(i) = (0..MEDIA_SLOTS).find(|&i| {
+            self.pcm_phys + Self::media_offset(i) == addr
+                && self.slots[i].is_some_and(|(t, _)| t == r.token)
+        }) else {
+            return false;
+        };
+        self.releases.push(self.slots[i].take().unwrap());
+        true
+    }
+
     pub fn set(&mut self, want: Mode) {
         self.want = want;
+    }
+
+    /// The mode asked for.
+    pub fn wanted(&self) -> Mode {
+        self.want
     }
 
     /// The mode running (or being started); Off while stopping.
@@ -546,6 +853,46 @@ impl Audio {
                     self.broken = true;
                 }
             }
+            Mode::Media | Mode::Duplex => {
+                q = alloc::vec![CoreReady];
+                self.jack_is = self.jack;
+                self.headset_is = m == Mode::Duplex && self.jack && self.headset;
+                if self.headset_is {
+                    // the headset's mic: the codec's MCLK, its I2S port (the jack's output below shares the MCLK)
+                    q.extend([
+                        ClockHz(MCLK, MCLK_HZ, true),
+                        ClockHz(HSMIC, I2S_BCLK_HZ, true),
+                        I2sConfig(HSMIC),
+                        Port(HSMIC, true),
+                    ]);
+                } else if m == Mode::Duplex {
+                    // the mic's port first, as a call
+                    q.extend([Clock(MIC), TdmConfig(MIC), SlotMap(MIC), Port(MIC, true)]);
+                }
+                if self.jack {
+                    if !self.headset_is {
+                        q.push(ClockHz(MCLK, MCLK_HZ, true));
+                    }
+                    q.extend([
+                        ClockHz(HPH, I2S_BCLK_HZ, true),
+                        I2sConfig(HPH),
+                        Port(HPH, true),
+                    ]);
+                } else {
+                    q.extend([Clock(SPK), TdmConfig(SPK), SlotMap(SPK), Port(SPK, true)]);
+                }
+                q.extend([AsmMap, AsmOpen, AsmFormat, AdmOpen, AdmRoute]);
+                if m == Mode::Duplex {
+                    q.extend([AsmOpenRead, AsmEncCfg, AdmOpenTx, AdmRouteTx]);
+                }
+                q.extend([Codecs(true), AsmRun]);
+                if m == Mode::Duplex {
+                    q.push(AsmRunRead);
+                }
+                if self.pcm_phys == 0 {
+                    self.broken = true;
+                }
+            }
             Mode::Off => q.clear(),
         }
         self.queue = q;
@@ -584,6 +931,36 @@ impl Audio {
                 Port(SPK, false),
                 Port(MIC, false),
             ]),
+            Mode::Media | Mode::Duplex => {
+                let duplex = self.is == Mode::Duplex;
+                q.push(AsmPause);
+                if duplex {
+                    q.push(AsmPauseRead);
+                }
+                q.push(AsmClose);
+                if duplex {
+                    q.push(AsmCloseRead);
+                }
+                q.extend([AsmUnmap, AdmClose]);
+                if duplex {
+                    q.push(AdmCloseTx);
+                }
+                q.push(Codecs(false));
+                if self.jack_is {
+                    q.extend([Port(HPH, false), ClockHz(HPH, I2S_BCLK_HZ, false)]);
+                } else {
+                    q.push(Port(SPK, false));
+                }
+                if duplex {
+                    q.push(Port(self.mic_port(), false));
+                    if self.headset_is {
+                        q.push(ClockHz(HSMIC, I2S_BCLK_HZ, false));
+                    }
+                }
+                if self.jack_is {
+                    q.push(ClockHz(MCLK, MCLK_HZ, false)); // last: both jack ports run from it
+                }
+            }
             Mode::Ring => q.extend([
                 AsmPause,
                 AsmClose,
@@ -678,16 +1055,23 @@ impl Audio {
                 packet(SVC_ASM, RING_PORT, RING_PORT, 1, ASM_FMT, &v)
             }
             AdmOpen => {
+                let out = self.out();
+                // the jack's port is stereo: the COPP takes FL and FR (the ADSP spreads the mono stream)
+                let (ch, map): (u16, [u8; 8]) = if out == HPH {
+                    (2, [1, 2, 0, 0, 0, 0, 0, 0])
+                } else {
+                    (1, [3, 0, 0, 0, 0, 0, 0, 0])
+                };
                 let mut v = Vec::new();
-                for h in [0u16, 1, SPK.1, 0] {
+                for h in [0u16, 1, out.1, 0] {
                     v.extend_from_slice(&h.to_le_bytes());
                 }
                 v.extend_from_slice(&0x10312u32.to_le_bytes()); // ADM NULL_COPP_TOPOLOGY (no effects)
-                v.extend_from_slice(&1u16.to_le_bytes());
+                v.extend_from_slice(&ch.to_le_bytes());
                 v.extend_from_slice(&16u16.to_le_bytes());
                 v.extend_from_slice(&48_000u32.to_le_bytes());
-                v.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
-                packet(SVC_ADM, SPK.1, SPK.1, u32::from(SPK.0) << 16, ADM_OPEN, &v)
+                v.extend_from_slice(&map);
+                packet(SVC_ADM, out.1, out.1, u32::from(out.0) << 16, ADM_OPEN, &v)
             }
             AdmRoute => {
                 let mut v = Vec::new();
@@ -728,12 +1112,74 @@ impl Audio {
             ),
             AdmClose => packet(
                 SVC_ADM,
-                SPK.1,
+                self.out().1,
                 self.copp,
-                u32::from(SPK.0) << 16,
+                u32::from(self.out().0) << 16,
                 ADM_CLOSE,
                 &[],
             ),
+            AsmOpenRead => {
+                let mut v = Vec::new();
+                // mode 0 (legacy session), from the device matrix, no pre-processing, PCM v2, 16 bits
+                for w in [0u32, 0, 0x10c68, 0x10da5] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                v.extend_from_slice(&16u16.to_le_bytes());
+                v.extend_from_slice(&0u16.to_le_bytes());
+                packet(SVC_ASM, REC_PORT, REC_PORT, 2, ASM_OPEN_READ, &v)
+            }
+            AsmEncCfg => {
+                let mut v = Vec::new();
+                // {param id, size 28}, {frames per buffer 1, block size 20}, 1 channel, 16 bits, 48 kHz, signed, FC
+                for w in [ASM_ENC_CFG_PCM, 28, 1, 20] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                v.extend_from_slice(&1u16.to_le_bytes());
+                v.extend_from_slice(&16u16.to_le_bytes());
+                v.extend_from_slice(&48_000u32.to_le_bytes());
+                v.extend_from_slice(&1u16.to_le_bytes());
+                v.extend_from_slice(&0u16.to_le_bytes());
+                v.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
+                packet(SVC_ASM, REC_PORT, REC_PORT, 2, ASM_ENCDEC, &v)
+            }
+            AdmOpenTx => {
+                let mut v = Vec::new();
+                // mode 2 = TX path, record
+                let mic = self.mic_port();
+                for h in [0u16, 2, mic.1, 0] {
+                    v.extend_from_slice(&h.to_le_bytes());
+                }
+                v.extend_from_slice(&0x10312u32.to_le_bytes()); // ADM NULL_COPP_TOPOLOGY
+                v.extend_from_slice(&1u16.to_le_bytes());
+                v.extend_from_slice(&16u16.to_le_bytes());
+                v.extend_from_slice(&48_000u32.to_le_bytes());
+                v.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
+                packet(SVC_ADM, mic.1, mic.1, u32::from(mic.0) << 16, ADM_OPEN, &v)
+            }
+            AdmRouteTx => {
+                let mut v = Vec::new();
+                // the TX matrix (1): session 2 from this COPP
+                for w in [1u32, 1] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                for h in [2u16, 1, self.copp_tx, 0] {
+                    v.extend_from_slice(&h.to_le_bytes());
+                }
+                packet(SVC_ADM, 0, 0, 0, ADM_ROUTE, &v)
+            }
+            AsmRunRead => packet(SVC_ASM, REC_PORT, REC_PORT, 2, ASM_RUN, &[0; 12]),
+            AsmPauseRead => packet(SVC_ASM, REC_PORT, REC_PORT, 2, ASM_PAUSE, &[]),
+            AsmCloseRead => packet(SVC_ASM, REC_PORT, REC_PORT, 2, ASM_CLOSE, &[]),
+            AdmCloseTx => packet(
+                SVC_ADM,
+                self.mic_port().1,
+                self.copp_tx,
+                u32::from(self.mic_port().0) << 16,
+                ADM_CLOSE,
+                &[],
+            ),
+            ClockHz(p, hz, on) => afe_clock_hz(p, hz, on),
+            I2sConfig(p) => afe_i2s_config(p),
             Codecs(_) | Publish => Vec::new(),
         }
     }
@@ -743,6 +1189,9 @@ impl Audio {
         if self.release {
             self.release = false;
             return Out::Complete(self.ticket, self.pcm_generation);
+        }
+        if let Some((t, g)) = self.releases.pop() {
+            return Out::Complete(t, g);
         }
         if self.broken {
             return Out::Nothing;
@@ -757,11 +1206,26 @@ impl Audio {
                 return Out::Nothing;
             }
         }
-        if self.idle() && self.want != self.is {
+        // headphones in or out while media runs: stop it, and it starts again on the other port
+        let replug = matches!(self.is, Mode::Media | Mode::Duplex) && self.jack != self.jack_is
+            || self.is == Mode::Duplex && (self.jack && self.headset) != self.headset_is;
+        if self.idle() && (self.want != self.is || replug) {
             if self.is == Mode::Off {
                 log(format_args!("apr: starting {:?}", self.want));
                 self.begin(self.want);
+            } else if matches!(self.is, Mode::Media | Mode::Duplex)
+                && self.media_in_flight() + self.rec_in_flight() > 0
+                && now.saturating_sub(*self.drain_since.get_or_insert(now)) < MEDIA_DRAIN_MS
+            {
+                return Out::Nothing; // the periods in flight play out first
             } else {
+                if self.media_in_flight() + self.rec_in_flight() > 0 {
+                    log(format_args!(
+                        "apr: {} media periods not given back; closing anyway (they stay unusable)",
+                        self.media_in_flight() + self.rec_in_flight()
+                    ));
+                }
+                self.drain_since = None;
                 log(format_args!("apr: stopping {:?}", self.is));
                 self.end();
             }
@@ -835,6 +1299,42 @@ impl Audio {
             log(format_args!("apr: bad packet ({} bytes)", packet.len()));
             return;
         };
+        if r.svc == SVC_ASM && r.opcode == ASM_WRITTEN && self.media_written(&r) {
+            return;
+        }
+        if r.svc == SVC_ASM && r.opcode == ASM_READ_DONE && self.read_done(&r) {
+            return;
+        }
+        // a READ or WRITE the ADSP refused: its buffer is given back now (as 0 bytes), never left the ADSP's
+        if r.svc == SVC_ASM && self.stream_refused(&r) {
+            return;
+        }
+        // what the streams did not take: read events, errors for a READ or WRITE (they are not queue commands)
+        if r.svc == SVC_ASM
+            && (r.opcode == ASM_READ_DONE
+                || r.result()
+                    .is_some_and(|(o, s)| s != 0 && matches!(o, ASM_READ | ASM_WRITE)))
+            && self.unmatched < 20
+        {
+            self.unmatched += 1;
+            let w = |i: usize| {
+                r.payload
+                    .get(i..i + 4)
+                    .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+            };
+            log(format_args!(
+                "apr: unmatched ASM {:#x} port {:#x} token {:#x}: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                r.opcode,
+                r.src_port,
+                r.token,
+                w(0),
+                w(4),
+                w(8),
+                w(12),
+                w(16),
+                w(20)
+            ));
+        }
         let Some((op, _)) = self.waiting else {
             return; // an event, or a late answer
         };
@@ -853,10 +1353,27 @@ impl Audio {
                     | Cmd::AsmClose
                     | Cmd::AsmUnmap
                     | Cmd::AdmClose
+                    | Cmd::AsmOpenRead
+                    | Cmd::AsmEncCfg
+                    | Cmd::AdmOpenTx
+                    | Cmd::AdmRouteTx
+                    | Cmd::AsmRunRead
+                    | Cmd::AsmPauseRead
+                    | Cmd::AsmCloseRead
+                    | Cmd::AdmCloseTx
             )
         ) {
-            let expected = if matches!(current, Some(Cmd::AdmOpen | Cmd::AdmRoute | Cmd::AdmClose))
-            {
+            let expected = if matches!(
+                current,
+                Some(
+                    Cmd::AdmOpen
+                        | Cmd::AdmRoute
+                        | Cmd::AdmClose
+                        | Cmd::AdmOpenTx
+                        | Cmd::AdmRouteTx
+                        | Cmd::AdmCloseTx
+                )
+            ) {
                 SVC_ADM
             } else {
                 SVC_ASM
@@ -878,7 +1395,7 @@ impl Audio {
                 }
                 return;
             }
-            if current == Some(Cmd::AdmOpen) && r.opcode == ADM_OPEN_RSP {
+            if matches!(current, Some(Cmd::AdmOpen | Cmd::AdmOpenTx)) && r.opcode == ADM_OPEN_RSP {
                 let status = r
                     .payload
                     .get(..4)
@@ -890,7 +1407,11 @@ impl Audio {
                 if status != Some(0) || copp.is_none_or(|c| c == 255) {
                     self.failed(log);
                 } else {
-                    self.copp = copp.unwrap();
+                    if current == Some(Cmd::AdmOpen) {
+                        self.copp = copp.unwrap();
+                    } else {
+                        self.copp_tx = copp.unwrap();
+                    }
                     self.waiting = None;
                     self.at += 1;
                 }
@@ -915,8 +1436,10 @@ impl Audio {
                 return;
             }
             // MAP/OPEN return handles in dedicated replies; basic success is not completion.
-            if matches!(current, Some(Cmd::AsmMap | Cmd::AdmOpen | Cmd::AsmWrite))
-                && r.result().is_some_and(|(_, s)| s == 0)
+            if matches!(
+                current,
+                Some(Cmd::AsmMap | Cmd::AdmOpen | Cmd::AdmOpenTx | Cmd::AsmWrite)
+            ) && r.result().is_some_and(|(_, s)| s == 0)
             {
                 return;
             }
@@ -1439,5 +1962,384 @@ mod tests {
         assert_eq!(a.poll(200, &mut |_| {}), Out::Nothing);
         // A fresh owner is created only after the kernel confirms DSP stop.
         assert!(Audio::default().quiescent());
+    }
+
+    /// The WRITE_DONE the ADSP sends for a media WRITE packet.
+    fn media_done(a: &mut Audio, w: &[u8]) {
+        let token = u32::from_le_bytes(w[12..16].try_into().unwrap());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&w[20..28]); // its address, both words
+        payload.extend_from_slice(&[0; 8]);
+        let mut r = packet(SVC_ASM, RING_PORT, RING_PORT, token, ASM_WRITTEN, &payload);
+        r[4] = SVC_ASM;
+        r[5] = DOMAIN_ADSP;
+        a.handle(&r, &mut |_| {});
+    }
+
+    /// Start media and return the ops sent.
+    fn start_media(a: &mut Audio) -> Vec<u32> {
+        a.set(Mode::Media);
+        let mut ops = Vec::new();
+        for now in 0..100 {
+            match a.poll(now, &mut |_| {}) {
+                Out::Send(p) => {
+                    ops.push(u32::from_le_bytes(p[16..20].try_into().unwrap()));
+                    ring_response(a, &p);
+                }
+                Out::Codecs(_) => a.codecs_done(true, &mut |_| {}),
+                Out::Nothing => {}
+                o => panic!("{o:?}"),
+            }
+        }
+        ops
+    }
+
+    #[test]
+    fn media_streams_periods_and_releases_each_once() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 4,
+            ..Default::default()
+        };
+        assert_eq!(a.media_slot(), None);
+        let ops = start_media(&mut a);
+        assert_eq!(*ops.last().unwrap(), ASM_RUN);
+        assert!(!ops.contains(&ASM_WRITE));
+        assert!(a.running());
+        // fill every slot
+        let mut writes = Vec::new();
+        for t in 1..=MEDIA_SLOTS as u32 {
+            let slot = a.media_slot().unwrap();
+            writes.push(a.media_write(slot, t, 4));
+        }
+        assert_eq!(a.media_slot(), None);
+        assert_eq!(a.media_in_flight(), MEDIA_SLOTS);
+        let w = &writes[2];
+        assert_eq!(
+            u32::from_le_bytes(w[20..24].try_into().unwrap()),
+            0x9000_0000 + MEDIA_OFFSET + 2 * MEDIA_PERIOD as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(w[32..36].try_into().unwrap()),
+            MEDIA_PERIOD as u32
+        );
+        // a done with a wrong ticket releases nothing
+        let mut bad = writes[2].clone();
+        bad[12] ^= 0x55;
+        media_done(&mut a, &bad);
+        assert_eq!(a.poll(200, &mut |_| {}), Out::Nothing);
+        media_done(&mut a, &writes[2]);
+        assert_eq!(a.poll(201, &mut |_| {}), Out::Complete(3, 4));
+        assert_eq!(a.poll(202, &mut |_| {}), Out::Nothing);
+        media_done(&mut a, &writes[2]); // a duplicate
+        assert_eq!(a.poll(203, &mut |_| {}), Out::Nothing);
+        assert_eq!(a.media_slot(), Some(2));
+    }
+
+    #[test]
+    fn leaving_media_waits_for_the_periods_in_flight() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 1,
+            ..Default::default()
+        };
+        start_media(&mut a);
+        let w = a.media_write(0, 7, 1);
+        a.set(Mode::Ring);
+        assert_eq!(a.media_slot(), None, "no new periods while leaving");
+        for now in 300..310 {
+            assert_eq!(a.poll(now, &mut |_| {}), Out::Nothing);
+        }
+        assert_eq!(a.is(), Mode::Media);
+        media_done(&mut a, &w);
+        assert_eq!(a.poll(311, &mut |_| {}), Out::Complete(7, 1));
+        let Out::Send(p) = a.poll(312, &mut |_| {}) else {
+            panic!()
+        };
+        assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), ASM_PAUSE);
+        assert_eq!(a.is(), Mode::Off);
+    }
+
+    #[test]
+    fn a_lost_media_period_does_not_block_a_call_forever() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 1,
+            ..Default::default()
+        };
+        start_media(&mut a);
+        a.media_write(0, 9, 1);
+        a.set(Mode::Call);
+        assert_eq!(a.poll(400, &mut |_| {}), Out::Nothing);
+        let Out::Send(p) = a.poll(400 + MEDIA_DRAIN_MS, &mut |_| {}) else {
+            panic!()
+        };
+        assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), ASM_PAUSE);
+        // never released: the kernel keeps that range the ADSP's
+        assert_eq!(a.media_in_flight(), 1);
+    }
+
+    #[test]
+    fn unsent_media_write_is_released() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 2,
+            ..Default::default()
+        };
+        start_media(&mut a);
+        a.media_write(5, 11, 2);
+        a.media_unsent(5);
+        assert_eq!(a.poll(500, &mut |_| {}), Out::Complete(11, 2));
+        assert_eq!(a.media_in_flight(), 0);
+    }
+
+    #[test]
+    fn media_slots_fit_after_the_ringtone() {
+        assert!(MEDIA_OFFSET as usize >= RING_BYTES);
+        assert!(MEDIA_OFFSET as usize + MEDIA_SLOTS * MEDIA_PERIOD <= RING_REGION as usize);
+    }
+
+    /// Start a mode with the scripted ADSP and return the ops sent.
+    fn start(a: &mut Audio, m: Mode) -> Vec<u32> {
+        a.set(m);
+        let mut ops = Vec::new();
+        for now in 0..200 {
+            match a.poll(now, &mut |_| {}) {
+                Out::Send(p) => {
+                    ops.push(u32::from_le_bytes(p[16..20].try_into().unwrap()));
+                    ring_response(a, &p);
+                }
+                Out::Codecs(_) => a.codecs_done(true, &mut |_| {}),
+                Out::Nothing => {}
+                o => panic!("{o:?}"),
+            }
+        }
+        ops
+    }
+
+    fn read_done_for(a: &mut Audio, read: &[u8], status: u32, size: u32) {
+        let token = u32::from_le_bytes(read[12..16].try_into().unwrap());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&status.to_le_bytes());
+        payload.extend_from_slice(&read[20..28]); // the address, both words
+        payload.extend_from_slice(&read[28..32]); // the map handle
+        payload.extend_from_slice(&size.to_le_bytes());
+        payload.extend_from_slice(&[0; 24]);
+        let mut r = packet(SVC_ASM, REC_PORT, REC_PORT, token, ASM_READ_DONE, &payload);
+        r[4] = SVC_ASM;
+        r[5] = DOMAIN_ADSP;
+        a.handle(&r, &mut |_| {});
+    }
+
+    #[test]
+    fn duplex_opens_the_mic_path_and_reads_buffers() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 3,
+            ..Default::default()
+        };
+        let ops = start(&mut a, Mode::Duplex);
+        let at = |o: u32| ops.iter().position(|x| *x == o).unwrap();
+        assert!(at(ASM_OPEN) < at(ASM_OPEN_READ));
+        assert!(at(ASM_OPEN_READ) < at(ASM_ENCDEC));
+        assert_eq!(ops.iter().filter(|o| **o == ADM_OPEN).count(), 2);
+        assert_eq!(*ops.last().unwrap(), ASM_RUN);
+        assert!(a.running());
+        assert!(a.media_slot().is_some());
+        let slot = a.rec_slot().unwrap();
+        let read = a.rec_read(slot, 21, 3);
+        assert_eq!(
+            u32::from_le_bytes(read[20..24].try_into().unwrap()),
+            0x9000_0000 + REC_OFFSET
+        );
+        // another buffer's done, then this one's
+        let mut other = read.clone();
+        other[20] ^= 0x40;
+        read_done_for(&mut a, &other, 0, 1920);
+        assert!(a.take_recorded().is_empty());
+        read_done_for(&mut a, &read, 0, 1920);
+        assert_eq!(a.take_recorded(), alloc::vec![(slot, 21, 3, 1920)]);
+        assert_eq!(a.rec_in_flight(), 0);
+        // a failed read releases its buffer with no bytes
+        let read = a.rec_read(1, 22, 3);
+        read_done_for(&mut a, &read, 1, 1920);
+        assert_eq!(a.take_recorded(), alloc::vec![(1, 22, 3, 0)]);
+    }
+
+    #[test]
+    fn media_has_no_read_buffers_and_leaving_duplex_drains_reads() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 3,
+            ..Default::default()
+        };
+        let ops = start(&mut a, Mode::Media);
+        assert!(!ops.contains(&ASM_OPEN_READ));
+        assert_eq!(a.rec_slot(), None);
+        let mut b = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 3,
+            ..Default::default()
+        };
+        start(&mut b, Mode::Duplex);
+        let read = b.rec_read(0, 30, 3);
+        b.set(Mode::Media);
+        assert_eq!(b.rec_slot(), None, "no new reads while leaving");
+        assert_eq!(b.poll(500, &mut |_| {}), Out::Nothing);
+        read_done_for(&mut b, &read, 0, 1920);
+        assert_eq!(b.take_recorded().len(), 1);
+        let Out::Send(p) = b.poll(501, &mut |_| {}) else {
+            panic!()
+        };
+        assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), ASM_PAUSE);
+    }
+
+    #[test]
+    fn read_buffers_fit_after_the_media_periods() {
+        assert!(REC_OFFSET as usize >= MEDIA_OFFSET as usize + MEDIA_SLOTS * MEDIA_PERIOD);
+        assert!(REC_OFFSET as usize + MEDIA_SLOTS * MEDIA_PERIOD <= RING_REGION as usize);
+    }
+
+    #[test]
+    fn a_refused_read_or_write_gives_its_buffer_back() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            pcm_generation: 5,
+            ..Default::default()
+        };
+        start(&mut a, Mode::Duplex);
+        let read = a.rec_read(3, 40, 5);
+        assert_eq!(
+            u32::from_le_bytes(read[16..20].try_into().unwrap()),
+            0x10dac
+        );
+        let mut refused = ack(&read, 0, 3); // status 3: unsupported
+        refused[4] = SVC_ASM;
+        a.handle(&refused, &mut |_| {});
+        assert_eq!(a.take_recorded(), alloc::vec![(3, 40, 5, 0)]);
+        assert_eq!(a.rec_in_flight(), 0);
+        let write = a.media_write(1, 41, 5);
+        let mut refused = ack(&write, 0, 1);
+        refused[4] = SVC_ASM;
+        a.handle(&refused, &mut |_| {});
+        assert_eq!(a.media_in_flight(), 0);
+        assert_eq!(a.poll(900, &mut |_| {}), Out::Complete(41, 5));
+    }
+
+    /// Drive `a` with the scripted ADSP from `t0` for 200 ms of fake time; the packets sent.
+    fn run_packets(a: &mut Audio, t0: u64) -> Vec<Vec<u8>> {
+        let mut sent = Vec::new();
+        for now in t0..t0 + 200 {
+            match a.poll(now, &mut |_| {}) {
+                Out::Send(p) => {
+                    ring_response(a, &p);
+                    sent.push(p);
+                }
+                Out::Codecs(_) => a.codecs_done(true, &mut |_| {}),
+                _ => {}
+            }
+        }
+        sent
+    }
+
+    fn opcode(p: &[u8]) -> u32 {
+        u32::from_le_bytes(p[16..20].try_into().unwrap())
+    }
+
+    #[test]
+    fn media_on_headphones_uses_the_jack_port_and_its_clocks() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            jack: true,
+            ..Default::default()
+        };
+        a.set(Mode::Media);
+        let sent = run_packets(&mut a, 0);
+        assert!(a.running() && a.jack_is());
+        // MCLK 9.6 MHz, then the bit clock, the I2S config, the port's start
+        let clocks: Vec<&Vec<u8>> = sent
+            .iter()
+            .filter(|p| opcode(p) == AFE_SVC_SET_PARAM)
+            .collect();
+        assert_eq!(clocks[0], &afe_clock_hz(MCLK, MCLK_HZ, true));
+        assert_eq!(clocks[1], &afe_clock_hz(HPH, I2S_BCLK_HZ, true));
+        assert!(sent.contains(&afe_i2s_config(HPH)));
+        assert!(sent.contains(&afe_start(HPH, true)));
+        assert!(!sent.contains(&afe_start(SPK, true)));
+        let adm = sent.iter().find(|p| opcode(p) == ADM_OPEN).unwrap();
+        assert_eq!(u16::from_le_bytes(adm[24..26].try_into().unwrap()), HPH.1);
+        assert_eq!(
+            u16::from_le_bytes(adm[32..34].try_into().unwrap()),
+            2,
+            "stereo COPP"
+        );
+        // the I2S config's payload: 36 bytes after the param header
+        assert_eq!(afe_i2s_config(HPH).len(), HDR + 4 + 24 + 36);
+        // unplugged: media stops on the jack (port, bit clock, MCLK off) and starts again on the amps
+        a.jack = false;
+        assert_eq!(a.media_slot(), None);
+        let sent = run_packets(&mut a, 300);
+        let stop = sent
+            .iter()
+            .position(|p| *p == afe_start(HPH, false))
+            .unwrap();
+        let bclk_off = sent
+            .iter()
+            .position(|p| *p == afe_clock_hz(HPH, I2S_BCLK_HZ, false))
+            .unwrap();
+        let mclk_off = sent
+            .iter()
+            .position(|p| *p == afe_clock_hz(MCLK, MCLK_HZ, false))
+            .unwrap();
+        let spk = sent
+            .iter()
+            .position(|p| *p == afe_start(SPK, true))
+            .unwrap();
+        assert!(stop < bclk_off && bclk_off < mclk_off && mclk_off < spk);
+        assert!(a.running() && !a.jack_is());
+    }
+
+    #[test]
+    fn recording_with_a_headset_uses_its_mic_and_the_mclk_goes_last() {
+        let mut a = Audio {
+            pcm_phys: 0x9000_0000,
+            jack: true,
+            headset: true,
+            ..Default::default()
+        };
+        a.set(Mode::Duplex);
+        let sent = run_packets(&mut a, 0);
+        assert!(a.running() && a.headset_is() && a.jack_is());
+        assert!(sent.contains(&afe_clock_hz(HSMIC, I2S_BCLK_HZ, true)));
+        assert!(sent.contains(&afe_i2s_config(HSMIC)));
+        assert!(sent.contains(&afe_start(HSMIC, true)));
+        assert!(
+            !sent.contains(&afe_start(MIC, true)),
+            "the built-in mic's port stays off"
+        );
+        assert_eq!(
+            sent.iter()
+                .filter(|p| **p == afe_clock_hz(MCLK, MCLK_HZ, true))
+                .count(),
+            1,
+            "one MCLK for both jack ports"
+        );
+        let tx = sent
+            .iter()
+            .filter(|p| opcode(p) == ADM_OPEN)
+            .find(|p| u16::from_le_bytes(p[22..24].try_into().unwrap()) == 2)
+            .unwrap();
+        assert_eq!(u16::from_le_bytes(tx[24..26].try_into().unwrap()), HSMIC.1);
+        // the headset unplugged: everything stops, the MCLK last, and recording starts again on the DMIC
+        a.jack = false;
+        a.headset = false;
+        let sent = run_packets(&mut a, 300);
+        let at = |p: &Vec<u8>| sent.iter().position(|x| x == p).unwrap();
+        assert!(at(&afe_start(HPH, false)) < at(&afe_start(HSMIC, false)));
+        assert!(
+            at(&afe_clock_hz(HSMIC, I2S_BCLK_HZ, false)) < at(&afe_clock_hz(MCLK, MCLK_HZ, false))
+        );
+        assert!(at(&afe_clock_hz(MCLK, MCLK_HZ, false)) < at(&afe_start(MIC, true)));
+        assert!(a.running() && !a.headset_is());
     }
 }

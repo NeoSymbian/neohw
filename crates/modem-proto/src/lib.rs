@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+pub use neoaudio;
 pub use phone_rules;
 pub use sms;
 
@@ -1763,7 +1764,12 @@ impl Modem {
                 }
             } else {
                 self.radio_refusals = self.radio_refusals.saturating_add(1);
-                self.status.result = -2;
+                // QMI 26 no effect / 52 invalid transition: the modem is already there or getting there (it
+                // refuses "online" ~20 s into every boot while it brings itself online). Not a failed action for
+                // the user: the result would stay on Settings -> Sounds as "Action failed (-2)".
+                if !matches!(m.result(), Some(Err(26 | 52))) {
+                    self.status.result = -2;
+                }
             }
         }
         let text = |t: Option<&[u8]>| t.map(|b| String::from_utf8_lossy(b).into_owned());
