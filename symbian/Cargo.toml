@@ -6,8 +6,8 @@ members = ["neonet"]
 resolver = "2"
 
 [workspace.dependencies]
-# NeoSymbian/e32-rs, the same revision as neoui and telephony
-e32 = { git = "https://github.com/NeoSymbian/e32-rs", rev = "e97e2ebcb242f5365d1b3f9d520646603e1e9056", features = ["critical-section"] }
+# NeoSymbian/e32-rs, the same revision as neoui
+e32 = { git = "https://github.com/NeoSymbian/e32-rs", rev = "0489694ee55f6879a0f769d1e6d17077b22d4e32", features = ["critical-section"] }
 net = { path = "../crates/net" }
 
 [profile.release]
