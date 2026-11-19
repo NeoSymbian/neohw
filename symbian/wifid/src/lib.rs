@@ -63,6 +63,8 @@ struct Daemon {
     left: Option<Vec<u8>>,
     /// Settings' Wi-Fi switch
     radio_on: bool,
+    /// a join saw no EAPOL at all (fail::NO_DATA): no automatic joins until the modem restarts or the user connects
+    deaf: bool,
     link: Link,
     next_link: u64,
     last: Option<Scan>,
@@ -150,6 +152,7 @@ impl Daemon {
         };
         for e in events {
             if let Event::Reset { generation, .. } = e {
+                self.deaf = false; // the restarted firmware gets a fresh data path
                 self.stop();
                 if let Some(s) = &self.hub {
                     let mut args = TIpcArgs::new();
@@ -232,7 +235,13 @@ impl Daemon {
             }
             self.link = link;
         }
-        if !self.radio_on || !self.link.idle() {
+        if self.failed.is_some_and(|m| *m.lock() == fail::NO_DATA) && !self.deaf {
+            dprintln!(
+                "[wifid] no EAPOL in a whole handshake: the data path is down; no rejoins until a modem restart"
+            );
+            self.deaf = true;
+        }
+        if !self.radio_on || !self.link.idle() || self.deaf {
             return;
         }
         // a remembered network in the list while nothing is joined: try it (once a minute at most)
@@ -325,6 +334,7 @@ impl Service for Daemon {
             }
             op::CONNECT => match msg.read8_vec(0).ok().and_then(|b| Connect::decode(&b)) {
                 Some(c) => {
+                    self.deaf = false; // the user asked: try once more
                     let pmk = (!c.password.is_empty()).then(|| wpa::psk(&c.password, &c.ssid));
                     self.start(c.bssid, &c.ssid, pmk, now);
                     err::KERR_NONE
@@ -380,6 +390,7 @@ fn supplicant(bssid: [u8; 6], pmk: Option<[u8; 32]>, failed: Failed) -> i32 {
     let mut frame = [0u8; 512];
     let mut handshake_since: Option<u64> = None;
     let joined_at = time::millis();
+    let mut eapol = 0u32;
     loop {
         time::sleep(10_000);
         let mut b = [0u8; wifi::kernel::LINK_SIZE];
@@ -396,8 +407,17 @@ fn supplicant(bssid: [u8; 6], pmk: Option<[u8; 32]>, failed: Failed) -> i32 {
             LinkState::Handshake => {
                 let now = time::millis();
                 if now.saturating_sub(*handshake_since.get_or_insert(now)) > HANDSHAKE_MS {
-                    dprintln!("[wifid] no message 3 in {} ms: leaving", HANDSHAKE_MS);
-                    return fail(fail::HANDSHAKE);
+                    dprintln!(
+                        "[wifid] no message 3 in {} ms ({} EAPOL frames): leaving",
+                        HANDSHAKE_MS,
+                        eapol
+                    );
+                    // a wrong password still brings message 1 again and again; nothing at all is a dead data path
+                    return fail(if eapol == 0 {
+                        fail::NO_DATA
+                    } else {
+                        fail::HANDSHAKE
+                    });
                 }
             }
             LinkState::Connected => {}
@@ -419,6 +439,7 @@ fn supplicant(bssid: [u8; 6], pmk: Option<[u8; 32]>, failed: Failed) -> i32 {
             }
         };
         while let Ok(Some(n)) = hal::eapol_recv(&mut frame) {
+            eapol += 1;
             let actions = match hs.on_eapol(&frame[..n]) {
                 Ok(a) => a,
                 Err(wpa::Error::RsnMismatch | wpa::Error::NoGtk) => return fail(fail::DOWNGRADE),
@@ -502,6 +523,7 @@ fn main() -> i32 {
         join: None,
         left: read(LEFT).ok().filter(|b| !b.is_empty()),
         radio_on: true,
+        deaf: false,
         link: Link::default(),
         next_link: 0,
         last: None,

@@ -35,6 +35,9 @@ pub mod fail {
     pub const HAL: i32 = 4;
     /// the AP kept resending message 1: a wrong password
     pub const HANDSHAKE: i32 = 5;
+    /// associated, but not one EAPOL frame arrived: the firmware's data path is down (docs known-issues, the
+    /// reason-4 drops). No automatic rejoin until the modem restarts, since each such join makes the firmware assert.
+    pub const NO_DATA: i32 = 6;
 }
 
 /// [`op::CONNECT`]'s argument: `{bssid 6, ssid length, ssid, password length, password}`.
