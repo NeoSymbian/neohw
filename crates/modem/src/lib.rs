@@ -1050,7 +1050,8 @@ impl Cellular {
             (NAS, nas::GET_NETWORK_TIME) => self.network_time(p, m),
             (NAS, nas::GET_PLMN_NAME) => {
                 if let Some(n) = nas::plmn_name(m) {
-                    p.log(format_args!("nas: operator {n}"));
+                    let (mcc, mnc) = self.plmn_asked.unwrap_or_default();
+                    p.log(format_args!("nas: operator {n} (PLMN {mcc}-{mnc:02})"));
                     self.status.operator = Text::new(&n);
                 }
             }

@@ -208,6 +208,9 @@ pub struct Handshake {
     ptk: Option<Ptk>,
     replay: Option<[u8; 8]>,
     authorized: bool,
+    /// the keys handed to the driver: a key is never installed twice (KRACK: it would restart its packet numbers)
+    installed_tk: Option<[u8; 16]>,
+    installed_gtk: Option<(u8, [u8; 16])>,
 }
 
 impl Handshake {
@@ -224,6 +227,8 @@ impl Handshake {
             ptk: None,
             replay: None,
             authorized: false,
+            installed_tk: None,
+            installed_gtk: None,
         }
     }
 
@@ -315,18 +320,27 @@ impl Handshake {
             &[0; 32],
             &[],
         );
-        if self.authorized {
-            // a resent msg3 (our msg4 was lost): answer it, but never install the keys again (a reinstalled PTK
-            // restarts its packet numbers: the KRACK nonce reuse)
-            return Ok(vec![Action::Send(msg4)]);
+        // a resent msg3 (our msg4 was lost) carries the PTK already in: answer it, install nothing. A PTK rekey (a new
+        // 4-way on this association, a new ANonce) installs its new PTK.
+        let mut out = vec![Action::Send(msg4)];
+        if self.installed_tk != Some(ptk.tk) {
+            self.installed_tk = Some(ptk.tk);
+            out.push(Action::InstallPtk(ptk.tk));
         }
-        self.authorized = true;
-        Ok(vec![
-            Action::Send(msg4),
-            Action::InstallPtk(ptk.tk),
-            Action::InstallGtk(idx, gtk),
-            Action::Authorize,
-        ])
+        out.extend(self.new_gtk(idx, gtk));
+        if !self.authorized {
+            self.authorized = true;
+            out.push(Action::Authorize);
+        }
+        Ok(out)
+    }
+
+    // install a group key unless it is the one already in (a resent group message 1)
+    fn new_gtk(&mut self, idx: u8, gtk: [u8; 16]) -> Option<Action> {
+        (self.installed_gtk != Some((idx, gtk))).then(|| {
+            self.installed_gtk = Some((idx, gtk));
+            Action::InstallGtk(idx, gtk)
+        })
     }
 
     // the AP's group key handshake message 1 (a GTK rekey after the 4-way)
@@ -350,7 +364,9 @@ impl Handshake {
             &[0; 32],
             &[],
         );
-        Ok(vec![Action::Send(msg2), Action::InstallGtk(idx, gtk)])
+        let mut out = vec![Action::Send(msg2)];
+        out.extend(self.new_gtk(idx, gtk));
+        Ok(out)
     }
 }
 

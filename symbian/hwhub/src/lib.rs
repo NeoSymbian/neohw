@@ -246,6 +246,15 @@ impl Daemon {
                     self.fail("partition read", r);
                     return Ok(());
                 }
+                // diagnosis (docs known-issues, the reason-4 drops): which EFS the modem starts from
+                let fnv = v.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+                });
+                dprintln!(
+                    "[hwhub] EFS image {} FNV-1a {:016x}",
+                    hub::rmtfs::PATHS[i],
+                    fnv
+                );
                 self.images[i] = v;
                 if i + 1 < PART_SIZES.len() {
                     self.phase = Phase::Read(i + 1);

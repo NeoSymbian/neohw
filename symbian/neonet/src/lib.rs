@@ -2,7 +2,7 @@
 //! NEONET.EXE (docs hardware/wifi.md W5): the phone's IP stack. It moves Ethernet frames between [`net::Stack`] and the Wi-Fi
 //! driver (kernel HAL WlanLink 0x4e1f: op 3 the link, op 8 a received frame, op 9 a frame to send, op 10 wait for
 //! either, docs hardware/wifi.md W7), gets an address
-//! by DHCP once the link is connected, and serves the NeoNet API ([`net::proto`]) to SYSSTART and apps. SYSSTART
+//! by DHCP once the link is connected, and serves the NeoNet API ([`net::proto`]) to SYSSTART and apps. WIFID
 //! starts it at boot; a second copy finds the server name taken and exits.
 #![no_std]
 

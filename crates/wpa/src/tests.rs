@@ -308,3 +308,41 @@ fn resent_msg3_reinstalls_nothing() {
         msg4[MIC..MIC + 16]
     );
 }
+
+#[test]
+fn ptk_rekey_installs_the_new_key() {
+    // the AP runs a new 4-way on the same association (a PTK rekey): its msg3 installs the new PTK, not msg4 alone
+    let mut ap = Ap::new(b"pw-pw-pw");
+    let mut s = supplicant(b"pw-pw-pw");
+    let a = s.on_eapol(&ap.msg1()).unwrap();
+    ap.take_msg2(sent(&a[0]));
+    assert_eq!(s.on_eapol(&ap.msg3(&RSN_IE.clone())).unwrap().len(), 4);
+    ap.anonce = [0x55; 32];
+    let a = s.on_eapol(&ap.msg1()).unwrap();
+    assert!(ap.take_msg2(sent(&a[0])));
+    let tk = ap.ptk.clone().unwrap().tk;
+    let a = s.on_eapol(&ap.msg3(&RSN_IE.clone())).unwrap();
+    // the GTK did not change, so only the PTK goes in; the port is already open
+    assert_eq!(a[1..], [Action::InstallPtk(tk)]);
+    assert!(s.authorized());
+}
+
+#[test]
+fn resent_group_msg1_reinstalls_nothing() {
+    let mut ap = Ap::new(b"pw-pw-pw");
+    let mut s = supplicant(b"pw-pw-pw");
+    let a = s.on_eapol(&ap.msg1()).unwrap();
+    ap.take_msg2(sent(&a[0]));
+    s.on_eapol(&ap.msg3(&RSN_IE.clone())).unwrap();
+    // our group msg2 was lost: the AP resends the same GTK with a new replay counter
+    let (data, kck) = (ap.wrapped(&[], 1), ap.ptk.clone().unwrap().kck);
+    let g1 = ap.frame(
+        VER2 | ACK | HAS_MIC | SECURE | ENCRYPTED,
+        &[0; 32],
+        &data,
+        Some(&kck),
+    );
+    let a = s.on_eapol(&g1).unwrap();
+    assert_eq!(a.len(), 1);
+    assert_eq!(mic(&kck, sent(&a[0])), sent(&a[0])[MIC..MIC + 16]);
+}
