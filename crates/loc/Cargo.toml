@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "loc"
+description = "GNSS from the modem's QMI LOC over NeoHub (GNSSD.EXE), XTRA injection, and the NeoLocation contract"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+hub-ipc = { path = "../hub-ipc" }
+qrtr = { path = "../qrtr" }
