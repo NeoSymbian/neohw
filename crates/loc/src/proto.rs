@@ -168,9 +168,27 @@ impl Report {
     }
 }
 
-/// GNSS SV Info (0x25): how many satellites the engine sees (TLV 0x10's count).
-pub fn satellites_seen(m: &Msg) -> Option<u8> {
-    m.u8(0x10)
+/// One GNSS SV Info (0x25) list entry: `{valid u32, system u32, id u16, health u8, status u32, navigation u8,
+/// elevation f32, azimuth f32, SNR f32}`, packed.
+const SV_SIZE: usize = 28;
+const SV_SNR_VALID: u32 = 1 << 7;
+
+/// GNSS SV Info (0x25): `(listed, heard, best SNR in dB-Hz)`. The list holds every satellite the engine works on,
+/// searched for or tracked; "heard" = a valid SNR above 0.
+pub fn satellites(m: &Msg) -> Option<(u8, u8, u8)> {
+    let v = m.tlv(0x10)?;
+    let (&n, rest) = v.split_first()?;
+    let (mut heard, mut best) = (0u8, 0f32);
+    let (entries, _) = rest.as_chunks::<SV_SIZE>();
+    for e in entries.iter().take(n as usize) {
+        let valid = u32::from_le_bytes(e[..4].try_into().ok()?);
+        let snr = f32::from_le_bytes(e[24..28].try_into().ok()?);
+        if valid & SV_SNR_VALID != 0 && snr > 0.0 {
+            heard = heard.saturating_add(1);
+            best = best.max(snr);
+        }
+    }
+    Some((n, heard, best.min(255.0) as u8))
 }
 
 /// `{max file size, max part size}`

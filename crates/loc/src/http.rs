@@ -8,9 +8,13 @@ use alloc::vec::Vec;
 pub const MAX_BODY: usize = 512 * 1024;
 const ALLOWED: &str = ".izatcloud.net";
 
-/// `http://host/path` -> `(host, path)`, only for the XTRA servers' hosts on port 80.
+/// `http://host/path` -> `(host, path)`, only for the XTRA servers' hosts on port 80. The modem names `https://`
+/// URLs (phone, 2026-11-20); the same files come over plain HTTP.
+/// shortcut: HTTPS fetched as HTTP (no TLS on the phone yet; the modem checks the file), use TLS once there is one.
 pub fn split_url(url: &str) -> Option<(&str, &str)> {
-    let rest = url.strip_prefix("http://")?;
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
     let (host, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -98,8 +102,12 @@ mod tests {
             split_url("http://xtrapath1.izatcloud.net/xtra3grcej.bin"),
             Some(("xtrapath1.izatcloud.net", "/xtra3grcej.bin"))
         );
+        assert_eq!(
+            split_url("https://xtrapath2.izatcloud.net/xtra3grcej.bin"),
+            Some(("xtrapath2.izatcloud.net", "/xtra3grcej.bin"))
+        );
         for bad in [
-            "https://xtrapath1.izatcloud.net/x.bin",
+            "ftp://xtrapath1.izatcloud.net/x.bin",
             "http://izatcloud.net/x.bin",
             "http://.izatcloud.net/x.bin",
             "http://xtrapath1.izatcloud.net.evil.com/x.bin",

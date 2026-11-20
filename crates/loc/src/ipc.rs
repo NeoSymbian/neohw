@@ -38,7 +38,7 @@ pub const RECORD_VERSION: u8 = 1;
 pub const NO_XTRA: u32 = u32::MAX;
 
 /// The latest state and fix, little-endian, [`SIZE`] bytes:
-/// `{version, state, flags, used, seen, 3 reserved, lat_e7 i32, lon_e7 i32, h_acc_dm u32, alt_dm i32, utc_ms u64,
+/// `{version, state, flags, used, seen, snr, 2 reserved, lat_e7 i32, lon_e7 i32, h_acc_dm u32, alt_dm i32, utc_ms u64,
 /// ttff_ms u32, xtra_age_s u32}`. The fix fields keep the last fix (utc_ms 0 = none yet).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Status {
@@ -46,8 +46,10 @@ pub struct Status {
     pub flags: u8,
     /// satellites used in the last fix
     pub used: u8,
-    /// satellites the engine sees now
+    /// satellites the engine hears now (a signal-to-noise ratio above 0)
     pub seen: u8,
+    /// the strongest of them, dB-Hz (decoding a satellite's orbit needs about 25+)
+    pub snr: u8,
     /// degrees × 10^7
     pub lat_e7: i32,
     pub lon_e7: i32,
@@ -70,6 +72,7 @@ impl Default for Status {
             flags: 0,
             used: 0,
             seen: 0,
+            snr: 0,
             lat_e7: 0,
             lon_e7: 0,
             h_acc_dm: 0,
@@ -84,7 +87,14 @@ impl Default for Status {
 impl Status {
     pub fn encode(&self) -> [u8; SIZE] {
         let mut b = [0u8; SIZE];
-        b[..5].copy_from_slice(&[RECORD_VERSION, self.state, self.flags, self.used, self.seen]);
+        b[..6].copy_from_slice(&[
+            RECORD_VERSION,
+            self.state,
+            self.flags,
+            self.used,
+            self.seen,
+            self.snr,
+        ]);
         b[8..12].copy_from_slice(&self.lat_e7.to_le_bytes());
         b[12..16].copy_from_slice(&self.lon_e7.to_le_bytes());
         b[16..20].copy_from_slice(&self.h_acc_dm.to_le_bytes());
@@ -106,6 +116,7 @@ impl Status {
             flags: b[2],
             used: b[3],
             seen: b[4],
+            snr: b[5],
             lat_e7: w(8) as i32,
             lon_e7: w(12) as i32,
             h_acc_dm: w(16),
@@ -128,6 +139,7 @@ mod tests {
             flags: flag::SERVICE | flag::XTRA_VALID,
             used: 9,
             seen: 21,
+            snr: 31,
             lat_e7: 401_772_000,
             lon_e7: -445_036_000,
             h_acc_dm: 87,

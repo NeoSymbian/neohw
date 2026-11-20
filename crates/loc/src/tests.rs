@@ -74,6 +74,23 @@ fn ready() -> (Gnss, Fake) {
     (g, f)
 }
 
+/// An SV Info list: one entry per SNR (0 = searched for, not heard)
+fn sv_list(snrs: &[f32]) -> Vec<u8> {
+    let mut v = vec![snrs.len() as u8];
+    for (i, snr) in snrs.iter().enumerate() {
+        v.extend_from_slice(&0xffu32.to_le_bytes()); // every field valid
+        v.extend_from_slice(&1u32.to_le_bytes()); // GPS
+        v.extend_from_slice(&(i as u16 + 1).to_le_bytes());
+        v.push(1);
+        v.extend_from_slice(&2u32.to_le_bytes()); // tracking
+        v.push(1);
+        v.extend_from_slice(&45f32.to_le_bytes());
+        v.extend_from_slice(&180f32.to_le_bytes());
+        v.extend_from_slice(&snr.to_le_bytes());
+    }
+    v
+}
+
 fn fix(lat: f64, lon: f64) -> Builder {
     indication(id::POSITION_REPORT)
         .u32(0x01, proto::session::SUCCESS)
@@ -157,12 +174,19 @@ fn a_session_finds_a_fix() {
         .u8(0x02, 1);
     g.event(&mut f, &ind(progress), 5000);
     assert_eq!(g.status(0).state, state::SEARCHING);
-    g.event(&mut f, &ind(indication(id::SV_INFO).tlv(0x10, &[12])), 6000);
+    g.event(
+        &mut f,
+        &ind(indication(id::SV_INFO).tlv(0x10, &sv_list(&[0.0, 18.5, 31.2]))),
+        6000,
+    );
     g.event(&mut f, &ind(fix(40.1772, 44.5036)), 32_500);
     let s = g.status(0);
     assert_eq!(s.state, state::FIX);
     assert_eq!((s.lat_e7, s.lon_e7), (401_772_000, 445_036_000));
-    assert_eq!((s.h_acc_dm, s.alt_dm, s.used, s.seen), (85, -12, 7, 12));
+    assert_eq!(
+        (s.h_acc_dm, s.alt_dm, s.used, s.seen, s.snr),
+        (85, -12, 7, 2, 31)
+    );
     assert_eq!(s.ttff_ms, 31_500);
     // later fixes keep the first fix time
     g.event(&mut f, &ind(fix(40.1773, 44.5037)), 33_500);

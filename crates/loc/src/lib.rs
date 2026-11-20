@@ -219,6 +219,7 @@ impl Gnss {
         self.valid_until = None;
         self.engine = None;
         self.status.seen = 0;
+        self.status.snr = 0;
     }
 
     pub fn event(&mut self, bus: &mut dyn Bus, e: &Event, now_ms: u64) {
@@ -272,7 +273,15 @@ impl Gnss {
         }
         match m.id {
             id::POSITION_REPORT => self.report(bus, m, now_ms),
-            id::SV_INFO => self.status.seen = proto::satellites_seen(m).unwrap_or(0),
+            id::SV_INFO => {
+                let (listed, heard, snr) = proto::satellites(m).unwrap_or_default();
+                if (heard, snr / 5) != (self.status.seen, self.status.snr / 5) {
+                    bus.log(format_args!(
+                        "loc: {listed} satellites listed, {heard} heard, best {snr} dB-Hz"
+                    ));
+                }
+                (self.status.seen, self.status.snr) = (heard, snr);
+            }
             id::INJECT_TIME_REQUEST => {
                 let utc = bus.utc_ms();
                 if utc > 0 {
@@ -291,8 +300,8 @@ impl Gnss {
                 }
                 self.want_xtra |= self.upload.is_none();
                 bus.log(format_args!(
-                    "loc: the modem asks for XTRA ({} servers)",
-                    self.urls.len()
+                    "loc: the modem asks for XTRA from {:?}",
+                    self.urls
                 ));
             }
             id::ORBITS_SOURCE if proto::ind_ok(m) => {
@@ -302,10 +311,7 @@ impl Gnss {
                 if let Some(v) = m.tlv(0x11) {
                     self.urls = proto::servers(v);
                 }
-                bus.log(format_args!(
-                    "loc: XTRA source: {} servers",
-                    self.urls.len()
-                ));
+                bus.log(format_args!("loc: XTRA source {:?}", self.urls));
             }
             id::ORBITS_VALIDITY => {
                 self.valid_until = m.tlv(0x10).and_then(proto::valid_until);
