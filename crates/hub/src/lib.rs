@@ -779,8 +779,8 @@ impl hub_ipc::Bus for Connection<'_> {
                 Err(KERR_IN_USE)
             };
         }
-        // 0x24 IPA and 0x25 SSCTL are the hub's own clients; 0x26 is WIFID's WLFW client (S5)
-        if !(0x20..=0x27).contains(&port) || matches!(port, 0x24 | 0x25) {
+        // 0x24 IPA and 0x25 SSCTL are the hub's own clients; 0x26 is WIFID's WLFW client (S5), 0x28 GNSSD's LOC (GN1)
+        if !(0x20..=0x28).contains(&port) || matches!(port, 0x24 | 0x25) {
             return Err(KERR_ARGUMENT);
         }
         self.router.bindings.push((service, port));

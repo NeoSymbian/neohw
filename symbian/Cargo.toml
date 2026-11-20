@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# The Symbian side: the neohw EXEs (HWHUB.EXE, MODEMD.EXE, AUDIOD.EXE, WIFID.EXE, NEONET.EXE), each a staticlib for build/emitter/build_rust_exe.py
+# The Symbian side: the neohw EXEs (HWHUB.EXE, MODEMD.EXE, AUDIOD.EXE, GNSSD.EXE, WIFID.EXE, NEONET.EXE), each a staticlib for build/emitter/build_rust_exe.py
 # (exes.txt). Its own workspace:
 # built only for armv5te-none-eabi with the pinned nightly (`cargo arm`), like neoui/symbian.
 [workspace]
-members = ["audiod", "hwhub", "modemd", "neonet", "sys", "wifid"]
+members = ["audiod", "gnssd", "hwhub", "modemd", "neonet", "sys", "wifid"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -12,6 +12,7 @@ e32 = { git = "https://github.com/NeoSymbian/e32-rs", rev = "0489694ee55f6879a0f
 apr = { path = "../crates/apr" }
 hub-ipc = { path = "../crates/hub-ipc" }
 hub = { path = "../crates/hub" }
+loc = { path = "../crates/loc" }
 modem = { path = "../crates/modem" }
 modem-ipc = { path = "../crates/modem-ipc" }
 neoaudio = { path = "../crates/neoaudio" }

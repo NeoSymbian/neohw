@@ -657,6 +657,20 @@ fn closed_session_unbinds_ports_and_removes_its_outbox_requests() {
 }
 
 #[test]
+fn client_ports_are_0x20_to_0x28_without_the_hubs_own() {
+    use hub_ipc::Bus;
+    let (mut r, mut f) = (modem(), fake());
+    assert_eq!(r.bus(&mut f).bind(16, 0x28), Ok(()));
+    for port in [0x1f, 0x24, 0x25, 0x29] {
+        assert_eq!(
+            r.bus(&mut f).bind(16, port),
+            Err(KERR_ARGUMENT),
+            "{port:#x}"
+        );
+    }
+}
+
+#[test]
 fn acknowledged_recovery_reopens_without_a_second_reset_generation() {
     let mut r = modem();
     r.lost();
