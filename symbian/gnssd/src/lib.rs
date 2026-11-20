@@ -114,7 +114,6 @@ impl Daemon {
         if !self.gnss.want_xtra || self.download.is_some() || now < self.next_download {
             return;
         }
-        self.next_download = now + XTRA_RETRY_MS;
         let utc = b.utc_ms();
         if let Some((data, at)) = cached().filter(|(_, at)| utc > 0 && utc - at < XTRA_FRESH_MS) {
             dprintln!("[gnssd] XTRA from the cache ({} bytes)", data.len());
@@ -128,6 +127,8 @@ impl Daemon {
             return;
         }
         let Some(slot) = self.slot else { return };
+        // only a real download attempt waits before the next (the modem's own request brings the URLs later)
+        self.next_download = now + XTRA_RETRY_MS;
         match e32::thread::spawn_with_stack(32 << 10, move || {
             let r = download(&urls);
             *slot.lock() = Some(r);

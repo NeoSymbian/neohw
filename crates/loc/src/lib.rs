@@ -290,7 +290,10 @@ impl Gnss {
                     self.urls = proto::servers(v);
                 }
                 self.want_xtra |= self.upload.is_none();
-                bus.log(format_args!("loc: the modem asks for XTRA"));
+                bus.log(format_args!(
+                    "loc: the modem asks for XTRA ({} servers)",
+                    self.urls.len()
+                ));
             }
             id::ORBITS_SOURCE if proto::ind_ok(m) => {
                 if let Some((file, part)) = m.tlv(0x10).and_then(proto::sizes) {
@@ -299,6 +302,10 @@ impl Gnss {
                 if let Some(v) = m.tlv(0x11) {
                     self.urls = proto::servers(v);
                 }
+                bus.log(format_args!(
+                    "loc: XTRA source: {} servers",
+                    self.urls.len()
+                ));
             }
             id::ORBITS_VALIDITY => {
                 self.valid_until = m.tlv(0x10).and_then(proto::valid_until);
