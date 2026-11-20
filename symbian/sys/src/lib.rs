@@ -4,6 +4,8 @@
 
 extern crate alloc;
 
+pub mod hub;
+
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;

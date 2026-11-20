@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "gnssd"
+description = "GNSSD.EXE: GNSS from the modem's QMI LOC over NeoHub, XTRA over Wi-Fi, NeoLocation"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+test = false
+
+[dependencies]
+e32.workspace = true
+hub-ipc.workspace = true
+loc.workspace = true
+net = { workspace = true, features = ["client"] }
+sys.workspace = true

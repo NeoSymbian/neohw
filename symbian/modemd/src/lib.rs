@@ -1036,6 +1036,11 @@ fn main() -> i32 {
         }
     };
     dprintln!("[modemd] start: serving NeoModem, connecting to NeoHub and AUDIOD");
+    // GNSSD (docs hardware/gnss.md) waits for NeoHub on its own; a second copy exits
+    match e32::process::Process::spawn("GNSSD.EXE", "") {
+        Ok(p) => p.resume(),
+        Err(e) => dprintln!("[modemd] GNSSD spawn failed ({})", e),
+    }
     let mut d = Daemon {
         phase: Phase::Starting,
         modem: Some(Modem::new()),

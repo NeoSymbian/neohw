@@ -28,17 +28,19 @@ in [kernel](https://github.com/NeoSymbian/kernel) under `baseport/arm64`.
 | `modem` | Cellular QMI clients, status, calls, SIM/PIN, logs, blocklist and SMS; uses only the hub Bus/Event boundary |
 | `ext4ro` | Read-only ext4 for firmware on the vendor partition |
 | `wlfw` | The Wi-Fi firmware's QMI control service (WLFW, QMI 69) |
+| `loc` | GNSS: the modem's QMI LOC client (`Gnss`), the XTRA download's HTTP, the NeoLocation contract |
 | `wifi` | The firmware's start over NeoHub (`Firmware`), the NeoWifi contract, the kernel's scan/link records and the saved networks |
 | `wpa` | WPA2-PSK, supplicant side: PMK, PTK, the 4-way and group key handshakes (sans-I/O; CCMP, PSK, no MFP) |
 | `net` | NeoNet: the IP stack (smoltcp: DHCP, DNS, TCP, UDP), its IPC protocol and the client (`client` feature) |
 | `symbian/sys` | Shared HAL ABI, vendor ext4/firmware access and private-file saving |
 | `symbian/hwhub` | HWHUB.EXE (0xE0003002): QRTR rings/router, firmware, MSS/ADSP boot, recovery and NeoHub |
-| `symbian/modemd` | MODEMD.EXE (0xE0003001): cellular NeoHub client, NeoModem, call/ring/alert policy, vibration; starts HWHUB and AUDIOD |
+| `symbian/modemd` | MODEMD.EXE (0xE0003001): cellular NeoHub client, NeoModem, call/ring/alert policy, vibration; starts HWHUB, AUDIOD and GNSSD |
 | `symbian/audiod` | AUDIOD.EXE (0xE0003003): APR (ADSP ring 2), AudioMem, codecs, routes, amps, the jack; NeoAudio (+ MODEMD's op::CONTROL) |
+| `symbian/gnssd` | GNSSD.EXE (0xE0003004): QMI LOC over NeoHub, fix sessions, XTRA over Wi-Fi (cached on C:), NeoLocation |
 | `symbian/wifid` | WIFID.EXE (0xE0004002): WLFW over NeoHub, joining and WPA2, remembered networks, NeoWifi; starts NEONET |
 | `symbian/neonet` | NEONET.EXE (0xE0004001): the IP stack on the kernel's WlanLink frames, the NeoNet server |
 
-Consumers pin these crates by git rev: neoui (`modem-ipc`, `neoaudio`, `phone-rules`, `wifi`, `net`), phone
+Consumers pin these crates by git rev: neoui (`modem-ipc`, `neoaudio`, `phone-rules`, `wifi`, `net`, `loc`), phone
 (`modem-ipc`, `phone-rules`, `sms`).
 
 ## MODEMD notes

@@ -15,18 +15,17 @@ use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::fmt;
 use core::ops::ControlFlow;
 use core::pin::pin;
 use e32::fs::{File, Fs, mode};
-use e32::ipc::{Session, TIpcArgs, TVersion};
+use e32::ipc::{Session, TVersion};
 use e32::rt::{self, Either};
 use e32::server::{self, Message, Server, Service};
 use e32::sync::Mutex;
-use e32::sys::{TPtr8, TPtrC8, err};
+use e32::sys::err;
 use e32::thread::JoinHandle;
 use e32::{dprintln, time};
-use hub_ipc::{Bus, Event};
+use hub_ipc::Event;
 use wifi::ipc::{Connect, fail, op};
 use wifi::kernel::{Link, LinkState, Saved, Scan};
 
@@ -77,46 +76,8 @@ struct Daemon {
 }
 
 /// The NeoHub client's view: WLFW's sends cross to HWHUB.
-/// shortcut: a copy of MODEMD's small NeoHub client (client.rs); share it in `sys` when a third client appears
-struct HubBus<'a>(Option<&'a Session>);
-impl Bus for HubBus<'_> {
-    fn bind(&mut self, service: u32, port: u32) -> Result<(), i32> {
-        let s = self.0.ok_or(-18)?;
-        let mut args = TIpcArgs::new();
-        args.int(0, service as i32).int(1, port as i32);
-        s.send_receive(hub_ipc::op::BIND, &args).map(|_| ())
-    }
-    fn send(&mut self, port: u32, dst: (u32, u32), payload: &[u8], essential: bool) -> bool {
-        let Some(s) = self.0 else { return false };
-        let bytes = hub_ipc::Send {
-            port,
-            dst,
-            essential,
-            payload,
-        }
-        .encode();
-        let des = TPtrC8::new(&bytes);
-        let mut args = TIpcArgs::new();
-        args.desc8(0, &des);
-        matches!(s.send_receive(hub_ipc::op::SEND, &args), Ok(n) if n != 0)
-    }
-    fn log(&mut self, args: fmt::Arguments) {
-        dprintln!("[wifid] t={}ms {}", time::millis(), args);
-    }
-    fn utc_ms(&mut self) -> i64 {
-        0
-    }
-}
-
-async fn hub_receive(session: Option<&Session>, bytes: &mut [u8]) -> Result<usize, i32> {
-    let Some(s) = session else {
-        return core::future::pending().await;
-    };
-    let mut des = TPtr8::new(bytes);
-    let mut args = TIpcArgs::new();
-    args.des8(0, &mut des);
-    s.send(hub_ipc::op::RECV, &args).await?;
-    Ok(des.len())
+fn bus(session: Option<&Session>) -> sys::hub::HubBus<'_> {
+    sys::hub::HubBus::new(session, "wifid")
 }
 
 impl Daemon {
@@ -125,18 +86,10 @@ impl Daemon {
             return;
         }
         self.next_connect = now + 500;
-        let (major, minor, build) = hub_ipc::VERSION;
-        let Ok(s) = Session::connect(
-            hub_ipc::NAME,
-            TVersion {
-                major: major as u8,
-                minor: minor as u8,
-                build: build as u16,
-            },
-        ) else {
+        let Some(s) = sys::hub::connect() else {
             return; // HWHUB not up yet (MODEMD starts it)
         };
-        match self.fw.bind(&mut HubBus(Some(&s))) {
+        match self.fw.bind(&mut bus(Some(&s))) {
             Ok(()) => {
                 dprintln!("[wifid] connected to NeoHub");
                 self.hub = Some(Rc::new(s));
@@ -155,13 +108,11 @@ impl Daemon {
                 self.deaf = false; // the restarted firmware gets a fresh data path
                 self.stop();
                 if let Some(s) = &self.hub {
-                    let mut args = TIpcArgs::new();
-                    args.int(0, generation as i32);
-                    let _ = s.send_receive(hub_ipc::op::QUIESCED, &args);
+                    sys::hub::quiesced(s, generation);
                 }
             }
             self.fw
-                .event(&mut HubBus(self.hub.as_deref()), &mut hal::Fw, &e);
+                .event(&mut bus(self.hub.as_deref()), &mut hal::Fw, &e);
         }
     }
 
@@ -540,7 +491,7 @@ fn main() -> i32 {
             let hub = d.hub.clone();
             // the receive's descriptor outlives its pinned future and is read only after it completed
             let completed = {
-                let mut hub_rx = pin!(hub_receive(hub.as_deref(), &mut hub_bytes));
+                let mut hub_rx = pin!(sys::hub::receive(hub.as_deref(), &mut hub_bytes));
                 loop {
                     let now = time::millis();
                     if now >= next {
