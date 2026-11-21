@@ -522,6 +522,34 @@ fn init_driver_is_retried_until_it_goes_out() {
 }
 
 #[test]
+fn a_restarted_modem_is_told_the_ipa_uc_is_loaded() {
+    let (mut m, mut f) = (modem(), fake());
+    m.ipa_up = true;
+    let ipa_server = from_modem(
+        qrtr::TYPE_NEW_SERVER,
+        PORT_CTRL,
+        PORT_CTRL,
+        &qrtr::ctrl(4, [ipa::SERVICE, qrtr::instance_word(1, 2), 0, 30]),
+    );
+    let skip = |f: &Fake| {
+        let (_, p) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+        let q = qmi::Msg::parse(p).unwrap();
+        assert_eq!(q.id, ipa::INIT_DRIVER);
+        q.tlv(0x18).unwrap()[0]
+    };
+    m.handle(&mut f, &ipa_server);
+    assert_eq!(skip(&f), 0); // first boot: the modem loads the uC
+    // the modem reports the uC in (DRIVER_INIT_COMPLETE, a request to our IPA server)
+    let done = qmi::Builder::new(qmi::REQUEST, 7, ipa::DRIVER_INIT_COMPLETE).finish();
+    m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 30, IPA_PORT, &done));
+    m.reset(true); // a modem restart: IPA kept running
+    m.ipa_up = true;
+    m.start(&mut f);
+    m.handle(&mut f, &ipa_server);
+    assert_eq!(skip(&f), 1);
+}
+
+#[test]
 fn tftp_write_then_read_back() {
     let (mut m, mut f) = (modem(), fake());
     let mut wrq = 2u16.to_be_bytes().to_vec();

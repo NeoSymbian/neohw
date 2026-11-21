@@ -342,12 +342,14 @@ impl Router {
 
     /// INIT_DRIVER to the modem's IPA server: true once sent.
     fn init_driver(&mut self, p: &mut dyn Platform) -> bool {
-        let tlvs = ipa::init_driver_tlvs();
+        // the uC reported in on an earlier boot of this modem (DRIVER_INIT_COMPLETE): IPA kept running, skip its load
+        let tlvs = ipa::init_driver_tlvs(self.ipa.uc_ready);
         let refs: Vec<(u8, &[u8])> = tlvs.iter().map(|(t, v)| (*t, v.as_slice())).collect();
         let sent = self.ipa_request(p, ipa::INIT_DRIVER, &refs);
         p.log(format_args!(
-            "ipa: INIT_DRIVER {}",
-            if sent { "sent" } else { "not sent yet" }
+            "ipa: INIT_DRIVER {} (skip_uc_load {})",
+            if sent { "sent" } else { "not sent yet" },
+            u8::from(self.ipa.uc_ready)
         ));
         sent
     }
@@ -676,6 +678,9 @@ impl Router {
             .rmtfs
             .take()
             .map(|mut r| rmtfs::Rmtfs::new(core::mem::take(&mut r.images), r.phys));
+        // Linux keeps these across a modem restart: the uC stays loaded (IPA kept running), and a restarted modem
+        // need not register for indications again
+        let (uc_ready, indications) = (self.ipa.uc_ready, self.ipa.indications);
         let ipa_up = self.ipa_up;
         let not_modem = |node: u32| keep_adsp && node != MODEM_NODE;
         let retained: Vec<Server> = self
@@ -713,6 +718,8 @@ impl Router {
         self.hello_seen = hello;
         self.transfers = transfers;
         self.readers = readers;
+        self.ipa.uc_ready = uc_ready;
+        self.ipa.indications = indications;
         self.ipa_up = ipa_up;
         self.servers = retained;
         for s in &self.servers {
