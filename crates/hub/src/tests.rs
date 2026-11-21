@@ -12,6 +12,8 @@ struct Fake {
     refuse: usize,
     mem: Vec<u8>,
     logs: Vec<String>,
+    /// a firmware file for TFTP reads (any path)
+    fw: Vec<u8>,
 }
 
 impl Platform for Fake {
@@ -34,6 +36,12 @@ impl Platform for Fake {
     }
     fn log(&mut self, args: fmt::Arguments) {
         self.logs.push(format!("{args}"));
+    }
+    fn fw_size(&mut self, _path: &str) -> Result<usize, i32> {
+        Ok(self.fw.len())
+    }
+    fn fw_read(&mut self, _path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, i32> {
+        Ok(tftp::read_bytes(&self.fw, offset, buf))
     }
 }
 
@@ -460,7 +468,7 @@ fn init_driver_is_retried_until_it_goes_out() {
 }
 
 #[test]
-fn tftp_write_then_read_refused() {
+fn tftp_write_then_read_back() {
     let (mut m, mut f) = (modem(), fake());
     let mut wrq = 2u16.to_be_bytes().to_vec();
     wrq.extend_from_slice(b"/readwrite/server_check.txt\0octet\0");
@@ -482,7 +490,64 @@ fn tftp_write_then_read_refused() {
     rrq.extend_from_slice(b"/readwrite/modem_efs\0octet\0");
     m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 33, TFTP_PORT, &rrq));
     let (_, p) = qrtr::decode(f.sent.last().unwrap()).unwrap();
-    assert_eq!(&p[..4], &[0, 5, 0, 1]);
+    assert_eq!(&p[..4], &[0, 5, 0, 1]); // never written: not found, as Linux
+    // what it wrote, it reads back (mcfg.tmp under Linux): its size, then its bytes
+    let mut rrq = 1u16.to_be_bytes().to_vec();
+    rrq.extend_from_slice(b"/readwrite/server_check.txt\0octet\0tsize\x000\0");
+    m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 34, TFTP_PORT, &rrq));
+    let (h, p) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+    assert!(p.windows(8).any(|w| w == b"tsize\x002\0"));
+    m.handle(
+        &mut f,
+        &from_modem(qrtr::TYPE_DATA, 34, h.src_port, &[0, 4, 0, 0]),
+    );
+    let (_, p) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+    assert_eq!(p, &[0, 3, 0, 1, b'h', b'i'][..]);
+}
+
+#[test]
+fn tftp_window_waits_for_the_transport_and_never_blocks() {
+    let (mut m, mut f) = (modem(), fake());
+    f.fw = (0..24u8).collect();
+    let mut rrq = 1u16.to_be_bytes().to_vec();
+    rrq.extend_from_slice(
+        b"/readonly/vendor/firmware/wlanmdsp.mbn\0octet\0blksize\x008\0wsize\x003\0rsize\x0024\0",
+    );
+    m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 40, TFTP_PORT, &rrq));
+    let (h, p) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+    assert_eq!(&p[..2], &[0, 6]); // OACK
+    let port = h.src_port;
+    let blocks = |f: &Fake, from: usize| -> Vec<u16> {
+        f.sent[from..]
+            .iter()
+            .map(|d| qrtr::decode(d).unwrap().1)
+            .map(|p| u16::from_be_bytes([p[2], p[3]]))
+            .collect()
+    };
+    let n = f.sent.len();
+    f.refuse = 2; // no 7.7 KB intent yet: the first block waits, nothing is dropped
+    m.handle(
+        &mut f,
+        &from_modem(qrtr::TYPE_DATA, 40, port, &[0, 4, 0, 0]),
+    );
+    assert_eq!(f.sent.len(), n);
+    m.retry(&mut f, 10);
+    assert_eq!(f.sent.len(), n);
+    m.retry(&mut f, 20);
+    assert_eq!(blocks(&f, n), [1, 2, 3]);
+    // a repeated ACK asks for the window after it again (once), not for a second copy queued behind the first
+    let n = f.sent.len();
+    f.refuse = 1;
+    m.handle(
+        &mut f,
+        &from_modem(qrtr::TYPE_DATA, 40, port, &[0, 4, 0, 0]),
+    );
+    m.handle(
+        &mut f,
+        &from_modem(qrtr::TYPE_DATA, 40, port, &[0, 4, 0, 0]),
+    );
+    assert_eq!(blocks(&f, n), [1, 2, 3]);
+    assert!(f.logs.iter().all(|l| !l.contains("outbox full")));
 }
 
 #[test]

@@ -39,6 +39,10 @@ pub struct Reader {
     /// bytes asked for (0 = not given: tqftpserv then sends one block)
     pub rsize: usize,
     pub seek: usize,
+    /// the DATA blocks of the window last asked for that are not out yet, last first (the router's pump sends them)
+    pub window: Vec<Vec<u8>>,
+    /// a file the modem wrote (`/readwrite/`), served from RAM
+    pub ram: Option<Vec<u8>>,
 }
 
 /// An RRQ for a file we serve: where it lives and the options the modem asked for.
@@ -70,6 +74,8 @@ pub enum Action {
 pub type ReadFn<'a> = dyn FnMut(&str, usize, &mut [u8]) -> Result<usize, i32> + 'a;
 
 const FW_PREFIX: &str = "/readonly/firmware/image/";
+/// files the modem writes and reads back (kept in RAM by the router)
+pub const RW_PREFIX: &str = "/readwrite/";
 const VENDOR_PREFIX: &str = "/readonly/vendor/firmware/";
 
 /// Where a read-only firmware file lives:
@@ -110,7 +116,11 @@ fn read_request(name: &str, s: &[&[u8]]) -> Option<ReadRequest> {
         return None;
     }
     let mut r = ReadRequest {
-        path: firmware_path(name)?,
+        path: if name.starts_with(RW_PREFIX) && !name.contains("..") {
+            String::from(name)
+        } else {
+            firmware_path(name)?
+        },
         blksize: 512,
         wsize: 1,
         rsize: 0,
@@ -154,6 +164,8 @@ pub fn start_read(
         wsize: q.wsize,
         rsize: q.rsize,
         seek: q.seek.unwrap_or(0),
+        window: Vec::new(),
+        ram: None,
     };
     if !q.options {
         let first = block(&r, 0, read).unwrap_or_else(|_| error(0, "Read error"));
@@ -233,6 +245,14 @@ pub fn reader(r: &Reader, b: &[u8], read: &mut ReadFn) -> (Vec<Vec<u8>>, bool) {
         }
     }
     (out, false)
+}
+
+/// `buf.len()` bytes of `data` at `at` (fewer at its end): a RAM file's `ReadFn`
+pub fn read_bytes(data: &[u8], at: usize, buf: &mut [u8]) -> usize {
+    let tail = data.get(at..).unwrap_or(&[]);
+    let n = tail.len().min(buf.len());
+    buf[..n].copy_from_slice(&tail[..n]);
+    n
 }
 
 pub fn error(code: u16, msg: &str) -> Vec<u8> {

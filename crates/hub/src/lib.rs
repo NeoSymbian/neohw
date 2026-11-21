@@ -19,6 +19,11 @@ pub mod tftp;
 pub trait Platform {
     /// One whole QRTR packet to `node`: the modem (node 0) or the ADSP, each on its own GLINK IPCRTR.
     fn send(&mut self, node: u32, packet: &[u8]) -> Result<(), i32>;
+    /// The same, one attempt and no waiting (the TFTP window's blocks: a refusal keeps the block for the next
+    /// `retry`, it never blocks the loop). Platforms without one send.
+    fn try_send(&mut self, node: u32, packet: &[u8]) -> Result<(), i32> {
+        self.send(node, packet)
+    }
     /// The rmtfs carve-out the modem reads its EFS from.
     fn rmtfs_read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), i32>;
     fn rmtfs_write(&mut self, offset: u32, data: &[u8]) -> Result<(), i32>;
@@ -62,6 +67,7 @@ const IPA: u32 = ipa::SERVICE;
 pub const KERR_NOT_READY: i32 = -18;
 pub const KERR_ARGUMENT: i32 = -6;
 pub const KERR_IN_USE: i32 = -14;
+pub const KERR_NOT_FOUND: i32 = -1;
 /// One QMI client: its server, our port, the transaction counter and the requests still unanswered (txn, id).
 struct Client {
     dst: (u32, u32),
@@ -495,8 +501,8 @@ impl Router {
                     self.transfers.push(t);
                     self.send_must(p, qrtr::TYPE_DATA, port, from, &first);
                 }
-                tftp::Action::Read(q) => match p.fw_size(&q.path) {
-                    Ok(size) => {
+                tftp::Action::Read(q) => match self.read_size(p, &q.path) {
+                    Ok((size, ram)) => {
                         p.log(format_args!(
                             "tftp: read {:?} ({size} bytes), blksize {} wsize {} rsize {} seek {:?}",
                             tftp_name(payload),
@@ -507,9 +513,14 @@ impl Router {
                         ));
                         let port = self.next_port;
                         self.next_port += 1;
-                        let (r, first) = tftp::start_read(q, from, port, size, &mut |f, at, b| {
-                            p.fw_read(f, at, b)
-                        });
+                        let (mut r, first) =
+                            tftp::start_read(q, from, port, size, &mut |f, at, b| match ram
+                                .as_deref()
+                            {
+                                Some(data) => Ok(tftp::read_bytes(data, at, b)),
+                                None => p.fw_read(f, at, b),
+                            });
+                        r.ram = ram;
                         if self.readers.len() >= 8 {
                             self.readers.remove(0); // abandoned reads: keep the newest
                         }
@@ -534,15 +545,30 @@ impl Router {
                     .iter()
                     .position(|r| r.port == port)
                     .unwrap_or(0);
-                let (out, done) = tftp::reader(&self.readers[i], payload, &mut |f, at, b| {
-                    p.fw_read(f, at, b)
-                });
-                for d in &out {
-                    self.send_must(p, qrtr::TYPE_DATA, port, from, d);
-                }
+                let ram = self.readers[i].ram.take();
+                let (mut out, done) =
+                    tftp::reader(
+                        &self.readers[i],
+                        payload,
+                        &mut |f, at, b| match ram.as_deref() {
+                            Some(data) => Ok(tftp::read_bytes(data, at, b)),
+                            None => p.fw_read(f, at, b),
+                        },
+                    );
+                self.readers[i].ram = ram;
                 if done {
+                    // the last word is an ERROR when the read failed: it must arrive; DATA left unsent is dropped
                     let r = self.readers.remove(i);
+                    if let Some(e) = out.pop().filter(|d| d.starts_with(&[0, 5])) {
+                        self.send_must(p, qrtr::TYPE_DATA, port, from, &e);
+                    }
                     p.log(format_args!("tftp: read of {} done", r.path));
+                } else {
+                    // the window this ACK asked for replaces one still going out (the modem re-ACKs the block it
+                    // has after a timeout: what it still wants starts there); the pump sends it as intents come
+                    out.reverse();
+                    self.readers[i].window = out;
+                    self.pump(p);
                 }
             }
             0x24 if self.ipa_client.as_ref().is_some_and(|c| c.dst == from) => {
@@ -684,8 +710,49 @@ impl Router {
             platform,
         }
     }
+    /// The size of a file the modem reads: one it wrote earlier (`/readwrite/`, kept in RAM: it writes
+    /// `mcfg.tmp` and reads it back, and Linux tqftpserv answers that) or a firmware file.
+    fn read_size(
+        &mut self,
+        p: &mut dyn Platform,
+        path: &str,
+    ) -> Result<(usize, Option<Vec<u8>>), i32> {
+        if path.starts_with(tftp::RW_PREFIX) {
+            let f = self
+                .files
+                .iter()
+                .find(|f| f.0 == path)
+                .ok_or(KERR_NOT_FOUND)?;
+            return Ok((f.1.len(), Some(f.1.clone())));
+        }
+        p.fw_size(path).map(|n| (n, None))
+    }
+
+    /// The TFTP windows' blocks, in order, until the transport refuses one (no modem intent for 7.7 KB yet: the
+    /// kernel asked for one); the rest waits for the next call. Never blocks.
+    fn pump(&mut self, p: &mut dyn Platform) {
+        for r in &mut self.readers {
+            while let Some(d) = r.window.last() {
+                let h = Header {
+                    ty: qrtr::TYPE_DATA,
+                    src_node: NODE,
+                    src_port: r.port,
+                    confirm_rx: 0,
+                    size: 0,
+                    dst_node: r.peer.0,
+                    dst_port: r.peer.1,
+                };
+                if p.try_send(r.peer.0, &qrtr::encode(&h, d)).is_err() {
+                    break;
+                }
+                r.window.pop();
+            }
+        }
+    }
+
     /// Run between cellular intent and command timers to preserve the shared retry order.
     pub fn retry(&mut self, p: &mut dyn Platform, now: u64) {
+        self.pump(p);
         if !self.outbox.is_empty() && now.saturating_sub(self.outbox_at) >= OUTBOX_RETRY_MS {
             self.outbox_at = now;
             self.flush(p);

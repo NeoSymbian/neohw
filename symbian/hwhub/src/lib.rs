@@ -15,7 +15,7 @@ use hub::{Platform, Router};
 use hub_ipc::{Bus, Event, SessionQueue, Snapshot, op};
 use sys::{
     BOOT, IPA_START, Io, PART_READ, RECV, RMTFS_MEM, RPROC_STATE, RPROC_STOP, SEND, STATE,
-    ext4_err, fs_size, fw_read, hal, hal_io, ipa_firmware, vendor_file,
+    TRY_SEND, ext4_err, fs_size, fw_read, hal, hal_io, ipa_firmware, vendor_file,
 };
 const NOT_READY: i32 = -18;
 const PART_SIZES: [usize; 4] = [0x20_0000, 0x20_0000, 0x20_0000, 0x2_0000];
@@ -51,6 +51,24 @@ impl Platform for Hal {
         // may still wait for a receive intent; this is not a hard real-time send deadline.
         // SAFETY: SEND reads packet.len() bytes from the live packet slice.
         match unsafe { hal(SEND, packet.as_ptr() as *mut u8, packet.len() as *mut u8) } {
+            r if r < 0 => Err(r),
+            _ => Ok(()),
+        }
+    }
+
+    fn try_send(&mut self, node: u32, packet: &[u8]) -> Result<(), i32> {
+        if node != MODEM_NODE {
+            return self.send(node, packet);
+        }
+        // SAFETY: TRY_SEND reads packet.len() bytes from the live packet slice, synchronously.
+        match unsafe {
+            hal(
+                TRY_SEND,
+                packet.as_ptr() as *mut u8,
+                packet.len() as *mut u8,
+            )
+        } {
+            err::KERR_NOT_SUPPORTED => self.send(node, packet), // an older kernel
             r if r < 0 => Err(r),
             _ => Ok(()),
         }
