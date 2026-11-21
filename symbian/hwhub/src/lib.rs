@@ -28,6 +28,8 @@ const PART_SIZES: [usize; 4] = [0x20_0000, 0x20_0000, 0x20_0000, 0x2_0000];
 const RUNNING: u32 = 8;
 const MODEM_NODE: u32 = 0;
 const FATAL: u32 = 1;
+/// slave-kernel bit 7: the modem acknowledged an SSCTL shutdown (Linux sysmon's shutdown-ack interrupt)
+const SHUTDOWN_ACK: u32 = 1 << 7;
 const BOOT_TIMEOUT_MS: u64 = 60_000;
 const LOOP_MS: u64 = 10;
 const STATUS_LOG_MS: u64 = 30_000;
@@ -443,8 +445,7 @@ impl Daemon {
                                 now.saturating_sub(since)
                             );
                             self.router.restart_quiesced();
-                            self.router
-                                .notify_adsp(&mut Hal, ssctl::Event::AfterShutdown);
+                            self.notify_adsp(ssctl::Event::AfterShutdown);
                             // fatal_seen stays: a FATAL bit the kernel left set is not a new fault
                             if mask & 2 != 0 {
                                 self.adsp = adsp::Adsp::Idle;
@@ -497,8 +498,7 @@ impl Daemon {
             self.phase = Phase::Disabled;
             return;
         }
-        self.router
-            .notify_adsp(&mut Hal, ssctl::Event::BeforePowerup);
+        self.notify_adsp(ssctl::Event::BeforePowerup);
         // SAFETY: BOOT takes no arguments or buffers.
         let r = unsafe { hal(BOOT, core::ptr::null_mut(), core::ptr::null_mut()) };
         if r < 0 {
@@ -537,6 +537,7 @@ impl Daemon {
             recovery_attempt: self.recovery_attempt,
             recovery_error: match self.phase {
                 Phase::Recover { watchdog, .. } => watchdog.unwrap_or(0),
+                Phase::Shutdown { .. } => 0,
                 _ => self.recovery_error,
             },
             generation: self.router.generation(),
@@ -548,7 +549,7 @@ impl Daemon {
     /// is logged with its reason. Only the modem restarts (an ADSP fault doesn't restart it: `run`). While the modem
     /// has been running less than RESTART_HOLD_MS, only a crash restarts it. A running modem is asked to shut down
     /// first (SSCTL), and the ADSP hears "modem before shutdown".
-    fn recover(&mut self, reason: &str, crashed: bool) {
+    fn recover(&mut self, reason: &str, crashed: bool) -> bool {
         let now = time::millis();
         if matches!(
             self.phase,
@@ -559,7 +560,7 @@ impl Daemon {
                 now,
                 reason
             );
-            return;
+            return false;
         }
         let running = matches!(self.phase, Phase::Running);
         if running && !crashed && now.saturating_sub(self.running_since) < RESTART_HOLD_MS {
@@ -569,7 +570,7 @@ impl Daemon {
                 reason,
                 now.saturating_sub(self.running_since)
             );
-            return;
+            return false;
         }
         dprintln!(
             "[hwhub] t={}ms recovery: {}{}",
@@ -577,15 +578,22 @@ impl Daemon {
             reason,
             if crashed { " (crashed)" } else { "" }
         );
-        self.router
-            .notify_adsp(&mut Hal, ssctl::Event::BeforeShutdown);
+        self.notify_adsp(ssctl::Event::BeforeShutdown);
         if running && !crashed && self.router.request_modem_shutdown(&mut Hal) {
             self.phase = Phase::Shutdown {
                 until: now + SHUTDOWN_WAIT_MS,
             };
-            return;
+            return true;
         }
         self.begin_recovery();
+        true
+    }
+
+    /// The ADSP hears what the modem does, only while it runs (a dead ADSP's queue would hold up the modem's)
+    fn notify_adsp(&mut self, event: ssctl::Event) {
+        if matches!(self.adsp, adsp::Adsp::Up) {
+            self.router.notify_adsp(&mut Hal, event);
+        }
     }
 
     /// The stop itself: the router lets the modem go, then after the attempt's backoff the kernel stop.
@@ -622,7 +630,7 @@ impl Daemon {
         self.failed_at = time::millis();
         self.recovery_error = error;
         if self.recovery_attempt < 3 {
-            self.recover(what, false);
+            self.recover(what, true); // the modem isn't running: no shutdown to ask for, no window
         } else {
             self.router.lost();
         }
@@ -637,18 +645,29 @@ impl Daemon {
         if matches!(self.phase, Phase::Failed)
             && self.failed_at != 0
             && now.saturating_sub(self.failed_at) >= RETRY_FAILED_MS
-            && matches!(processor_stop_state(), Ok([0 | 2 | 3, _, _, _]))
+            // a failed kernel stop left memory quarantined: no automatic retry
+            && matches!(processor_stop_state(), Ok([0 | 2, _, _, _]))
         {
             self.recovery_attempt = 0;
             self.failed_at = 0;
-            self.recover("automatic retry after a failed recovery", false);
+            self.recover("automatic retry after a failed recovery", true);
             return;
         }
         if let Phase::Shutdown { until } = self.phase {
             self.pump_modem();
+            let bits = state().map_or(0, |s| s[2]);
             match self.router.modem_shutdown() {
                 Some((_, true)) => {
                     dprintln!("[hwhub] t={}ms the modem is ready to shut down", now);
+                    self.begin_recovery();
+                }
+                _ if bits & (SHUTDOWN_ACK | FATAL) != 0 => {
+                    let what = if bits & FATAL != 0 {
+                        "crashed while shutting down"
+                    } else {
+                        "acknowledged the shutdown"
+                    };
+                    dprintln!("[hwhub] t={}ms the modem {} ({:#x})", now, what, bits);
                     self.begin_recovery();
                 }
                 _ if now >= until => {
@@ -667,7 +686,7 @@ impl Daemon {
                 Ok(s) => s,
                 Err(e) => {
                     dprintln!("[hwhub] modem state unavailable ({})", e);
-                    self.recover("modem state unreadable", false);
+                    self.recover("modem state unreadable", true);
                     return;
                 }
             };
@@ -892,8 +911,11 @@ impl Service for Daemon {
                     }
                     // only the modem restarts; the reason comes from the client (MODEMD)
                     let _ = mask;
-                    self.recover(hub_ipc::reason::name(msg.int(1)), false);
-                    0
+                    if self.recover(hub_ipc::reason::name(msg.int(1)), false) {
+                        0
+                    } else {
+                        err::KERR_IN_USE // ignored (one running, or the restart window)
+                    }
                 }
             }
             op::QUIESCED => {

@@ -333,8 +333,11 @@ impl Router {
         for (t, v) in ssctl::event_tlvs("modem", event) {
             b = b.tlv(t, &v);
         }
-        self.send_must(p, qrtr::TYPE_DATA, SSCTL_PORT, adsp, &b.finish());
-        p.log(format_args!("ssctl: told the adsp \"modem\" {event:?}"));
+        // not queued: a refused notice is dropped (Linux sysmon doesn't retry), never ahead of the modem's packets
+        let sent = self.send(p, qrtr::TYPE_DATA, SSCTL_PORT, adsp, &b.finish());
+        p.log(format_args!(
+            "ssctl: told the adsp \"modem\" {event:?} -> {sent}"
+        ));
     }
 
     /// INIT_DRIVER to the modem's IPA server: true once sent.
