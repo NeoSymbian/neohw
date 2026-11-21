@@ -319,8 +319,62 @@ fn subsystems_hear_each_other_is_up() {
     assert!(
         f.logs
             .iter()
-            .any(|l| l.contains("adsp took \"modem up\" -> Ok"))
+            .any(|l| l.contains("adsp took event") && l.ends_with("-> Ok(())"))
     );
+}
+
+fn from_node(node: u32, port: u32, payload: &[u8]) -> Vec<u8> {
+    let h = Header {
+        ty: qrtr::TYPE_DATA,
+        src_node: node,
+        src_port: port,
+        dst_node: NODE,
+        dst_port: SSCTL_PORT,
+        ..Default::default()
+    };
+    qrtr::encode(&h, payload)
+}
+
+#[test]
+fn a_running_modem_is_asked_to_shut_down_and_the_adsp_is_told() {
+    let (mut m, mut f) = (modem(), fake());
+    assert!(!m.request_modem_shutdown(&mut f)); // no SSCTL server yet
+    m.handle(&mut f, &ssctl_ns(0, ssctl::MODEM, 4));
+    m.handle(&mut f, &ssctl_ns(5, ssctl::ADSP, 5));
+    let n = f.sent.len();
+    assert!(m.request_modem_shutdown(&mut f));
+    let sent = f.sent[n].clone();
+    let (h, p) = qrtr::decode(&sent).unwrap();
+    let q = qmi::Msg::parse(p).unwrap();
+    assert_eq!(
+        (h.dst_node, h.dst_port, q.ty, q.id),
+        (0, 4, qmi::REQUEST, ssctl::SHUTDOWN)
+    );
+    assert_eq!(m.modem_shutdown(), Some((false, false)));
+    m.handle(
+        &mut f,
+        &from_node(0, 4, &ok(q.txn, ssctl::SHUTDOWN).finish()),
+    );
+    assert_eq!(m.modem_shutdown(), Some((true, false)));
+    let ind = qmi::Builder::new(qmi::INDICATION, 0, ssctl::SHUTDOWN).finish();
+    m.handle(&mut f, &from_node(0, 4, &ind));
+    assert_eq!(m.modem_shutdown(), Some((true, true)));
+    // the ADSP hears "modem" before shutdown (event 2), forced
+    m.notify_adsp(&mut f, ssctl::Event::BeforeShutdown);
+    let (h, p) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+    let q = qmi::Msg::parse(p).unwrap();
+    assert_eq!(
+        (h.dst_node, h.dst_port, q.id),
+        (5, 5, ssctl::SUBSYS_EVENT_REQ)
+    );
+    assert_eq!(q.tlv(0x01), Some(&b"\x05modem"[..]));
+    assert_eq!((q.u32(0x02), q.u32(0x10)), (Some(2), Some(0)));
+    // after a modem reset the ADSP's server stays known, so after-shutdown still reaches it
+    m.reset(true);
+    let n = f.sent.len();
+    m.notify_adsp(&mut f, ssctl::Event::AfterShutdown);
+    assert_eq!(f.nodes[n..], [5]);
+    assert_eq!(m.modem_shutdown(), None);
 }
 
 #[test]

@@ -103,6 +103,8 @@ pub struct Router {
     /// the SSCTL servers (node, port): the modem's, the ADSP's
     ssctl: [Option<(u32, u32)>; 2],
     ssctl_txn: u16,
+    /// a graceful modem shutdown asked over SSCTL: (transaction, answered, ready indication seen)
+    shutdown: Option<(u16, bool, bool)>,
     /// essential packets the transport refused, sent again by `tick` in order
     outbox: Vec<Unsent>,
     outbox_at: u64,
@@ -166,6 +168,7 @@ impl Router {
             hello_seen: Vec::new(),
             ssctl: [None; 2],
             ssctl_txn: 0,
+            shutdown: None,
             outbox: Vec::new(),
             outbox_at: 0,
             ipa_client: None,
@@ -290,7 +293,7 @@ impl Router {
         for (dst, name) in [(modem, "adsp"), (adsp, "modem")] {
             self.ssctl_txn = self.ssctl_txn.wrapping_add(1).max(1);
             let mut b = qmi::Builder::new(qmi::REQUEST, self.ssctl_txn, ssctl::SUBSYS_EVENT_REQ);
-            for (t, v) in ssctl::event_tlvs(name) {
+            for (t, v) in ssctl::event_tlvs(name, ssctl::Event::AfterPowerup) {
                 b = b.tlv(t, &v);
             }
             now &= self.send_must(p, qrtr::TYPE_DATA, SSCTL_PORT, dst, &b.finish());
@@ -299,6 +302,39 @@ impl Router {
             "ssctl: {} the modem \"adsp up\" and the adsp \"modem up\"",
             if now { "told" } else { "queued for" }
         ));
+    }
+
+    /// Ask the running modem to shut down (Linux sysmon before a stop): false without its SSCTL server. Its answer and
+    /// SHUTDOWN_READY_IND show in `modem_shutdown`.
+    pub fn request_modem_shutdown(&mut self, p: &mut dyn Platform) -> bool {
+        let Some(modem) = self.ssctl[0] else {
+            return false;
+        };
+        self.ssctl_txn = self.ssctl_txn.wrapping_add(1).max(1);
+        self.shutdown = Some((self.ssctl_txn, false, false));
+        let b = qmi::Builder::new(qmi::REQUEST, self.ssctl_txn, ssctl::SHUTDOWN);
+        self.send_must(p, qrtr::TYPE_DATA, SSCTL_PORT, modem, &b.finish());
+        true
+    }
+
+    /// The asked shutdown: (answered, ready); None if none was asked.
+    pub fn modem_shutdown(&self) -> Option<(bool, bool)> {
+        self.shutdown.map(|(_, answered, ready)| (answered, ready))
+    }
+
+    /// Tell the ADSP (if its SSCTL server is up) what the modem does: before/after shutdown, before power-up
+    /// (after power-up goes out from `ssctl_up` when the modem's server reappears).
+    pub fn notify_adsp(&mut self, p: &mut dyn Platform, event: ssctl::Event) {
+        let Some(adsp) = self.ssctl[1] else {
+            return;
+        };
+        self.ssctl_txn = self.ssctl_txn.wrapping_add(1).max(1);
+        let mut b = qmi::Builder::new(qmi::REQUEST, self.ssctl_txn, ssctl::SUBSYS_EVENT_REQ);
+        for (t, v) in ssctl::event_tlvs("modem", event) {
+            b = b.tlv(t, &v);
+        }
+        self.send_must(p, qrtr::TYPE_DATA, SSCTL_PORT, adsp, &b.finish());
+        p.log(format_args!("ssctl: told the adsp \"modem\" {event:?}"));
     }
 
     /// INIT_DRIVER to the modem's IPA server: true once sent.
@@ -476,16 +512,35 @@ impl Router {
                 self.send_must(p, qrtr::TYPE_DATA, h.dst_port, from, &resp);
             }
             SSCTL_PORT => {
-                let Some(m) = qmi::Msg::parse(payload).filter(|m| m.ty == qmi::RESPONSE) else {
-                    return; // the answers only (the processors send other messages on this port too)
+                let Some(m) = qmi::Msg::parse(payload) else {
+                    return;
                 };
-                let (who, what) = if h.src_node == MODEM_NODE {
-                    ("modem", "adsp")
+                if m.id == ssctl::SHUTDOWN && h.src_node == MODEM_NODE {
+                    if let Some(s) = &mut self.shutdown {
+                        if m.ty == qmi::RESPONSE && m.txn == s.0 {
+                            s.1 = true;
+                            p.log(format_args!(
+                                "ssctl: the modem took the shutdown request -> {:?}",
+                                m.result().unwrap_or(Err(u16::MAX))
+                            ));
+                        } else if m.ty == qmi::INDICATION {
+                            s.2 = true;
+                            p.log(format_args!("ssctl: the modem is ready to shut down"));
+                        }
+                    }
+                    return;
+                }
+                if m.ty != qmi::RESPONSE {
+                    return; // the answers only (the processors send other messages on this port too)
+                }
+                let who = if h.src_node == MODEM_NODE {
+                    "modem"
                 } else {
-                    ("adsp", "modem")
+                    "adsp"
                 };
                 p.log(format_args!(
-                    "ssctl: the {who} took \"{what} up\" -> {:?}",
+                    "ssctl: the {who} took event {} -> {:?}",
+                    m.txn,
                     m.result().unwrap_or(Err(u16::MAX))
                 ));
             }

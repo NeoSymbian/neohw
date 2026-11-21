@@ -11,13 +11,19 @@ use e32::server::{self, Message, Server, Service};
 use e32::sys::{err, ipc::TVersion};
 use e32::{dprintln, time};
 use hub::recovery::{self, StopProgress};
-use hub::{Platform, Router};
+use hub::{Platform, Router, ssctl};
 use hub_ipc::{Bus, Event, SessionQueue, Snapshot, op};
 use sys::{
     BOOT, IPA_START, Io, PART_READ, RECV, RMTFS_MEM, RPROC_STATE, RPROC_STOP, SEND, STATE,
     TRY_SEND, ext4_err, fs_size, fw_read, hal, hal_io, ipa_firmware, vendor_file,
 };
 const NOT_READY: i32 = -18;
+/// a modem restarted this recently restarts again only after a crash (requests are logged and ignored)
+const RESTART_HOLD_MS: u64 = 30_000;
+/// how long a running modem gets to say it is ready to shut down (Linux: 5 s answer + 10 s ack)
+const SHUTDOWN_WAIT_MS: u64 = 10_000;
+/// after 3 failed attempts, the next try on its own
+const RETRY_FAILED_MS: u64 = 300_000;
 const PART_SIZES: [usize; 4] = [0x20_0000, 0x20_0000, 0x20_0000, 0x2_0000];
 const RUNNING: u32 = 8;
 const MODEM_NODE: u32 = 0;
@@ -146,6 +152,11 @@ enum Phase {
     /// the kernel boots the modem; since t0
     Wait(u64),
     Running,
+    /// a running modem was asked to shut down over SSCTL (Linux sysmon); the stop follows its ready
+    /// indication or this deadline
+    Shutdown {
+        until: u64,
+    },
     Recover {
         mask: u32,
         since: u64,
@@ -193,6 +204,10 @@ struct Daemon {
     adsp_reclaimed: bool,
     recovery_error: i32,
     healthy_since: u64,
+    /// when the modem last reached Running (the restart window counts from here)
+    running_since: u64,
+    /// when HWHUB last gave up (Phase::Failed): it tries again on its own 5 minutes later
+    failed_at: u64,
     quiesce_until: u64,
     clients: Vec<Client>,
     next_session: u32,
@@ -334,6 +349,7 @@ impl Daemon {
                     self.last_log = now;
                     self.router.start(&mut Hal);
                     self.phase = Phase::Running;
+                    self.running_since = now;
                 } else if time::millis() - t0 > BOOT_TIMEOUT_MS {
                     self.fail("modem boot (60 s)", NOT_READY);
                 }
@@ -427,6 +443,8 @@ impl Daemon {
                                 now.saturating_sub(since)
                             );
                             self.router.restart_quiesced();
+                            self.router
+                                .notify_adsp(&mut Hal, ssctl::Event::AfterShutdown);
                             // fatal_seen stays: a FATAL bit the kernel left set is not a new fault
                             if mask & 2 != 0 {
                                 self.adsp = adsp::Adsp::Idle;
@@ -440,7 +458,11 @@ impl Daemon {
                     }
                 }
             }
-            Phase::Running | Phase::Failed | Phase::Disabled | Phase::Absent => {}
+            Phase::Running
+            | Phase::Shutdown { .. }
+            | Phase::Failed
+            | Phase::Disabled
+            | Phase::Absent => {}
         }
         Ok(())
     }
@@ -475,6 +497,8 @@ impl Daemon {
             self.phase = Phase::Disabled;
             return;
         }
+        self.router
+            .notify_adsp(&mut Hal, ssctl::Event::BeforePowerup);
         // SAFETY: BOOT takes no arguments or buffers.
         let r = unsafe { hal(BOOT, core::ptr::null_mut(), core::ptr::null_mut()) };
         if r < 0 {
@@ -491,6 +515,7 @@ impl Daemon {
             Phase::Read(_) => hub_ipc::phase::READ,
             Phase::Wait(_) => hub_ipc::phase::WAIT,
             Phase::Running => hub_ipc::phase::RUNNING,
+            Phase::Shutdown { .. } => hub_ipc::phase::RECOVER,
             Phase::Recover { .. } => hub_ipc::phase::RECOVER,
             Phase::Failed => hub_ipc::phase::FAILED,
             Phase::Disabled => hub_ipc::phase::DISABLED,
@@ -519,21 +544,58 @@ impl Daemon {
         }
     }
 
-    fn recover(&mut self, mask: u32) {
-        if matches!(self.phase, Phase::Recover { .. } | Phase::Absent) {
+    /// The one place that restarts the modem (Linux remoteproc: one owner, one recovery at a time). Every request
+    /// is logged with its reason. Only the modem restarts (an ADSP fault doesn't restart it: `run`). While the modem
+    /// has been running less than RESTART_HOLD_MS, only a crash restarts it. A running modem is asked to shut down
+    /// first (SSCTL), and the ADSP hears "modem before shutdown".
+    fn recover(&mut self, reason: &str, crashed: bool) {
+        let now = time::millis();
+        if matches!(
+            self.phase,
+            Phase::Recover { .. } | Phase::Shutdown { .. } | Phase::Absent
+        ) {
+            dprintln!(
+                "[hwhub] t={}ms recovery requested ({}): one is running",
+                now,
+                reason
+            );
             return;
         }
-        // C7: PAS shutdown hung on the phone. Preserve the ADSP until that kernel path is fixed.
-        if mask & 2 != 0 {
+        let running = matches!(self.phase, Phase::Running);
+        if running && !crashed && now.saturating_sub(self.running_since) < RESTART_HOLD_MS {
             dprintln!(
-                "[hwhub] recovery: keeping the ADSP (asked mask {}); restarting the modem only",
-                mask
+                "[hwhub] t={}ms recovery requested ({}): ignored, the modem restarted {} ms ago",
+                now,
+                reason,
+                now.saturating_sub(self.running_since)
             );
+            return;
         }
+        dprintln!(
+            "[hwhub] t={}ms recovery: {}{}",
+            now,
+            reason,
+            if crashed { " (crashed)" } else { "" }
+        );
+        self.router
+            .notify_adsp(&mut Hal, ssctl::Event::BeforeShutdown);
+        if running && !crashed && self.router.request_modem_shutdown(&mut Hal) {
+            self.phase = Phase::Shutdown {
+                until: now + SHUTDOWN_WAIT_MS,
+            };
+            return;
+        }
+        self.begin_recovery();
+    }
+
+    /// The stop itself: the router lets the modem go, then after the attempt's backoff the kernel stop.
+    fn begin_recovery(&mut self) {
         self.router.lost();
         self.healthy_since = 0;
         if self.recovery_attempt >= 3 {
+            dprintln!("[hwhub] recovery: 3 attempts failed; trying again in 5 minutes");
             self.phase = Phase::Failed;
+            self.failed_at = time::millis();
             return;
         }
         let delay = [1000, 3000, 10_000][usize::from(self.recovery_attempt)];
@@ -557,9 +619,10 @@ impl Daemon {
     fn fail(&mut self, what: &str, error: i32) {
         dprintln!("[hwhub] {} failed ({})", what, error);
         self.phase = Phase::Failed;
+        self.failed_at = time::millis();
         self.recovery_error = error;
         if self.recovery_attempt < 3 {
-            self.recover(1);
+            self.recover(what, false);
         } else {
             self.router.lost();
         }
@@ -571,24 +634,57 @@ impl Daemon {
             return;
         }
         let now = time::millis();
+        if matches!(self.phase, Phase::Failed)
+            && self.failed_at != 0
+            && now.saturating_sub(self.failed_at) >= RETRY_FAILED_MS
+            && matches!(processor_stop_state(), Ok([0 | 2 | 3, _, _, _]))
+        {
+            self.recovery_attempt = 0;
+            self.failed_at = 0;
+            self.recover("automatic retry after a failed recovery", false);
+            return;
+        }
+        if let Phase::Shutdown { until } = self.phase {
+            self.pump_modem();
+            match self.router.modem_shutdown() {
+                Some((_, true)) => {
+                    dprintln!("[hwhub] t={}ms the modem is ready to shut down", now);
+                    self.begin_recovery();
+                }
+                _ if now >= until => {
+                    dprintln!(
+                        "[hwhub] t={}ms no shutdown-ready from the modem in {} ms: stopping it (the kernel asks again)",
+                        now,
+                        SHUTDOWN_WAIT_MS
+                    );
+                    self.begin_recovery();
+                }
+                _ => {}
+            }
+        }
         if matches!(self.phase, Phase::Running) {
             let st = match state() {
                 Ok(s) => s,
                 Err(e) => {
                     dprintln!("[hwhub] modem state unavailable ({})", e);
-                    self.recover(3);
+                    self.recover("modem state unreadable", false);
                     return;
                 }
             };
             if recovery::rising(&mut self.fatal_seen, st[2] & FATAL != 0) {
-                self.recover(3);
+                self.recover("modem FATAL", true);
                 return;
             }
+            // an ADSP fault doesn't restart the modem (Linux restarts only the processor that failed): audio is
+            // unavailable, calls and data keep going
             if matches!(self.adsp, adsp::Adsp::Up)
                 && !matches!(adsp::processor_state(), Ok(s) if s[2] & FATAL == 0 && s[1] == 0)
             {
-                self.recover(3);
-                return;
+                dprintln!(
+                    "[hwhub] ADSP failed ({:?}): audio unavailable; the modem stays up",
+                    adsp::processor_state()
+                );
+                self.adsp = adsp::Adsp::Failed;
             }
             if self.healthy_since == 0 {
                 self.healthy_since = now;
@@ -596,18 +692,7 @@ impl Daemon {
             if now.saturating_sub(self.healthy_since) >= 60_000 {
                 self.recovery_attempt = 0;
             }
-            for _ in 0..32 {
-                // SAFETY: RECV writes at most the live receive buffer capacity; HWHUB is its only reader.
-                let n = unsafe { hal(RECV, self.rx.as_mut_ptr(), self.rx.len() as *mut u8) };
-                if n == NOT_READY {
-                    break;
-                }
-                if n < 0 {
-                    dprintln!("[hwhub] receive failed ({})", n);
-                    break;
-                }
-                self.router.handle(&mut Hal, &self.rx[..n as usize]);
-            }
+            self.pump_modem();
             if now.saturating_sub(self.last_log) >= STATUS_LOG_MS {
                 self.last_log = now;
                 dprintln!(
@@ -629,6 +714,22 @@ impl Daemon {
         // begin_tick/tick/poll run on MODEMD's timer; their old cross-process ordering is no longer imposed.
         self.router.retry(&mut Hal, now);
         self.router.tick(&mut Hal, now);
+    }
+
+    /// The modem's QRTR packets into the router.
+    fn pump_modem(&mut self) {
+        for _ in 0..32 {
+            // SAFETY: RECV writes at most the live receive buffer capacity; HWHUB is its only reader.
+            let n = unsafe { hal(RECV, self.rx.as_mut_ptr(), self.rx.len() as *mut u8) };
+            if n == NOT_READY {
+                break;
+            }
+            if n < 0 {
+                dprintln!("[hwhub] receive failed ({})", n);
+                break;
+            }
+            self.router.handle(&mut Hal, &self.rx[..n as usize]);
+        }
     }
 
     fn events(&mut self) {
@@ -789,7 +890,9 @@ impl Service for Daemon {
                     if matches!(self.phase, Phase::Failed) {
                         self.recovery_attempt = 0;
                     }
-                    self.recover(mask);
+                    // only the modem restarts; the reason comes from the client (MODEMD)
+                    let _ = mask;
+                    self.recover(hub_ipc::reason::name(msg.int(1)), false);
                     0
                 }
             }
@@ -841,6 +944,8 @@ fn main() -> i32 {
         adsp_reclaimed: false,
         recovery_error: 0,
         healthy_since: 0,
+        running_since: 0,
+        failed_at: 0,
         quiesce_until: 0,
         clients: Vec::new(),
         next_session: 0,

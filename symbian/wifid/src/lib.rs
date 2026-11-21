@@ -55,6 +55,8 @@ struct Daemon {
     fw: wifi::Firmware,
     hub: Option<Rc<Session>>,
     next_connect: u64,
+    /// the next WlanStart retry (once a second while the kernel refuses it)
+    next_start: u64,
     saved: Saved,
     failed: Failed,
     join: Option<Join>,
@@ -107,6 +109,7 @@ impl Daemon {
             if let Event::Reset { generation, .. } = e {
                 self.deaf = false; // the restarted firmware gets a fresh data path
                 self.stop();
+                set(self.failed, 0); // else the old NO_DATA makes it deaf again at once
                 if let Some(s) = &self.hub {
                     sys::hub::quiesced(s, generation);
                 }
@@ -192,7 +195,13 @@ impl Daemon {
             );
             self.deaf = true;
         }
-        if !self.radio_on || !self.link.idle() || self.deaf {
+        if now >= self.next_start {
+            self.next_start = now + 1000;
+            self.fw
+                .retry_start(&mut bus(self.hub.as_deref()), &mut hal::Fw);
+        }
+        // no joins while the firmware isn't in mission mode (the modem restarting takes it down)
+        if !self.radio_on || !self.link.idle() || self.deaf || !self.fw.enabled {
             return;
         }
         // a remembered network in the list while nothing is joined: try it (once a minute at most)
@@ -479,6 +488,7 @@ fn main() -> i32 {
         fw: wifi::Firmware::new(),
         hub: None,
         next_connect: 0,
+        next_start: 0,
         saved,
         failed: Mutex::new(0).ok().map(|m| &*Box::leak(Box::new(m))),
         join: None,

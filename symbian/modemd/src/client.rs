@@ -66,8 +66,13 @@ impl Modem {
     pub fn snapshot(&self) -> Result<Snapshot, i32> {
         snapshot(self.session.as_deref().ok_or(-18)?)
     }
-    pub fn recover(&self, mask: u32) -> i32 {
-        self.scalar(hub_ipc::op::RECOVER, mask)
+    pub fn recover(&self, mask: u32, reason: i32) -> i32 {
+        let Some(s) = &self.session else { return -18 };
+        let mut args = TIpcArgs::new();
+        args.int(0, mask as i32);
+        args.int(1, reason);
+        s.send_receive(hub_ipc::op::RECOVER, &args)
+            .unwrap_or_else(|e| e)
     }
     pub fn quiesced(&self, generation: u32) -> i32 {
         self.scalar(hub_ipc::op::QUIESCED, generation)

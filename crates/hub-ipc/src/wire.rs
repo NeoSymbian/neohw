@@ -19,10 +19,26 @@ pub mod op {
     pub const CANCEL_RECV: i32 = 3;
     /// arg0 writable Snapshot descriptor.
     pub const STATUS: i32 = 4;
-    /// arg0 processor mask (bit 0 MSS, bit 1 ADSP).
+    /// arg0 processor mask (bit 0 MSS, bit 1 ADSP), arg1 a [`reason`](super::reason) (0 from older clients).
     pub const RECOVER: i32 = 5;
     /// arg0 Reset generation, after the client's state has been cleared.
     pub const QUIESCED: i32 = 6;
+}
+
+/// Why a client asks for a recovery (HWHUB logs it; it alone decides)
+pub mod reason {
+    pub const UNKNOWN: i32 = 0;
+    /// MODEMD: no QMI answer for its watchdog's time
+    pub const WATCHDOG: i32 = 1;
+    /// the user's Retry
+    pub const USER: i32 = 2;
+    pub fn name(r: i32) -> &'static str {
+        match r {
+            WATCHDOG => "MODEMD watchdog",
+            USER => "user retry",
+            _ => "client request",
+        }
+    }
 }
 
 pub mod phase {

@@ -47,11 +47,6 @@ impl Link {
         self.report.epoch == self.intent.epoch && self.report.call
     }
 
-    /// AUDIOD's report is about this epoch.
-    pub fn is_current(&self) -> bool {
-        self.report.epoch == self.intent.epoch
-    }
-
     pub fn status(&self) -> modem_ipc::Audio {
         modem_ipc::Audio {
             on: self.report.epoch == self.intent.epoch && self.report.call_running,
