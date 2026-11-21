@@ -15,6 +15,9 @@ pub const LINK_SIZE: usize = 29 + 64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Network {
     pub bssid: [u8; 6],
+    /// the AP's channel (1-14: 2.4 GHz, above: 5 GHz) and its signal
+    pub channel: u8,
+    pub dbm: i8,
     pub secured: bool,
     /// as the beacon carried it; empty = hidden
     pub ssid: Vec<u8>,
@@ -43,6 +46,8 @@ impl Scan {
             }
             networks.push(Network {
                 bssid: e[..6].try_into().ok()?,
+                channel: e[6],
+                dbm: e[7] as i8,
                 secured: e[8] & 1 != 0,
                 ssid: e[10..10 + len].to_vec(),
             });
@@ -53,7 +58,20 @@ impl Scan {
             networks,
         })
     }
+
+    /// The access point to join for `ssid`: its strongest 5 GHz one while that is at least [`GOOD_5GHZ_DBM`] (more
+    /// room and less interference, as Android and wpa_supplicant prefer it), else its strongest in either band.
+    pub fn best(&self, ssid: &[u8]) -> Option<&Network> {
+        self.networks
+            .iter()
+            .filter(|n| !ssid.is_empty() && n.ssid == ssid)
+            .max_by_key(|n| (n.channel > 14 && n.dbm >= GOOD_5GHZ_DBM, n.dbm))
+    }
 }
+
+/// A 5 GHz signal this strong or better is preferred to 2.4 GHz (a -75 dBm 5 GHz link dropped on beacon misses,
+/// docs hardware/wifi.md)
+pub const GOOD_5GHZ_DBM: i8 = -70;
 
 /// The join: idle, joining, the key handshake, connected, lost, error.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -170,6 +188,8 @@ mod tests {
         let mut b = vec![1, 2, 1, 7];
         let mut e = vec![0u8; ENTRY];
         e[..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        e[6] = 44;
+        e[7] = (-46i8) as u8;
         e[8] = 1;
         e[9] = 3;
         e[10..13].copy_from_slice(b"net");
@@ -178,6 +198,7 @@ mod tests {
         assert_eq!((s.state, s.scans), (2, 7));
         assert_eq!(s.networks[0].ssid, b"net");
         assert!(s.networks[0].secured);
+        assert_eq!((s.networks[0].channel, s.networks[0].dbm), (44, -46));
         assert_eq!(Scan::decode(&b[..b.len() - 1]), None);
 
         let mut l = vec![0u8; 29];
@@ -192,6 +213,34 @@ mod tests {
         assert!(!k.idle());
         l[1] = 9;
         assert_eq!(Link::decode(&l), None);
+    }
+
+    fn ap(last: u8, channel: u8, dbm: i8) -> Network {
+        Network {
+            bssid: [0x82, 0x99, 0xc1, 0xe9, 0x33, last],
+            channel,
+            dbm,
+            secured: true,
+            ssid: b"home".to_vec(),
+        }
+    }
+
+    #[test]
+    fn best_prefers_a_good_5ghz_ap() {
+        let mut s = Scan {
+            state: 2,
+            scans: 1,
+            networks: vec![ap(0x66, 1, -40), ap(0x6a, 44, -46)],
+        };
+        assert_eq!(s.best(b"home").unwrap().bssid[5], 0x6a); // the owner's dual-band AP
+        s.networks[1].dbm = -78;
+        assert_eq!(s.best(b"home").unwrap().bssid[5], 0x66); // weak 5 GHz: the stronger 2.4 GHz
+        s.networks.push(ap(0x70, 1, -30));
+        s.networks[1].dbm = -60;
+        assert_eq!(s.best(b"home").unwrap().bssid[5], 0x6a);
+        s.networks.remove(1);
+        assert_eq!(s.best(b"home").unwrap().bssid[5], 0x70); // 2.4 GHz only: the strongest
+        assert!(s.best(b"other").is_none() && s.best(b"").is_none());
     }
 
     #[test]

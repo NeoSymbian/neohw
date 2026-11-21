@@ -205,7 +205,10 @@ impl Daemon {
                 s.networks
                     .iter()
                     .filter(|n| !n.ssid.is_empty() && self.left.as_deref() != Some(&n.ssid[..]))
-                    .find_map(|n| Some((n.bssid, self.saved.pmk(&n.ssid)?, n.ssid.clone())))
+                    .find_map(|n| {
+                        let pmk = self.saved.pmk(&n.ssid)?;
+                        Some((s.best(&n.ssid)?.bssid, pmk, n.ssid.clone())) // its best AP, 5 GHz first
+                    })
             })
         {
             self.start(bssid, &ssid, Some(pmk), now);
@@ -287,7 +290,14 @@ impl Service for Daemon {
                 Some(c) => {
                     self.deaf = false; // the user asked: try once more
                     let pmk = (!c.password.is_empty()).then(|| wpa::psk(&c.password, &c.ssid));
-                    self.start(c.bssid, &c.ssid, pmk, now);
+                    // the user picks the network, WIFID its access point (5 GHz when good); the row's AP
+                    // when the latest scan lacks the name (a hidden network)
+                    let bssid = self
+                        .last
+                        .as_ref()
+                        .and_then(|s| s.best(&c.ssid))
+                        .map_or(c.bssid, |n| n.bssid);
+                    self.start(bssid, &c.ssid, pmk, now);
                     err::KERR_NONE
                 }
                 None => err::KERR_ARGUMENT,
