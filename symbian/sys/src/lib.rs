@@ -39,6 +39,9 @@ pub const RPROC_STATE: i32 = 0x4e25;
 pub const AUDIO_MEM: i32 = 0x4e26;
 /// the vibration motor {ms, amplitude}; 0 stops it
 pub const HAPTIC: i32 = 0x4e27;
+/// QRTR send to the modem, one attempt and no waiting (kernel `Glink_TrySend`): KErrNotReady with no fitting
+/// receive intent (the kernel asked for one), KErrOverflow with no FIFO space; HWHUB's TFTP window retries it
+pub const TRY_SEND: i32 = 0x4e28;
 /// PartRead's index of vendor_a (the IPA firmware, read-only through ext4ro)
 const VENDOR: u32 = 4;
 const SECTOR: u64 = 512;
