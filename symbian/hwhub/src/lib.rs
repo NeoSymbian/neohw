@@ -171,6 +171,8 @@ struct Daemon {
     last_log: u64,
     fatal_seen: bool,
     recovery_attempt: u8,
+    /// the one stop that reclaims a load a previous HWHUB abandoned was issued
+    adsp_reclaimed: bool,
     recovery_error: i32,
     healthy_since: u64,
     quiesce_until: u64,
@@ -264,6 +266,24 @@ impl Daemon {
             }
             // (the top of step() already stepped the ADSP and serviced its rings)
             Phase::Adsp => {
+                if matches!(self.adsp, adsp::Adsp::Stale) {
+                    // a previous HWHUB died mid-load: the processor stop releases the kernel's loader (PAS) and
+                    // the ADSP's step, then the load starts again; a second refusal is a failure
+                    self.adsp = adsp::Adsp::Failed;
+                    if !self.adsp_reclaimed {
+                        self.adsp_reclaimed = true;
+                        dprintln!(
+                            "[hwhub] adsp: an abandoned load holds the loader; stopping it first"
+                        );
+                        self.phase = Phase::Recover {
+                            mask: 2,
+                            since: time::millis(),
+                            issued: false,
+                            watchdog: None,
+                        };
+                        return Ok(());
+                    }
+                }
                 if !self.adsp.busy() {
                     if matches!(self.adsp, adsp::Adsp::Failed) {
                         // no audio, but the radio still starts (PR #2)
@@ -463,7 +483,7 @@ impl Daemon {
             adsp::Adsp::Loading(_) => hub_ipc::adsp::LOADING,
             adsp::Adsp::Booting(_) => hub_ipc::adsp::WAITING,
             adsp::Adsp::Up => hub_ipc::adsp::UP,
-            adsp::Adsp::Failed => hub_ipc::adsp::FAILED,
+            adsp::Adsp::Stale | adsp::Adsp::Failed => hub_ipc::adsp::FAILED,
         };
         Snapshot {
             state: self.router.state(),
@@ -800,6 +820,7 @@ fn main() -> i32 {
         last_log: 0,
         fatal_seen: false,
         recovery_attempt: 0,
+        adsp_reclaimed: false,
         recovery_error: 0,
         healthy_since: 0,
         quiesce_until: 0,
