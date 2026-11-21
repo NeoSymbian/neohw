@@ -38,6 +38,8 @@ pub enum Adsp {
     /// authenticated; waiting for ready and the channels, since t0
     Booting(u64),
     Up,
+    /// the kernel still holds a load a previous HWHUB left (KErrInUse at the start): stop it once, then retry
+    Stale,
     Failed,
 }
 
@@ -129,7 +131,11 @@ impl Adsp {
                 }
                 Err(e) => {
                     dprintln!("[hwhub] adsp: no start ({})", e);
-                    *self = Adsp::Failed;
+                    *self = if e == crate::err::KERR_IN_USE {
+                        Adsp::Stale
+                    } else {
+                        Adsp::Failed
+                    };
                 }
             },
             Adsp::Loading(l) => match l.more() {
@@ -188,7 +194,7 @@ impl Adsp {
                     *self = Adsp::Failed;
                 }
             }
-            Adsp::Up | Adsp::Failed => {}
+            Adsp::Up | Adsp::Stale | Adsp::Failed => {}
         }
     }
 
