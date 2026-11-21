@@ -787,6 +787,11 @@ impl Cellular {
         }
     }
 
+    /// The modem (re)started: the watchdog counts from the next tick, not from the boot wait before it.
+    pub fn rearm_watchdog(&mut self) {
+        self.heartbeat_at = 0;
+    }
+
     /// Three missed 30-second NAS poll cycles: the transport may be alive while the modem is wedged.
     pub fn watchdog(&self) -> bool {
         !self.status.airplane

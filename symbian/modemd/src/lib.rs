@@ -125,13 +125,17 @@ impl Daemon {
         self.waiting_alert = None;
     }
 
-    fn recover(&mut self, mask: u32) {
+    fn recover(&mut self, mask: u32, reason: i32) {
         if matches!(self.phase, Phase::Recover { .. }) {
             return;
         }
         self.clear_audio();
         if let Some(m) = &self.modem {
-            let r = m.recover(mask);
+            dprintln!(
+                "[modemd] asking NeoHub for a recovery: {}",
+                hub_ipc::reason::name(reason)
+            );
+            let r = m.recover(mask, reason);
             if r < 0 {
                 dprintln!("[modemd] NeoHub recovery request failed ({})", r);
             } else {
@@ -159,6 +163,12 @@ impl Daemon {
             m.event(Event::State(s.state));
         }
         self.hub = s;
+        if s.phase == hub_ipc::phase::RUNNING
+            && !matches!(self.phase, Phase::Running)
+            && let Some(m) = &mut self.modem
+        {
+            m.rearm_watchdog(); // it counts from Running, not from the boot before it
+        }
         self.phase = match s.phase {
             hub_ipc::phase::RUNNING => Phase::Running,
             hub_ipc::phase::RECOVER => Phase::Recover {
@@ -398,15 +408,9 @@ impl Daemon {
         if matches!(self.phase, Phase::Absent) {
             return;
         }
+        // an audio (ADSP) failure no longer restarts the modem: AUDIOD retries, NeoHub keeps the modem up and the
+        // ADSP state shows as failed (docs hardware/modem.md C7, Linux-grade recovery)
         let running = matches!(self.phase, Phase::Running);
-        if running
-            && self.hub.adsp == hub_ipc::adsp::UP
-            && self.audio.report.failed
-            && self.audio.is_current()
-        {
-            self.recover(3);
-            return;
-        }
         let Some(modem) = &mut self.modem else { return };
         // the audio follows what is wanted now: a connected call's voice path, else the test, else nothing (the
         // state machine finishes a running sequence first)
@@ -581,7 +585,7 @@ impl Daemon {
         let now = time::millis();
         modem.tick(&mut Hal, now);
         if running && modem.watchdog() {
-            self.recover(3);
+            self.recover(1, hub_ipc::reason::WATCHDOG);
         }
     }
 }
@@ -792,7 +796,9 @@ impl Service for Daemon {
                 if !matches!(self.phase, Phase::Failed) {
                     err::KERR_IN_USE
                 } else {
-                    self.modem.as_ref().map_or(NOT_READY, |m| m.recover(1))
+                    self.modem
+                        .as_ref()
+                        .map_or(NOT_READY, |m| m.recover(1, hub_ipc::reason::USER))
                 }
             }
             // the call log (C8)

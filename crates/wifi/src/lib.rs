@@ -30,6 +30,10 @@ pub trait Hal {
     fn wlan_start(&mut self) -> Result<(), i32>;
 }
 
+const START_RETRIES: u8 = 30;
+const KERR_NOT_READY: i32 = -18;
+const KERR_IN_USE: i32 = -14;
+
 /// The firmware's control client, once its service appears on the modem's node.
 pub struct Firmware {
     client: Option<((u32, u32), wlfw::Client)>,
@@ -37,6 +41,9 @@ pub struct Firmware {
     board: u32,
     /// mission mode reached (the kernel's copy engines run)
     pub enabled: bool,
+    /// mission mode reached but the kernel refused WlanStart (it does while a modem stop finishes): tries left,
+    /// one per `retry_start` (WIFID calls it every second)
+    start_retries: u8,
 }
 
 impl Default for Firmware {
@@ -51,6 +58,33 @@ impl Firmware {
             client: None,
             board: 0xff,
             enabled: false,
+            start_retries: 0,
+        }
+    }
+
+    /// The kernel's copy engines for the firmware in mission mode (WlanStart); refused while a modem stop is still
+    /// finishing (KErrNotReady) or the driver lets go (KErrInUse): tried again by `retry_start`.
+    fn start(&mut self, bus: &mut dyn Bus, hal: &mut dyn Hal) {
+        let r = hal.wlan_start();
+        self.enabled = r.is_ok();
+        let again = matches!(r, Err(KERR_NOT_READY | KERR_IN_USE)) && self.start_retries > 1;
+        if r.is_ok() || !again || self.start_retries == START_RETRIES {
+            bus.log(format_args!(
+                "wlfw: mission mode; host copy engines start -> {r:?}{}",
+                if again {
+                    " (trying again every second)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        self.start_retries = if again { self.start_retries - 1 } else { 0 };
+    }
+
+    /// Once a second: a refused WlanStart again (up to 30 s).
+    pub fn retry_start(&mut self, bus: &mut dyn Bus, hal: &mut dyn Hal) {
+        if self.start_retries > 0 && !self.enabled {
+            self.start(bus, hal);
         }
     }
 
@@ -79,6 +113,7 @@ impl Firmware {
                 bus.log(format_args!("wlfw: the Wi-Fi firmware's service went"));
                 self.client = None;
                 self.enabled = false;
+                self.start_retries = 0;
             }
             Event::Packet {
                 src,
@@ -95,6 +130,7 @@ impl Firmware {
             Event::Reset { .. } => {
                 self.client = None;
                 self.enabled = false;
+                self.start_retries = 0;
             }
             _ => {}
         }
@@ -149,11 +185,8 @@ impl Firmware {
                     }
                     wlfw::Step::Ready => bus.log(format_args!("wlfw: firmware ready (W1 done)")),
                     wlfw::Step::Enabled => {
-                        let r = hal.wlan_start();
-                        self.enabled = r.is_ok();
-                        bus.log(format_args!(
-                            "wlfw: mission mode; host copy engines start -> {r:?}"
-                        ));
+                        self.start_retries = START_RETRIES;
+                        self.start(bus, hal);
                     }
                     wlfw::Step::Failed(what, e) => {
                         bus.log(format_args!("wlfw: {what} failed ({e})"))
@@ -180,6 +213,8 @@ mod tests {
         binds: Vec<(u32, u32)>,
         sent: Vec<Sent>,
         msa: usize,
+        /// WlanStart answers, first one first (empty: Ok)
+        starts: Vec<i32>,
     }
     impl Bus for Fake {
         fn bind(&mut self, service: u32, port: u32) -> Result<(), i32> {
@@ -204,8 +239,36 @@ mod tests {
             vec![]
         }
         fn wlan_start(&mut self) -> Result<(), i32> {
-            Ok(())
+            match self.starts.is_empty() {
+                true => Ok(()),
+                false => Err(self.starts.remove(0)),
+            }
         }
+    }
+
+    #[test]
+    fn a_refused_wlan_start_is_tried_again_until_the_kernel_takes_it() {
+        let (mut fw, mut f, mut h) = (Firmware::new(), Fake::default(), Fake::default());
+        h.starts = vec![KERR_NOT_READY, KERR_IN_USE]; // a modem stop still finishing
+        fw.start_retries = START_RETRIES;
+        fw.start(&mut f, &mut h);
+        assert!(!fw.enabled);
+        fw.retry_start(&mut f, &mut h);
+        assert!(!fw.enabled);
+        fw.retry_start(&mut f, &mut h);
+        assert!(fw.enabled);
+        // any other error is final
+        let (mut fw, mut h) = (
+            Firmware::new(),
+            Fake {
+                starts: vec![-5],
+                ..Fake::default()
+            },
+        );
+        fw.start_retries = START_RETRIES;
+        fw.start(&mut f, &mut h);
+        fw.retry_start(&mut f, &mut h);
+        assert!(!fw.enabled && h.starts.is_empty());
     }
 
     fn up(node: u32, port: u32) -> Event {

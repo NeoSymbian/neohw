@@ -26,8 +26,10 @@ fn pair(a: u32, b: u32) -> [u8; 8] {
 
 /// INIT_DRIVER's TLVs for IPA v3.5.1 (Linux init_modem_driver_req): platform MSM_ANDROID, the header table, the
 /// route tables (start, last index 7), filter starts, the modem's SRAM, the control endpoint (10, AP_MODEM_RX),
-/// skip_uc_load 0, the header processing contexts, the hashed tables.
-pub fn init_driver_tlvs() -> Vec<(u8, Vec<u8>)> {
+/// skip_uc_load, the header processing contexts, the hashed tables. `skip_uc_load`: the IPA microcontroller is
+/// already loaded (a modem restart while IPA kept running: Linux sends 1 once the uC reported in, else the modem
+/// waits for a uC load that never comes and asserts "ipa_hwp_init ... didnt rx any ind frm HWP").
+pub fn init_driver_tlvs(skip_uc_load: bool) -> Vec<(u8, Vec<u8>)> {
     let u32v = |v: u32| v.to_le_bytes().to_vec();
     alloc::vec![
         (0x10, u32v(3)),
@@ -38,7 +40,7 @@ pub fn init_driver_tlvs() -> Vec<(u8, Vec<u8>)> {
         (0x15, u32v(0x408)),
         (0x16, pair(0xbd8, 0x1024).to_vec()),
         (0x17, u32v(10)),
-        (0x18, alloc::vec![0]),
+        (0x18, alloc::vec![u8::from(skip_uc_load)]),
         (0x19, pair(0x7d0, 0x9cf).to_vec()),
         (0x1b, pair(0x488, 7).to_vec()),
         (0x1c, pair(0x588, 7).to_vec()),
@@ -94,7 +96,7 @@ mod tests {
     #[test]
     fn init_driver_is_linuxs_123_bytes() {
         let mut b = Builder::new(REQUEST, 1, INIT_DRIVER);
-        for (t, v) in init_driver_tlvs() {
+        for (t, v) in init_driver_tlvs(false) {
             b = b.tlv(t, &v);
         }
         let msg = b.finish();
