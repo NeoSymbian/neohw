@@ -62,15 +62,10 @@ impl Scan {
     /// The access point to join for `ssid`: its strongest 5 GHz one while that is at least [`GOOD_5GHZ_DBM`] (more
     /// room and less interference, as Android and wpa_supplicant prefer it), else its strongest in either band.
     pub fn best(&self, ssid: &[u8]) -> Option<&Network> {
-        let aps = || {
-            self.networks
-                .iter()
-                .filter(|n| !ssid.is_empty() && n.ssid == ssid)
-        };
-        aps()
-            .filter(|n| n.channel > 14 && n.dbm >= GOOD_5GHZ_DBM)
-            .max_by_key(|n| n.dbm)
-            .or_else(|| aps().max_by_key(|n| n.dbm))
+        self.networks
+            .iter()
+            .filter(|n| !ssid.is_empty() && n.ssid == ssid)
+            .max_by_key(|n| (n.channel > 14 && n.dbm >= GOOD_5GHZ_DBM, n.dbm))
     }
 }
 
