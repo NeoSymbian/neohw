@@ -163,8 +163,16 @@ impl Saved {
         self.0.iter().find(|(s, _)| s == ssid).map(|(_, p)| *p)
     }
 
-    pub fn forget(&mut self, ssid: &[u8]) {
+    /// Forget a network; `false` if it wasn't remembered.
+    pub fn forget(&mut self, ssid: &[u8]) -> bool {
+        let before = self.0.len();
         self.0.retain(|(s, _)| s != ssid);
+        self.0.len() != before
+    }
+
+    /// The names, newest first.
+    pub fn names(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.iter().map(|(s, _)| s.as_slice())
     }
 
     /// Remember (or refresh) a network as the newest.
@@ -256,5 +264,17 @@ mod tests {
         let mut damaged = s.encode();
         damaged.push(40);
         assert_eq!(Saved::decode(&damaged).0.len(), 2);
+    }
+
+    #[test]
+    fn forget_says_whether_it_found_the_network() {
+        let mut s = Saved::default();
+        s.remember(b"a", [1; 32]);
+        s.remember(b"b", [2; 32]);
+        assert!(!s.forget(b"c"));
+        assert_eq!(s.names().collect::<Vec<_>>(), [&b"b"[..], b"a"]);
+        assert!(s.forget(b"a"));
+        assert_eq!(s.names().collect::<Vec<_>>(), [&b"b"[..]]);
+        assert_eq!(s.pmk(b"a"), None);
     }
 }

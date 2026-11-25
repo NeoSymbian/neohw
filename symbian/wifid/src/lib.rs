@@ -328,6 +328,33 @@ impl Service for Daemon {
                 self.next_link = 0;
                 err::KERR_NONE
             }
+            op::SAVED => {
+                let b = wifi::ipc::encode_names(self.saved.names());
+                match msg.write8(0, &b, 0) {
+                    Ok(_) => i32::from(b[0]),
+                    Err(e) => e,
+                }
+            }
+            op::FORGET => match msg.read8_vec(0) {
+                Ok(ssid) if (1..=32).contains(&ssid.len()) => {
+                    if self.saved.pmk(&ssid).is_none() {
+                        err::KERR_NOT_FOUND
+                    } else {
+                        // leave it first if it is the network joined or being joined, as LEAVE 1 does
+                        if self.joined_ssid().as_deref() == Some(ssid.as_slice()) {
+                            self.stop();
+                            self.set_left(Some(ssid.clone()));
+                            self.next_link = 0;
+                        }
+                        self.saved.forget(&ssid);
+                        store(&self.saved);
+                        dprintln!("[wifid] forgot a network ({} left)", self.saved.0.len());
+                        err::KERR_NONE
+                    }
+                }
+                Ok(_) => err::KERR_ARGUMENT,
+                Err(e) => e,
+            },
             op::RADIO => {
                 self.radio_on = msg.int(0) != 0;
                 if !self.radio_on {

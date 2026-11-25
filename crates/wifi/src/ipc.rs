@@ -9,11 +9,18 @@
 //!   characters, or none for an open network); a running join is left first.
 //! - [`op::LEAVE`] arg 0 = 1 to forget the network too. It isn't rejoined on its own until CONNECT.
 //! - [`op::RADIO`] arg 0 = Settings' Wi-Fi switch: off, nothing is joined or scanned on its own.
+//! - [`op::SAVED`] (1.1) arg 0 = writable des8 of [`SAVED_SIZE`]: the remembered networks' names, newest first
+//!   ([`encode_names`]; never their keys); completes with the count, `KErrOverflow` if the buffer is short.
+//! - [`op::FORGET`] (1.1) arg 0 = des8 SSID (1..=32 bytes, else `KErrArgument`): forget that network, leaving it
+//!   first if it is joined or being joined (as LEAVE 1); `KErrNotFound` if it isn't remembered, and nothing changes.
 use alloc::vec::Vec;
 
 pub const NAME: &str = "NeoWifi";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (1, 0, 0);
+pub const VERSION: (i8, i8, i16) = (1, 1, 0);
+
+/// [`op::SAVED`]'s buffer: a count, then at most [`crate::kernel::Saved::MAX`] names of up to 32 bytes.
+pub const SAVED_SIZE: usize = 1 + crate::kernel::Saved::MAX * 33;
 
 pub mod op {
     pub const SCAN: i32 = 1;
@@ -21,6 +28,38 @@ pub mod op {
     pub const CONNECT: i32 = 3;
     pub const LEAVE: i32 = 4;
     pub const RADIO: i32 = 5;
+    pub const SAVED: i32 = 6;
+    pub const FORGET: i32 = 7;
+}
+
+/// [`op::SAVED`]'s record: `{count, {ssid length, ssid}*}`.
+pub fn encode_names<'a>(names: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut b = alloc::vec![0];
+    for n in names {
+        b[0] += 1;
+        b.push(n.len() as u8);
+        b.extend_from_slice(n);
+    }
+    b
+}
+
+/// The names in an [`op::SAVED`] record; `None` if it is damaged or longer than [`SAVED_SIZE`] allows.
+pub fn decode_names(b: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let (&count, mut rest) = b.split_first()?;
+    if usize::from(count) > crate::kernel::Saved::MAX {
+        return None;
+    }
+    let mut v = Vec::new();
+    for _ in 0..count {
+        let (&n, r) = rest.split_first()?;
+        let n = usize::from(n);
+        if n == 0 || n > 32 || r.len() < n {
+            return None;
+        }
+        v.push(r[..n].to_vec());
+        rest = &r[n..];
+    }
+    rest.is_empty().then_some(v)
 }
 
 /// Why a join gave up ([`op::LINK`]'s result)
@@ -103,5 +142,29 @@ mod tests {
         };
         assert_eq!(Connect::decode(&short.encode()), None);
         assert_eq!(Connect::decode(&c.encode()[..10]), None);
+    }
+
+    #[test]
+    fn saved_names_round_trip_and_limits() {
+        let names: Vec<&[u8]> = vec![b"home", b"Cafe Guest", &[b'x'; 32]];
+        let b = encode_names(names.iter().copied());
+        assert_eq!(b[0], 3);
+        assert_eq!(
+            decode_names(&b),
+            Some(names.iter().map(|n| n.to_vec()).collect())
+        );
+        assert_eq!(decode_names(&[0]), Some(vec![]));
+        // a full list fits the buffer
+        let full: Vec<Vec<u8>> = (0..8).map(|_| vec![b'y'; 32]).collect();
+        assert_eq!(
+            encode_names(full.iter().map(|n| n.as_slice())).len(),
+            SAVED_SIZE
+        );
+        // damaged: short, trailing bytes, an empty name, too many
+        assert_eq!(decode_names(&b[..b.len() - 1]), None);
+        assert_eq!(decode_names(&[b.as_slice(), &[0]].concat()), None);
+        assert_eq!(decode_names(&[1, 0]), None);
+        assert_eq!(decode_names(&[9]), None);
+        assert_eq!(decode_names(&[]), None);
     }
 }
