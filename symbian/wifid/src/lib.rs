@@ -17,6 +17,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::pin::pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use e32::fs::{File, Fs, mode};
 use e32::ipc::{Session, TVersion};
 use e32::rt::{self, Either};
@@ -44,6 +45,10 @@ const RETRY_MS: u64 = 60_000;
 const HANDSHAKE_MS: u64 = 10_000;
 /// The kernel's join (finishing a scan, then up to 3 tries for each frame) ends well within this
 const JOIN_MS: u64 = 30_000;
+
+/// Set by [`Daemon::stop`]: the supplicant thread leaves and ends at its next pass (a leave asked while the kernel
+/// is busy with the thread's own request gets KErrInUse and would not stop a connected link's thread)
+static STOP: AtomicBool = AtomicBool::new(false);
 
 /// Why the supplicant thread gave up (0 = it ended with the link); shared with the thread
 type Failed = Option<Arc<Mutex<i32>>>;
@@ -148,8 +153,34 @@ impl Daemon {
     /// Leave the network and end the supplicant thread.
     fn stop(&mut self) {
         if let Some((h, ..)) = self.join.take() {
+            STOP.store(true, Ordering::SeqCst);
             let _ = hal::leave();
             h.join();
+            STOP.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// FORGET: leave the network if it is the one joined or being joined (also a link WIFID didn't start, after a
+    /// restart), then drop it from `wifi.dat`; RAM changes only once the file is saved, so a failure can be retried.
+    fn forget(&mut self, ssid: &[u8]) -> i32 {
+        if self.saved.pmk(ssid).is_none() {
+            return err::KERR_NOT_FOUND;
+        }
+        if self.joined_ssid().as_deref() == Some(ssid) {
+            self.stop();
+            let _ = hal::leave();
+            self.set_left(Some(ssid.to_vec()));
+            self.next_link = 0;
+        }
+        let mut next = self.saved.clone();
+        next.forget(ssid);
+        match store(&next) {
+            Ok(()) => {
+                self.saved = next;
+                dprintln!("[wifid] forgot a network ({} left)", self.saved.0.len());
+                err::KERR_NONE
+            }
+            Err(e) => e,
         }
     }
 
@@ -181,7 +212,7 @@ impl Daemon {
                 && let Some((_, ssid, Some(pmk), _)) = &self.join
             {
                 self.saved.remember(ssid, *pmk);
-                store(&self.saved);
+                let _ = store(&self.saved);
             }
             if link.state != self.link.state {
                 dprintln!("[wifid] link {:?}", link.state);
@@ -321,7 +352,7 @@ impl Service for Daemon {
                 if let Some(ssid) = ssid {
                     if msg.int(0) != 0 {
                         self.saved.forget(&ssid);
-                        store(&self.saved);
+                        let _ = store(&self.saved);
                     }
                     self.set_left(Some(ssid));
                 }
@@ -335,26 +366,17 @@ impl Service for Daemon {
                     Err(e) => e,
                 }
             }
-            op::FORGET => match msg.read8_vec(0) {
-                Ok(ssid) if (1..=32).contains(&ssid.len()) => {
-                    if self.saved.pmk(&ssid).is_none() {
-                        err::KERR_NOT_FOUND
-                    } else {
-                        // leave it first if it is the network joined or being joined, as LEAVE 1 does
-                        if self.joined_ssid().as_deref() == Some(ssid.as_slice()) {
-                            self.stop();
-                            self.set_left(Some(ssid.clone()));
-                            self.next_link = 0;
-                        }
-                        self.saved.forget(&ssid);
-                        store(&self.saved);
-                        dprintln!("[wifid] forgot a network ({} left)", self.saved.0.len());
-                        err::KERR_NONE
-                    }
+            op::FORGET => {
+                let mut b = [0u8; 32];
+                match msg.des_len(0) {
+                    Ok(n) if (1..=32).contains(&n) => match msg.read8(0, &mut b, 0) {
+                        Ok(n) => self.forget(&b[..n]),
+                        Err(e) => e,
+                    },
+                    Ok(_) => err::KERR_ARGUMENT,
+                    Err(e) => e,
                 }
-                Ok(_) => err::KERR_ARGUMENT,
-                Err(e) => e,
-            },
+            }
             op::RADIO => {
                 self.radio_on = msg.int(0) != 0;
                 if !self.radio_on {
@@ -394,6 +416,10 @@ fn supplicant(bssid: [u8; 6], pmk: Option<[u8; 32]>, failed: Failed) -> i32 {
     let mut eapol = 0u32;
     loop {
         time::sleep(10_000);
+        if STOP.load(Ordering::SeqCst) {
+            let _ = hal::leave(); // the stopper's leave may have found the kernel busy with ours
+            return 0;
+        }
         let mut b = [0u8; wifi::kernel::LINK_SIZE];
         let Some(link) = hal::link(&mut b).ok().and_then(|n| Link::decode(&b[..n])) else {
             return fail(fail::HAL);
@@ -476,10 +502,10 @@ fn read(path: &str) -> Result<Vec<u8>, i32> {
     Ok(b)
 }
 
-fn store(saved: &Saved) {
-    if let Err(e) = sys::save_private("C:\\private\\e0004002\\", "wifi.dat", &saved.encode()) {
+fn store(saved: &Saved) -> Result<(), i32> {
+    sys::save_private("C:\\private\\e0004002\\", "wifi.dat", &saved.encode()).inspect_err(|e| {
         dprintln!("[wifid] saving the networks failed ({})", e);
-    }
+    })
 }
 
 fn main() -> i32 {
@@ -502,7 +528,7 @@ fn main() -> i32 {
                     "[wifid] {} remembered networks moved from SYSSTART",
                     old.0.len()
                 );
-                store(&old);
+                let _ = store(&old);
             }
             old
         }

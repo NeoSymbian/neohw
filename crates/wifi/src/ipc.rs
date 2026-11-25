@@ -9,8 +9,8 @@
 //!   characters, or none for an open network); a running join is left first.
 //! - [`op::LEAVE`] arg 0 = 1 to forget the network too. It isn't rejoined on its own until CONNECT.
 //! - [`op::RADIO`] arg 0 = Settings' Wi-Fi switch: off, nothing is joined or scanned on its own.
-//! - [`op::SAVED`] (1.1) arg 0 = writable des8 of [`SAVED_SIZE`]: the remembered networks' names, newest first
-//!   ([`encode_names`]; never their keys); completes with the count, `KErrOverflow` if the buffer is short.
+//! - [`op::SAVED`] (1.1) arg 0 = writable des8, [`SAVED_SIZE`] holds any list: the remembered networks' names, newest
+//!   first ([`encode_names`]; never their keys); completes with the count, `KErrOverflow` if this list doesn't fit.
 //! - [`op::FORGET`] (1.1) arg 0 = des8 SSID (1..=32 bytes, else `KErrArgument`): forget that network, leaving it
 //!   first if it is joined or being joined (as LEAVE 1); `KErrNotFound` if it isn't remembered, and nothing changes.
 use alloc::vec::Vec;
