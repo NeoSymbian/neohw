@@ -49,6 +49,9 @@ const JOIN_MS: u64 = 30_000;
 /// Set by [`Daemon::stop`]: the supplicant thread leaves and ends at its next pass (a leave asked while the kernel
 /// is busy with the thread's own request gets KErrInUse and would not stop a connected link's thread)
 static STOP: AtomicBool = AtomicBool::new(false);
+/// Set by the supplicant thread as it ends: its exit's signal may already have been taken by the server's wait (e32
+/// `wait_for_request` waits for a new one), so [`Daemon::stop`] joins only a thread that hasn't ended.
+static EXITED: AtomicBool = AtomicBool::new(false);
 
 /// Why the supplicant thread gave up (0 = it ended with the link); shared with the thread
 type Failed = Option<Arc<Mutex<i32>>>;
@@ -130,7 +133,12 @@ impl Daemon {
         set(&self.failed, 0);
         let failed = self.failed.clone();
         dprintln!("[wifid] joining {:02x?}", bssid);
-        match e32::thread::spawn(move || supplicant(bssid, pmk, failed)) {
+        EXITED.store(false, Ordering::SeqCst);
+        match e32::thread::spawn(move || {
+            let r = supplicant(bssid, pmk, failed);
+            EXITED.store(true, Ordering::SeqCst);
+            r
+        }) {
             Ok(h) => self.join = Some((h, ssid.to_vec(), pmk, now)),
             Err(e) => dprintln!("[wifid] no supplicant thread ({})", e),
         }
@@ -150,13 +158,23 @@ impl Daemon {
         }
     }
 
-    /// Leave the network and end the supplicant thread.
+    /// Leave the network and end the supplicant thread. It sees STOP between HAL requests, each of which the kernel
+    /// ends within 3 s, so this is bounded by about that (logged).
+    // shortcut: if the thread's exit logon failed (KErrNoMemory), join returns at once while the thread may still run
+    // its last request; STOP is cleared early then and a new join could overlap it. An e32 JoinHandle that reports
+    // the logon failure (or a timed join) would close this.
     fn stop(&mut self) {
         if let Some((h, ..)) = self.join.take() {
+            let t = time::millis();
             STOP.store(true, Ordering::SeqCst);
             let _ = hal::leave();
-            h.join();
+            if EXITED.load(Ordering::SeqCst) {
+                drop(h); // ended already: its exit signal may be gone
+            } else {
+                h.join();
+            }
             STOP.store(false, Ordering::SeqCst);
+            dprintln!("[wifid] supplicant stopped in {} ms", time::millis() - t);
         }
     }
 
@@ -166,9 +184,17 @@ impl Daemon {
         if self.saved.pmk(ssid).is_none() {
             return err::KERR_NOT_FOUND;
         }
-        if self.joined_ssid().as_deref() == Some(ssid) {
+        // a link up whose network can't be named (after a WIFID restart the scan isn't read yet) is left too
+        let up = matches!(
+            self.link.state,
+            LinkState::Joining | LinkState::Handshake | LinkState::Connected
+        );
+        let joined = self.joined_ssid();
+        if joined.as_deref() == Some(ssid) || (up && joined.is_none()) {
             self.stop();
-            let _ = hal::leave();
+            if let Err(e) = hal::leave() {
+                return e;
+            }
             self.set_left(Some(ssid.to_vec()));
             self.next_link = 0;
         }
@@ -466,6 +492,9 @@ fn supplicant(bssid: [u8; 6], pmk: Option<[u8; 32]>, failed: Failed) -> i32 {
             }
         };
         while let Ok(Some(n)) = hal::eapol_recv(&mut frame) {
+            if STOP.load(Ordering::SeqCst) {
+                break; // the loop's top leaves
+            }
             eapol += 1;
             let actions = match hs.on_eapol(&frame[..n]) {
                 Ok(a) => a,
@@ -503,7 +532,7 @@ fn read(path: &str) -> Result<Vec<u8>, i32> {
 }
 
 fn store(saved: &Saved) -> Result<(), i32> {
-    sys::save_private("C:\\private\\e0004002\\", "wifi.dat", &saved.encode()).inspect_err(|e| {
+    sys::replace_private("C:\\private\\e0004002\\", "wifi.dat", &saved.encode()).inspect_err(|e| {
         dprintln!("[wifid] saving the networks failed ({})", e);
     })
 }
@@ -517,7 +546,7 @@ fn main() -> i32 {
         }
     };
     // the networks SYSSTART remembered before S5 move here once
-    let saved = match read(SAVED) {
+    let saved = match sys::load_private(SAVED, 1024) {
         Ok(b) => Saved::decode(&b),
         Err(_) => {
             let old = read(OLD_SAVED)

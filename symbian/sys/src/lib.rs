@@ -215,6 +215,54 @@ pub fn ipa_firmware() -> Result<(Vec<u8>, usize), ext4ro::Error> {
     Ok((image, mdt.len()))
 }
 
+/// Replace `name` in the caller's private directory with `data`, never leaving it empty or half written: write
+/// `name.new`, flush it, delete `name`, rename. A cut between the delete and the rename leaves only `name.new`,
+/// which [`load_private`] falls back to (neoui's settings store does the same).
+pub fn replace_private(directory: &str, name: &str, data: &[u8]) -> Result<(), i32> {
+    use e32::fs::{File, Fs, mode};
+    let fs = Fs::connect()?;
+    for path in ["C:\\private\\", directory] {
+        if let Err(e) = fs.mkdir(path)
+            && e != err::KERR_ALREADY_EXISTS
+        {
+            return Err(e);
+        }
+    }
+    let (path, new) = (
+        alloc::format!("{directory}{name}"),
+        alloc::format!("{directory}{name}.new"),
+    );
+    {
+        // closed (dropped) before the rename
+        let f = File::replace(&fs, &new, mode::SHARE_EXCLUSIVE)?;
+        f.write(data)?;
+        f.flush()?;
+    }
+    match fs.delete(&path) {
+        Ok(()) | Err(err::KERR_NOT_FOUND) => {}
+        Err(e) => return Err(e),
+    }
+    fs.rename(&new, &path)
+}
+
+/// The file [`replace_private`] wrote: `path`, else `path.new` (a cut between its delete and its rename), at most
+/// `max` bytes.
+pub fn load_private(path: &str, max: usize) -> Result<Vec<u8>, i32> {
+    use e32::fs::{File, Fs, mode};
+    let fs = Fs::connect()?;
+    let read = |p: &str| -> Result<Vec<u8>, i32> {
+        let f = File::open(&fs, p, mode::READ | mode::SHARE_READERS_ONLY)?;
+        let mut b = alloc::vec![0u8; max];
+        let n = f.read_at(0, &mut b)?;
+        b.truncate(n);
+        Ok(b)
+    };
+    match read(path) {
+        Err(err::KERR_NOT_FOUND) => read(&alloc::format!("{path}.new")),
+        r => r,
+    }
+}
+
 /// Replace `name` in the caller's private directory with `data`.
 pub fn save_private(directory: &str, name: &str, data: &[u8]) -> Result<(), i32> {
     use e32::fs::{File, Fs, mode};
