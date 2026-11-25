@@ -1,7 +1,7 @@
 # neohw
 
 NeoSymbian's hardware, user side: Rust for the Pixel 3a XL's (Qualcomm SDM670) modem, audio DSP, Wi-Fi and, later,
-Bluetooth, on the 2010 Symbian user side (`armv5te-none-eabi`, `no_std` + `alloc`, the
+Bluetooth, on the 2010 Symbian user side (ARMv8-A AArch32 softfp, `targets/armv8a-neosymbian-eabi.json`, `no_std` + `alloc`, the
 [`e32`](https://github.com/NeoSymbian/e32-rs) crate). Renamed from `telephony` on 2026-11-18; `neolink` (Wi-Fi) was
 merged in with its history.
 
@@ -14,7 +14,7 @@ in [kernel](https://github.com/NeoSymbian/kernel) under `baseport/arm64`.
 ## Layout
 
 `crates/` is the host workspace: protocols, IPC contracts and sans-I/O state machines, tested on the Mac.
-`symbian/` is the Symbian workspace: the EXEs (`exes.txt`), built only for armv5te.
+`symbian/` is the Symbian workspace: the EXEs (`exes.txt`), built only for that target (`cargo arm`).
 
 | Crate / EXE | What |
 |---|---|
@@ -78,7 +78,7 @@ cargo test
 cd symbian
 cargo fmt --all --check
 cargo arm --workspace
-cargo clippy --workspace --target armv5te-none-eabi -Zbuild-std=core,alloc --release -- -D warnings
+cargo clippy-arm --workspace -- -D warnings
 ```
 
 Qualcomm firmware and board data are never stored here: they are read from the phone's own partitions at runtime.

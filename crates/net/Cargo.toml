@@ -17,8 +17,8 @@ smoltcp = { version = "0.14", default-features = false, features = [
     "alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "proto-dns", "socket-tcp", "socket-udp", "socket-dhcpv4",
     "socket-dns", "auto-icmp-echo-reply",
 ] }
-# smoltcp's heapless assumes armv5te-none-eabi has atomic load/store; this nightly gives it none. Its atomics go
-# through portable-atomic, backed on the phone by e32's critical-section (a kernel mutex), as Slint's do in neoui.
+# smoltcp's heapless goes through portable-atomic (native ARMv8 atomics since US4; the critical-section backend, e32's
+# kernel mutex, is only its fallback), as Slint's do in neoui.
 heapless = { version = "0.9", default-features = false, features = ["portable-atomic-critical-section"] }
 # NeoSymbian/e32-rs, the same revision as neoui (one e32 in SYSSTART)
-e32 = { git = "https://github.com/NeoSymbian/e32-rs", rev = "cedbcd2ee7540e2e73e1dc1f7dc19dd6d42721f8", optional = true }
+e32 = { git = "https://github.com/NeoSymbian/e32-rs", rev = "206b6c28cf49ef2f6e746580df97f05921500c35", optional = true }
