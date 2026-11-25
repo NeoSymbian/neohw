@@ -153,7 +153,7 @@ dependencies = [
 [[package]]
 name = "e32"
 version = "0.1.0"
-source = "git+https://github.com/NeoSymbian/e32-rs?rev=206b6c28cf49ef2f6e746580df97f05921500c35#206b6c28cf49ef2f6e746580df97f05921500c35"
+source = "git+https://github.com/NeoSymbian/e32-rs?rev=8084b94f9e8264384113e7ea6fa52adf70944cc5#8084b94f9e8264384113e7ea6fa52adf70944cc5"
 dependencies = [
  "e32-sys",
  "linked_list_allocator",
@@ -162,7 +162,7 @@ dependencies = [
 [[package]]
 name = "e32-sys"
 version = "0.1.0"
-source = "git+https://github.com/NeoSymbian/e32-rs?rev=206b6c28cf49ef2f6e746580df97f05921500c35#206b6c28cf49ef2f6e746580df97f05921500c35"
+source = "git+https://github.com/NeoSymbian/e32-rs?rev=8084b94f9e8264384113e7ea6fa52adf70944cc5#8084b94f9e8264384113e7ea6fa52adf70944cc5"
 
 [[package]]
 name = "ext4ro"

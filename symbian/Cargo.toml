@@ -8,7 +8,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # NeoSymbian/e32-rs, the same revision as neoui
-e32 = { git = "https://github.com/NeoSymbian/e32-rs", rev = "206b6c28cf49ef2f6e746580df97f05921500c35", features = ["critical-section"] }
+e32 = { git = "https://github.com/NeoSymbian/e32-rs", rev = "8084b94f9e8264384113e7ea6fa52adf70944cc5", features = ["critical-section"] }
 apr = { path = "../crates/apr" }
 hub-ipc = { path = "../crates/hub-ipc" }
 hub = { path = "../crates/hub" }
