@@ -11,8 +11,8 @@ extern crate alloc;
 
 mod hal;
 
-use alloc::boxed::Box;
 use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
@@ -45,9 +45,8 @@ const HANDSHAKE_MS: u64 = 10_000;
 /// The kernel's join (finishing a scan, then up to 3 tries for each frame) ends well within this
 const JOIN_MS: u64 = 30_000;
 
-/// Why the supplicant thread gave up (0 = it ended with the link); shared with the thread (leaked: it lives as long
-/// as WIFID, and Arc needs compare-and-swap, which ARMv5TE lacks)
-type Failed = Option<&'static Mutex<i32>>;
+/// Why the supplicant thread gave up (0 = it ended with the link); shared with the thread
+type Failed = Option<Arc<Mutex<i32>>>;
 /// a running supplicant thread, the SSID and PMK (none: an open network) it joins with, and when it started
 type Join = (JoinHandle, Vec<u8>, Option<[u8; 32]>, u64);
 
@@ -109,7 +108,7 @@ impl Daemon {
             if let Event::Reset { generation, .. } = e {
                 self.deaf = false; // the restarted firmware gets a fresh data path
                 self.stop();
-                set(self.failed, 0); // else the old NO_DATA makes it deaf again at once
+                set(&self.failed, 0); // else the old NO_DATA makes it deaf again at once
                 if let Some(s) = &self.hub {
                     sys::hub::quiesced(s, generation);
                 }
@@ -123,8 +122,8 @@ impl Daemon {
     fn start(&mut self, bssid: [u8; 6], ssid: &[u8], pmk: Option<[u8; 32]>, now: u64) {
         self.stop();
         self.set_left(None);
-        set(self.failed, 0);
-        let failed = self.failed;
+        set(&self.failed, 0);
+        let failed = self.failed.clone();
         dprintln!("[wifid] joining {:02x?}", bssid);
         match e32::thread::spawn(move || supplicant(bssid, pmk, failed)) {
             Ok(h) => self.join = Some((h, ssid.to_vec(), pmk, now)),
@@ -189,7 +188,12 @@ impl Daemon {
             }
             self.link = link;
         }
-        if self.failed.is_some_and(|m| *m.lock() == fail::NO_DATA) && !self.deaf {
+        if self
+            .failed
+            .as_ref()
+            .is_some_and(|m| *m.lock() == fail::NO_DATA)
+            && !self.deaf
+        {
             dprintln!(
                 "[wifid] no EAPOL in a whole handshake: the data path is down; no rejoins until a modem restart"
             );
@@ -291,7 +295,7 @@ impl Service for Daemon {
                 match hal::link(&mut b) {
                     Ok(n) => msg
                         .write8(0, &b[..n], 0)
-                        .map_or_else(|e| e, |_| self.failed.map_or(0, |m| *m.lock())),
+                        .map_or_else(|e| e, |_| self.failed.as_ref().map_or(0, |m| *m.lock())),
                     Err(e) => e,
                 }
             }
@@ -348,7 +352,7 @@ impl Service for Daemon {
 /// driver is polled too, and the AP waits about a second per handshake message).
 fn supplicant(bssid: [u8; 6], pmk: Option<[u8; 32]>, failed: Failed) -> i32 {
     let fail = |why: i32| {
-        set(failed, why);
+        set(&failed, why);
         let _ = hal::leave();
         why
     };
@@ -430,7 +434,7 @@ fn supplicant(bssid: [u8; 6], pmk: Option<[u8; 32]>, failed: Failed) -> i32 {
     }
 }
 
-fn set(failed: Failed, why: i32) {
+fn set(failed: &Failed, why: i32) {
     if let Some(m) = failed {
         *m.lock() = why;
     }
@@ -490,7 +494,7 @@ fn main() -> i32 {
         next_connect: 0,
         next_start: 0,
         saved,
-        failed: Mutex::new(0).ok().map(|m| &*Box::leak(Box::new(m))),
+        failed: Mutex::new(0).ok().map(Arc::new),
         join: None,
         left: read(LEFT).ok().filter(|b| !b.is_empty()),
         radio_on: true,

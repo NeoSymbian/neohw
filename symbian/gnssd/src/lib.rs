@@ -6,9 +6,9 @@
 #![no_std]
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
@@ -37,9 +37,8 @@ const XTRA_RETRY_MS: u64 = 10 * 60_000;
 /// read buffer per NeoNet RECV (its maximum)
 const CHUNK: usize = 8 * 1024;
 
-/// The download thread's result, shared with it (leaked: GNSSD lives for ever, and Arc needs compare-and-swap,
-/// which ARMv5TE lacks)
-type Slot = &'static Mutex<Option<Result<Vec<u8>, i32>>>;
+/// The download thread's result, shared with it
+type Slot = Arc<Mutex<Option<Result<Vec<u8>, i32>>>>;
 
 struct Daemon {
     gnss: loc::Gnss,
@@ -96,6 +95,7 @@ impl Daemon {
         // a finished download: cache and inject it
         let done = self
             .slot
+            .as_ref()
             .and_then(|s| s.lock().take())
             .filter(|_| self.download.is_some());
         if let Some(r) = done {
@@ -126,7 +126,9 @@ impl Daemon {
             self.gnss.want_xtra = false;
             return;
         }
-        let Some(slot) = self.slot else { return };
+        let Some(slot) = self.slot.clone() else {
+            return;
+        };
         // only a real download attempt waits before the next (the modem's own request brings the URLs later)
         self.next_download = now + XTRA_RETRY_MS;
         match e32::thread::spawn_with_stack(32 << 10, move || {
@@ -277,7 +279,7 @@ fn main() -> i32 {
         hub: None,
         next_connect: 0,
         download: None,
-        slot: Mutex::new(None).ok().map(|m| &*Box::leak(Box::new(m))),
+        slot: Mutex::new(None).ok().map(Arc::new),
         next_download: 0,
     };
     rt::block_on(async {

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # neohw host workspace: the hardware's user-side crates (protocols, IPC contracts, sans-I/O state machines), no_std +
 # alloc, unit-tested on the Mac with `cargo test`. The Symbian EXEs are in symbian/, its own workspace built only for
-# armv5te-none-eabi (`cargo arm`). Overview: docs hardware.md.
+# targets/armv8a-neosymbian-eabi.json (`cargo arm`). Overview: docs hardware.md.
 [workspace]
 members = [
     "crates/ext4ro",

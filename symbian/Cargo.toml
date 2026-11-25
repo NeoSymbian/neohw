@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # The Symbian side: the neohw EXEs (HWHUB.EXE, MODEMD.EXE, AUDIOD.EXE, GNSSD.EXE, WIFID.EXE, NEONET.EXE), each a staticlib for build/emitter/build_rust_exe.py
 # (exes.txt). Its own workspace:
-# built only for armv5te-none-eabi with the pinned nightly (`cargo arm`), like neoui/symbian.
+# built only for targets/armv8a-neosymbian-eabi.json with the pinned nightly (`cargo arm`), like neoui/symbian.
 [workspace]
 members = ["audiod", "gnssd", "hwhub", "modemd", "neonet", "sys", "wifid"]
 resolver = "2"
