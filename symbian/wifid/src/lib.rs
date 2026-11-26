@@ -210,6 +210,24 @@ impl Daemon {
         }
     }
 
+    /// RESET: leave whatever is joined, then forget every network and the left one. `wifi.dat` is written empty (not
+    /// deleted), so the move from SYSSTART's old file can't run again; RAM changes only once it is saved.
+    fn reset(&mut self) -> i32 {
+        self.stop();
+        let _ = hal::leave();
+        self.next_link = 0;
+        let none = Saved::default();
+        match store(&none) {
+            Ok(()) => {
+                self.saved = none;
+                self.set_left(None);
+                dprintln!("[wifid] reset: every network forgotten");
+                err::KERR_NONE
+            }
+            Err(e) => e,
+        }
+    }
+
     /// The joined network's SSID: the join's, else the scan entry of the linked BSSID.
     fn joined_ssid(&self) -> Option<Vec<u8>> {
         if let Some((_, ssid, ..)) = &self.join {
@@ -403,6 +421,7 @@ impl Service for Daemon {
                     Err(e) => e,
                 }
             }
+            op::RESET => self.reset(),
             op::RADIO => {
                 self.radio_on = msg.int(0) != 0;
                 if !self.radio_on {

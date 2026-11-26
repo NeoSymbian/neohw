@@ -13,11 +13,14 @@
 //!   first ([`encode_names`]; never their keys); completes with the count, `KErrOverflow` if this list doesn't fit.
 //! - [`op::FORGET`] (1.1) arg 0 = des8 SSID (1..=32 bytes, else `KErrArgument`): forget that network, leaving it
 //!   first if it is joined or being joined (as LEAVE 1); `KErrNotFound` if it isn't remembered, and nothing changes.
+//! - [`op::RESET`] (1.2, Settings' Reset network settings): leave, forget every network (`wifi.dat` becomes a valid
+//!   empty file, so the old SYSSTART copy is never moved in again) and the left network; completes with the save's
+//!   error, if any (the networks stay then).
 use alloc::vec::Vec;
 
 pub const NAME: &str = "NeoWifi";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (1, 1, 0);
+pub const VERSION: (i8, i8, i16) = (1, 2, 0);
 
 /// [`op::SAVED`]'s buffer: a count, then at most [`crate::kernel::Saved::MAX`] names of up to 32 bytes.
 pub const SAVED_SIZE: usize = 1 + crate::kernel::Saved::MAX * 33;
@@ -30,6 +33,7 @@ pub mod op {
     pub const RADIO: i32 = 5;
     pub const SAVED: i32 = 6;
     pub const FORGET: i32 = 7;
+    pub const RESET: i32 = 8;
 }
 
 /// [`op::SAVED`]'s record: `{count, {ssid length, ssid}*}`.
