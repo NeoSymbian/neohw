@@ -24,6 +24,10 @@
 //! - v2.6: each [`Call`] says whether it is part of a conference ([`Call::multiparty`]) and when it connected
 //!   ([`Call::since`], MODEMD's tick clock, so every app shows the same timer); [`Status::imei`]; [`op::SILENCE`]
 //!   quietens one ringing call without touching the ring settings.
+//! - v2.8 (Settings D6, SE2c-1): [`op::RING_SETTINGS`]' tones may be the user's own sounds, ids
+//!   [`tone::FIRST_YOURS`]..=[`tone::LAST`] (AUDIOD plays their files, the built-in ringtone when one is missing). A
+//!   2.7 MODEMD refuses them: the shell sends the built-in tone instead. `settings.bin` keeps the built-in tone in
+//!   their place (a 2.7 MODEMD refuses the whole record otherwise); the shell sends them again after a restart.
 //!
 //! Each op completes with KErrNone or an error: KErrNotReady (-18) without a modem/call to act on, KErrArgument (-6)
 //! for a number it refuses.
@@ -31,7 +35,7 @@
 
 pub const NAME: &str = "NeoModem";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (2, 7, 0);
+pub const VERSION: (i8, i8, i16) = (2, 8, 0);
 
 pub mod op {
     pub const STATUS: i32 = 1;
@@ -424,6 +428,17 @@ pub mod tone {
     pub const TWO_BEEPS: u8 = 2;
     /// no sound: the call vibrates (if vibrate is on), a message buzzes
     pub const NONE: u8 = 3;
+    /// (2.8) the user's own sounds (NeoAudio `tones::file`): the first and the last id
+    pub const FIRST_YOURS: u8 = 4;
+    pub const LAST: u8 = 15;
+
+    /// (2.8) The tones as `settings.bin` keeps them: the user's own sounds as the built-in tone, so a 2.7 MODEMD still
+    /// reads the record (the shell sends the real ones again after a restart).
+    #[must_use]
+    pub fn persisted(t: (u8, u8)) -> (u8, u8) {
+        let keep = |x: u8| if x > NONE { BUILT_IN } else { x };
+        (keep(t.0), keep(t.1))
+    }
     /// [`super::op::RING_SETTINGS`]' arg3 carries tones (bit 8); without it MODEMD keeps the ones it has.
     pub const PRESENT: i32 = 0x100;
 
@@ -448,13 +463,13 @@ pub mod tone {
     /// The tones in arg3: `Ok(None)` when it carries none (an older caller).
     ///
     /// # Errors
-    /// [`Unknown`] for a tone above [`NONE`] or stray bits.
+    /// [`Unknown`] for stray bits (since 2.8 every 4-bit id is a tone: 0..=3 built in, 4..=15 the user's own).
     pub fn unpack(arg: i32) -> Result<Option<(u8, u8)>, Unknown> {
         if arg & PRESENT == 0 {
             return Ok(None);
         }
         let (ring, message) = ((arg & 0xf) as u8, (arg >> 4 & 0xf) as u8);
-        if ring > NONE || message > NONE || arg & !0x1ff != 0 {
+        if arg & !0x1ff != 0 {
             return Err(Unknown);
         }
         Ok(Some((ring, message)))
@@ -515,7 +530,12 @@ pub mod saved {
             return None;
         }
         let tones = if kind == 9 {
-            Some(super::tone::unpack(super::tone::PRESENT | i32::from(b[9])).ok()??)
+            // the file never keeps the user's own sounds (`tone::persisted`): a record with one is damaged
+            let t = super::tone::unpack(super::tone::PRESENT | i32::from(b[9])).ok()??;
+            if super::tone::persisted(t) != t {
+                return None;
+            }
+            Some(t)
         } else {
             None
         };
@@ -905,7 +925,9 @@ mod tests {
         assert_eq!(set, (BEEP, TWO_BEEPS));
         // NEOPHONE's and an older shell's RING_SETTINGS: arg3 = 0
         assert_eq!(apply(set, 0), Ok(set));
-        assert_eq!(apply(set, PRESENT | 9), Err(Unknown));
+        // 2.8: the user's own sounds pass through; stray bits don't
+        assert_eq!(apply(set, PRESENT | 9), Ok((9, BUILT_IN)));
+        assert_eq!(apply(set, PRESENT | 0x400), Err(Unknown));
     }
 
     #[test]
@@ -918,9 +940,13 @@ mod tests {
             unpack(pack(BUILT_IN, BUILT_IN)),
             Ok(Some((BUILT_IN, BUILT_IN)))
         );
-        assert_eq!(unpack(PRESENT | 4), Err(Unknown));
-        assert_eq!(unpack(PRESENT | 4 << 4), Err(Unknown));
+        assert_eq!(unpack(PRESENT | 4), Ok(Some((FIRST_YOURS, BUILT_IN))));
+        assert_eq!(unpack(pack(LAST, 7)), Ok(Some((LAST, 7))));
         assert_eq!(unpack(PRESENT | 0x200), Err(Unknown));
+        assert_eq!(unpack(-1), Err(Unknown));
+        // settings.bin keeps the built-in tone in their place
+        assert_eq!(persisted((5, TWO_BEEPS)), (BUILT_IN, TWO_BEEPS));
+        assert_eq!(persisted((NONE, 15)), (NONE, BUILT_IN));
     }
 
     use super::*;

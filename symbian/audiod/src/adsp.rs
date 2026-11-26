@@ -207,7 +207,11 @@ impl CallAudio {
     /// Prepare the bounded kernel region once before opening a ringtone stream. It is never copied while published.
     pub fn prepare_ring(&mut self) -> Result<(), i32> {
         let want = (self.ring_tone, self.ring.volume);
-        if self.ring_loaded && self.prepared == Some(want) {
+        // a sound of the user's is read again for each ring: NEOSET may have replaced it under the same id
+        if self.ring_loaded
+            && self.prepared == Some(want)
+            && self.ring_tone <= neoaudio::tones::NONE
+        {
             return Ok(());
         }
         // SAFETY: This AUDIO_MEM query/publish/completion uses scalar fields and no userspace buffer.
@@ -215,7 +219,7 @@ impl CallAudio {
         if r < 0 {
             return Err(r);
         }
-        let pcm = neoaudio::tones::pcm(self.ring_tone, self.ring.volume);
+        let pcm = ring_pcm(self.ring_tone, self.ring.volume);
         // SAFETY: AUDIO_MEM copy-in reads the live PCM buffer for its stated byte length.
         let (r, _) = unsafe {
             hal_io(
@@ -457,6 +461,29 @@ impl CallAudio {
             Mode::Media | Mode::Duplex if self.apr.jack_is() => 3,
             Mode::Media | Mode::Duplex => self.media_route,
             _ => self.speaker as u32,
+        }
+    }
+}
+
+/// (NeoAudio 1.1, Settings D6) The ring's PCM: a built-in tone, or the user's own sound from NEOSET's folder
+/// (`tones::file`), which must be exactly one period; a missing, short or long one rings with the built-in tone.
+fn ring_pcm(tone: u8, volume: u8) -> Vec<u8> {
+    use neoaudio::tones;
+    let Some(path) = tones::file(tone) else {
+        return tones::pcm(tone, volume);
+    };
+    match sys::load_private(&path, tones::BYTES + 1) {
+        Ok(mut b) if b.len() == tones::BYTES => {
+            tones::scale(&mut b, volume);
+            b
+        }
+        r => {
+            dprintln!(
+                "[audiod] tone {} unusable ({:?}): the built-in one",
+                tone,
+                r.map(|b| b.len())
+            );
+            tones::pcm(tones::BUILT_IN, volume)
         }
     }
 }

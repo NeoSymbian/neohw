@@ -17,6 +17,9 @@ pub struct Link {
     sent: Option<(Intent, u64)>,
     next_connect: u64,
     spawned: bool,
+    /// (NeoAudio 1.1) AUDIOD refused a sound of the user's (a 1.0 AUDIOD): the built-in tone in its place until it
+    /// reconnects
+    old_tones: bool,
 }
 
 impl Link {
@@ -31,6 +34,7 @@ impl Link {
             sent: None,
             next_connect: 0,
             spawned: false,
+            old_tones: false,
         }
     }
 
@@ -76,6 +80,7 @@ impl Link {
                     dprintln!("[modemd] connected to AUDIOD");
                     self.session = Some(s);
                     self.sent = None;
+                    self.old_tones = false;
                 }
                 Err(e) if e == err::KERR_NOT_FOUND && !self.spawned => {
                     self.spawned = true;
@@ -98,7 +103,11 @@ impl Link {
             return;
         }
         let Some(s) = &self.session else { return };
-        let bytes = self.intent.to_bytes();
+        let mut sent = self.intent;
+        if self.old_tones && sent.ring_tone > neoaudio::tones::NONE {
+            sent.ring_tone = neoaudio::tones::BUILT_IN;
+        }
+        let bytes = sent.to_bytes();
         let des = TPtrC8::new(&bytes);
         let mut back = [0u8; Report::SIZE];
         let mut out = TPtr8::new(&mut back);
@@ -110,6 +119,16 @@ impl Link {
                     self.report = r;
                 }
                 self.sent = Some((self.intent, now));
+            }
+            // a 1.0 AUDIOD knows only the built-in tones: ring with the built-in one (call, hold, epoch unchanged)
+            Err(err::KERR_ARGUMENT)
+                if !self.old_tones && sent.ring_tone > neoaudio::tones::NONE =>
+            {
+                dprintln!(
+                    "[modemd] AUDIOD refused tone {}: the built-in one",
+                    sent.ring_tone
+                );
+                self.old_tones = true;
             }
             Err(e) => {
                 dprintln!("[modemd] AUDIOD control failed ({}): reconnecting", e);

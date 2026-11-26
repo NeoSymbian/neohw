@@ -318,7 +318,9 @@ impl Daemon {
             airplane: s.airplane,
             ring: s.ring,
             c8: Some((clir, days)),
-            tones: Some(self.tones),
+            // (2.8) the user's own sounds as the built-in tone: a 2.7 MODEMD refuses the record otherwise; the shell
+            // sends them again after a restart
+            tones: Some(modem_ipc::tone::persisted(self.tones)),
         });
         sys::replace_private(
             "C:\\private\\e0003001\\",
