@@ -6,6 +6,9 @@ use apr::Mode;
 use e32::{dprintln, time};
 use sys::{AUDIO, AUDIO_MEM, CHAN_RECV, CHAN_SEND, Io, hal_io};
 
+// the ring's PCM fills exactly the ADSP's ring buffer
+const _: () = assert!(neoaudio::tones::BYTES == apr::RING_BYTES);
+
 pub const RING_APR: u32 = 2;
 
 /// One message from kernel ring `ring` into `buf`: its length, or None when the ring is empty.
@@ -82,6 +85,11 @@ pub struct CallAudio {
     pub volume: u8,
     pub test: Option<bool>,
     pub ring: modem_ipc::Ring,
+    /// (SE2b) the tone the next ring prepares (`neoaudio::tones`)
+    pub ring_tone: u8,
+    /// (tone, volume) of the PCM in the ring buffer now: a ring plays only that, so a call can't loop a message's
+    /// chime (or the last ring's tone)
+    pub prepared: Option<(u8, u8)>,
     ring_loaded: bool,
     /// NeoAudio's media: the kernel route (0 earpiece, 1 both amps, 2 bottom) and amp volume 0..=10
     pub media_route: u32,
@@ -103,6 +111,8 @@ impl CallAudio {
             volume: 10,
             test: None,
             ring: Default::default(),
+            ring_tone: neoaudio::tones::BUILT_IN,
+            prepared: None,
             ring_loaded: false,
             media_route: 1,
             media_volume: 7,
@@ -196,7 +206,8 @@ impl CallAudio {
 
     /// Prepare the bounded kernel region once before opening a ringtone stream. It is never copied while published.
     pub fn prepare_ring(&mut self) -> Result<(), i32> {
-        if self.ring_loaded {
+        let want = (self.ring_tone, self.ring.volume);
+        if self.ring_loaded && self.prepared == Some(want) {
             return Ok(());
         }
         // SAFETY: This AUDIO_MEM query/publish/completion uses scalar fields and no userspace buffer.
@@ -204,7 +215,7 @@ impl CallAudio {
         if r < 0 {
             return Err(r);
         }
-        let pcm = apr::ring_pcm(self.ring.volume);
+        let pcm = neoaudio::tones::pcm(self.ring_tone, self.ring.volume);
         // SAFETY: AUDIO_MEM copy-in reads the live PCM buffer for its stated byte length.
         let (r, _) = unsafe {
             hal_io(
@@ -223,6 +234,7 @@ impl CallAudio {
         self.apr.pcm_phys = info.b;
         self.apr.pcm_generation = info.buf;
         self.ring_loaded = true;
+        self.prepared = Some(want);
         Ok(())
     }
 
@@ -230,6 +242,7 @@ impl CallAudio {
     pub fn pump(&mut self, buf: &mut [u8]) {
         if self.apr.is() == Mode::Off && self.apr.idle() {
             self.ring_loaded = false;
+            self.prepared = None;
         }
         let mut log = |a: core::fmt::Arguments| dprintln!("[audiod] t={}ms {}", time::millis(), a);
         for _ in 0..32 {

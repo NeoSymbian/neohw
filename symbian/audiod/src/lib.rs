@@ -79,6 +79,7 @@ impl Daemon {
         }
         a.test = test;
         a.ring.volume = i.ring_volume;
+        a.ring_tone = i.ring_tone;
         self.intent = i;
     }
 
@@ -106,8 +107,12 @@ impl Daemon {
                 }
             }
         } else {
-            i.ring
+            // a ring stream plays the buffer as it is: only if it holds what MODEMD wants now
+            i.ring && self.audio.prepared == Some((i.ring_tone, i.ring_volume))
         };
+        // a ring wanted while another stream (media, or a ring with another tone: a call during a message's chime)
+        // holds the speaker: let that one go first, then prepare this one
+        let clear_first = i.ring && !i.hold && !ring_ready && self.audio.apr.is() != Mode::Off;
         // NeoAudio's media plays when nothing else needs the speaker; a call, the ringtone or the test preempt it
         let media = self.sound.wants_media(now)
             && match self.audio.prepare_region() {
@@ -118,6 +123,7 @@ impl Daemon {
                 }
             };
         let wanted = match (up && !i.hold, i.call, self.audio.test, ring_ready) {
+            (true, false, _, false) if clear_first => Mode::Off,
             (false, _, _, _) => Mode::Off,
             (true, true, _, _) => Mode::Call,
             (true, false, _, true) => Mode::Ring,
