@@ -28,6 +28,11 @@
 //!   [`tone::FIRST_YOURS`]..=[`tone::LAST`] (AUDIOD plays their files, the built-in ringtone when one is missing). A
 //!   2.7 MODEMD refuses them: the shell sends the built-in tone instead. `settings.bin` keeps the built-in tone in
 //!   their place (a 2.7 MODEMD refuses the whole record otherwise); the shell sends them again after a restart.
+//! - v2.9 (Settings D11): the SIM PIN's protection. [`op::STATUS`] and [`op::NOTIFY`] with arg 2 = [`pin::EXTENDED`]
+//!   write [`Status::EXT_SIZE`] bytes: the 533 of before, then [`Protection`] (the raw PIN state, which PIN, the card's
+//!   epoch); arg 2 = 0 keeps the 533-byte reply. A 2.8 MODEMD writes 533 bytes into the bigger buffer: decode what
+//!   was written ([`Status::decode`]) and offer no PIN change then. [`op::SET_PIN_PROTECTION`] and
+//!   [`op::CHANGE_PIN`] (NEOSET only) complete when the card answered and was read again ([`pin`] results).
 //!
 //! Each op completes with KErrNone or an error: KErrNotReady (-18) without a modem/call to act on, KErrArgument (-6)
 //! for a number it refuses.
@@ -35,7 +40,7 @@
 
 pub const NAME: &str = "NeoModem";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (2, 8, 0);
+pub const VERSION: (i8, i8, i16) = (2, 9, 0);
 
 pub mod op {
     pub const STATUS: i32 = 1;
@@ -90,6 +95,14 @@ pub mod op {
     /// (2.6) arg0 call ID (0 = primary): stop ringing and vibrating for that call only (Silence). The ring settings
     /// stay as they are.
     pub const SILENCE: i32 = 28;
+    // 29-30 are kept for D9's ALERT_POLICY and D4's OWNER_USAGE.
+    /// (2.9, NEOSET only) arg0 des8 the current PIN, arg1 1 = ask for it at start, 0 = don't, arg2 the card epoch and
+    /// arg3 the modem generation of the extended status this session read. Completes once the card answered and was
+    /// read again: 0, or a [`super::pin`] result. Never retried.
+    pub const SET_PIN_PROTECTION: i32 = 31;
+    /// (2.9, NEOSET only) arg0 des8 the current PIN, arg1 des8 the new one (each 4-8 ASCII digits), arg2/arg3 as
+    /// [`SET_PIN_PROTECTION`]. Needs the PIN on and verified.
+    pub const CHANGE_PIN: i32 = 32;
 }
 
 /// SMS (C9): [`SmsEntry::state`], the [`op::SMS_READ`] modes, the [`op::SMS_EDIT`] actions, [`SmsSettings::alert`].
@@ -392,6 +405,69 @@ pub mod sim {
     pub const ERROR: u8 = 3;
     pub const PIN_REQUIRED: u8 = 4;
     pub const BLOCKED: u8 = 5;
+}
+
+/// (2.9) The SIM PIN: [`Protection::state`] and [`Protection::pin_id`] (UIM's own numbers), the opt-in, the results
+/// of [`op::SET_PIN_PROTECTION`] and [`op::CHANGE_PIN`].
+pub mod pin {
+    /// not known (no card, no application, or the card doesn't say)
+    pub const UNKNOWN: u8 = 0;
+    /// on, not entered yet (the start-up prompt)
+    pub const REQUIRED: u8 = 1;
+    /// on and entered
+    pub const VERIFIED: u8 = 2;
+    pub const DISABLED: u8 = 3;
+    /// the PUK is needed
+    pub const BLOCKED: u8 = 4;
+    pub const PERM_BLOCKED: u8 = 5;
+    pub const ID_UNKNOWN: u8 = 0;
+    pub const ID_PIN1: u8 = 1;
+    pub const ID_UPIN: u8 = 3;
+    /// arg 2 of STATUS/NOTIFY for the extended reply
+    pub const EXTENDED: i32 = 1;
+    /// KErrTimedOut: the card's answer was lost (timeout, restart, removal). Read the status; never send it again.
+    pub const RESULT_UNKNOWN: i32 = -33;
+    /// KErrAbort: the card or the modem changed since the status the request names.
+    pub const STALE: i32 = -39;
+    /// The card refused the PIN (QMI 12, -1000 - error as every QMI refusal); 35 blocked, 36 blocked for good.
+    pub const WRONG: i32 = -1012;
+    pub const NOW_BLOCKED: i32 = -1035;
+    pub const NOW_PERM_BLOCKED: i32 = -1036;
+    /// 4 to 8 ASCII digits (leading zeroes count).
+    pub fn valid(pin: &[u8]) -> bool {
+        (4..=8).contains(&pin.len()) && pin.iter().all(u8::is_ascii_digit)
+    }
+}
+
+/// (2.9) The tail of the extended status: schema 1, [`pin`] state, [`pin`] id, a zero byte, the card's epoch (u32
+/// LE, never 0 from a 2.9 MODEMD: it changes whenever the card or its application may have changed).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Protection {
+    pub state: u8,
+    pub pin_id: u8,
+    pub epoch: u32,
+}
+
+impl Protection {
+    pub const SIZE: usize = 8;
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let e = self.epoch.to_le_bytes();
+        [1, self.state, self.pin_id, 0, e[0], e[1], e[2], e[3]]
+    }
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        let b: &[u8; Self::SIZE] = b.try_into().ok()?;
+        let p = Self {
+            state: b[1],
+            pin_id: b[2],
+            epoch: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+        };
+        (b[0] == 1
+            && b[3] == 0
+            && p.state <= pin::PERM_BLOCKED
+            && matches!(p.pin_id, pin::ID_UNKNOWN | pin::ID_PIN1 | pin::ID_UPIN)
+            && p.epoch != 0)
+            .then_some(p)
+    }
 }
 
 /// Manage-calls actions. Answer/end additionally accept arg0 call ID (0 selects primary).
@@ -731,6 +807,8 @@ pub struct Status {
     pub sms_senders: u8,
     /// (2.6) the IMEI (empty until the modem reports it); `*#06#` shows it. Never log it whole.
     pub imei: Text,
+    /// (2.9) only in the extended reply ([`Status::to_ext_bytes`])
+    pub protection: Protection,
 }
 
 /// v2.1's tail: the calls' presentations, the log revision, call waiting, the selected call's presentation.
@@ -743,6 +821,29 @@ const V26: usize = (MAX_CALLS + 1) * 9 + 1 + TEXT;
 
 impl Status {
     pub const SIZE: usize = 110 + MAX_CALLS * 36 + V21 + V23 + V26;
+    /// (2.9) [`Status::SIZE`] then [`Protection`]
+    pub const EXT_SIZE: usize = Self::SIZE + Protection::SIZE;
+
+    pub fn to_ext_bytes(&self) -> [u8; Self::EXT_SIZE] {
+        let mut b = [0u8; Self::EXT_SIZE];
+        b[..Self::SIZE].copy_from_slice(&self.to_bytes());
+        b[Self::SIZE..].copy_from_slice(&self.protection.to_bytes());
+        b
+    }
+
+    /// What a server wrote, by its length: [`Status::SIZE`] bytes (a 2.8 MODEMD, or no opt-in) has no protection;
+    /// [`Status::EXT_SIZE`] has it (or is refused whole). Any other length is refused.
+    pub fn decode(b: &[u8]) -> Option<(Self, Option<Protection>)> {
+        let mut s = Self::from_bytes(b)?;
+        match b.len() {
+            Self::SIZE => Some((s, None)),
+            Self::EXT_SIZE => {
+                s.protection = Protection::from_bytes(&b[Self::SIZE..])?;
+                Some((s, Some(s.protection)))
+            }
+            _ => None,
+        }
+    }
 
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
@@ -898,6 +999,7 @@ impl Status {
             sms_unread: u16::from_le_bytes([b[TAIL + V21 + 4], b[TAIL + V21 + 5]]),
             sms_senders: b[TAIL + V21 + 6],
             imei: text(v26 + (MAX_CALLS + 1) * 9)?,
+            protection: Protection::default(),
         })
     }
 }
@@ -1023,6 +1125,46 @@ mod tests {
         assert_eq!(Status::from_bytes(&b), Some(s));
         assert_eq!(Status::from_bytes(&b[..10]), None);
         assert_eq!(Status::from_bytes(&b[..78]), None);
+    }
+
+    #[test]
+    fn extended_status_keeps_the_old_bytes_and_decodes_by_length() {
+        let s = Status {
+            sim: sim::PRESENT,
+            generation: 7,
+            pin_attempts: 3,
+            protection: Protection {
+                state: pin::VERIFIED,
+                pin_id: pin::ID_UPIN,
+                epoch: 0x0102_0304,
+            },
+            ..Status::default()
+        };
+        let ext = s.to_ext_bytes();
+        assert_eq!(Status::SIZE, 533);
+        assert_eq!(Status::EXT_SIZE, 541);
+        // the old bytes stay where they were: SIM at 1, generation at 82, attempts at 93
+        assert_eq!(&ext[..Status::SIZE], &s.to_bytes()[..]);
+        assert_eq!((ext[1], ext[82], ext[93]), (sim::PRESENT, 7, 3));
+        assert_eq!(&ext[533..], &[1, 2, 3, 0, 4, 3, 2, 1]);
+        assert_eq!(Status::decode(&ext), Some((s, Some(s.protection))));
+        // a 2.8 server's 533 bytes: no protection, so no PIN change
+        let old = Status::decode(&ext[..Status::SIZE]).unwrap();
+        assert_eq!(old.1, None);
+        assert_eq!(old.0.protection, Protection::default());
+        // the legacy decoder ignores the tail; other lengths and bad tails are refused
+        assert_eq!(Status::from_bytes(&ext).map(|s| s.pin_attempts), Some(3));
+        assert!(Status::decode(&ext[..540]).is_none());
+        for (at, v) in [(533, 2), (534, 6), (535, 2), (536, 1)] {
+            let mut bad = ext;
+            bad[at] = v;
+            assert!(Status::decode(&bad).is_none(), "byte {at} = {v}");
+        }
+        let mut zero = ext;
+        zero[537..].fill(0);
+        assert!(Status::decode(&zero).is_none());
+        assert!(pin::valid(b"0000") && pin::valid(b"01234567"));
+        assert!(!pin::valid(b"123") && !pin::valid(b"123456789") && !pin::valid(b"12a4"));
     }
 
     #[test]

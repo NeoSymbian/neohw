@@ -199,7 +199,10 @@ impl Router {
         if self.trace {
             trace(p, ">", &h, payload);
         }
-        if let Err(e) = p.send(dst.0, &qrtr::encode(&h, payload)) {
+        let mut packet = qrtr::encode(&h, payload);
+        let sent = p.send(dst.0, &packet);
+        hub_ipc::wipe(&mut packet); // it may carry a SIM PIN
+        if let Err(e) = sent {
             p.log(format_args!(
                 "qrtr: send type {ty} to {}:{} failed ({e})",
                 dst.0, dst.1 as i32
@@ -961,6 +964,16 @@ fn trace(p: &mut dyn Platform, dir: &str, h: &Header, payload: &[u8]) {
     }
     let confirm = if h.confirm_rx != 0 { " confirm" } else { "" };
     match qmi::Msg::parse(payload) {
+        // a PIN-bearing UIM request: its header only, never its bytes
+        Some(m) if m.ty == qmi::REQUEST && hub_ipc::secret_request(m.id) => p.log(format_args!(
+            "{dir} data {}:{src} -> {}:{dst} {} B qmi type {} id {:#x} txn {}{confirm} (redacted)",
+            h.src_node,
+            h.dst_node,
+            payload.len(),
+            m.ty,
+            m.id,
+            m.txn
+        )),
         Some(m) => p.log(format_args!(
             "{dir} data {}:{src} -> {}:{dst} {} B qmi type {} id {:#x} txn {}{confirm} {}",
             h.src_node,

@@ -859,21 +859,25 @@ impl Service for Daemon {
                     }
                 });
                 match data {
-                    Ok(data) => match hub_ipc::Send::decode(&data) {
-                        Some(send)
-                            if self.clients[i].bindings.iter().any(|b| b.1 == send.port)
-                                && !matches!(self.phase, Phase::Recover { .. }) =>
-                        {
-                            self.router.bus(&mut Hal).send(
-                                send.port,
-                                send.dst,
-                                send.payload,
-                                send.essential,
-                            ) as i32
-                        }
-                        Some(_) => err::KERR_NOT_READY,
-                        None => err::KERR_ARGUMENT,
-                    },
+                    Ok(mut data) => {
+                        let r = match hub_ipc::Send::decode(&data) {
+                            Some(send)
+                                if self.clients[i].bindings.iter().any(|b| b.1 == send.port)
+                                    && !matches!(self.phase, Phase::Recover { .. }) =>
+                            {
+                                self.router.bus(&mut Hal).send(
+                                    send.port,
+                                    send.dst,
+                                    send.payload,
+                                    send.essential,
+                                ) as i32
+                            }
+                            Some(_) => err::KERR_NOT_READY,
+                            None => err::KERR_ARGUMENT,
+                        };
+                        hub_ipc::wipe(&mut data); // it may carry a SIM PIN
+                        r
+                    }
                     Err(e) => e,
                 }
             }

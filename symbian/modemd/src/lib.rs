@@ -59,7 +59,12 @@ struct Daemon {
     audio: audio::Link,
     /// a keypad tone ends here (ms): one tap = one 200 ms tone
     dtmf_stop: Option<u64>,
-    subscribers: Vec<(u32, Message)>,
+    /// NOTIFY requests: session, message, (2.9) extended reply
+    subscribers: Vec<(u32, Message, bool)>,
+    /// (D11) the one SET_PIN_PROTECTION / CHANGE_PIN waiting for the card: its session and message
+    pin_msg: Option<(u32, Message)>,
+    /// (D11) the card epoch and modem generation of the last extended status each session was given
+    seen: Vec<(u32, u32, u32)>,
     next_session: u32,
     published: Status,
     haptic_at: u64,
@@ -112,20 +117,93 @@ impl Daemon {
     }
 
     fn publish(&mut self) {
+        // (D11) a PIN request the card answered (and was read again), or whose answer was lost
+        if let Some(r) = self.modem.as_mut().and_then(|m| m.take_pin_done()) {
+            dprintln!("[modemd] SIM PIN request finished ({})", r);
+            if let Some((_, msg)) = self.pin_msg.take() {
+                msg.complete(r);
+            }
+        }
         let mut next = self.status();
         if next == self.published {
             return;
         }
         next.revision = self.published.revision.wrapping_add(1);
         self.published = next;
-        for (_, msg) in self.subscribers.drain(..) {
-            let r = msg.write8(0, &next.to_bytes(), 0).map_or_else(|e| e, |_| 0);
+        for (session, msg, ext) in core::mem::take(&mut self.subscribers) {
+            let r = self.write_status(session, &msg, &next, ext);
+            msg.complete(r);
+        }
+    }
+
+    /// STATUS/NOTIFY's reply: 533 bytes, or (2.9) with the protection, remembered as seen by that session.
+    fn write_status(&mut self, session: u32, msg: &Message, s: &Status, ext: bool) -> i32 {
+        if !ext {
+            return msg.write8(0, &s.to_bytes(), 0).map_or_else(|e| e, |_| 0);
+        }
+        match msg.write8(0, &s.to_ext_bytes(), 0) {
+            Ok(()) => {
+                self.seen.retain(|(id, ..)| *id != session);
+                self.seen.push((session, s.protection.epoch, s.generation));
+                0
+            }
+            Err(e) => e,
+        }
+    }
+
+    /// (2.9) NOTIFY/STATUS arg 2 asks for the extended reply; its buffer must hold it before anything is queued.
+    fn extended(msg: &Message) -> Result<bool, i32> {
+        if msg.int(2) != modem_ipc::pin::EXTENDED {
+            return Ok(false);
+        }
+        match msg.des_max_len(0) {
+            Ok(n) if n >= Status::EXT_SIZE => Ok(true),
+            Ok(_) => Err(err::KERR_OVERFLOW),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// (D11) SET_PIN_PROTECTION / CHANGE_PIN from NEOSET (checked before this): only against the card and modem
+    /// this session last saw, one at a time, completed when the card has answered. The PINs live in fixed buffers
+    /// that are wiped whatever happens, and are never logged.
+    fn pin_request(&mut self, session: u32, msg: Message) {
+        let (epoch, generation) = (msg.int(2) as u32, msg.int(3) as u32);
+        let r = if self.pin_msg.is_some() {
+            err::KERR_IN_USE
+        } else if !self.seen.contains(&(session, epoch, generation)) {
+            modem_ipc::pin::STALE
+        } else {
+            let (mut old, mut new) = ([0u8; 8], [0u8; 8]);
+            let r = match (msg.function(), read_pin(&msg, 0, &mut old)) {
+                (_, Err(e)) => e,
+                (op::SET_PIN_PROTECTION, Ok(n)) => self.modem.as_mut().map_or(NOT_READY, |m| {
+                    m.pin_protection(&mut Hal, &old[..n], msg.int(1) != 0, epoch, generation)
+                        .err()
+                        .unwrap_or(0)
+                }),
+                (_, Ok(n)) => match read_pin(&msg, 1, &mut new) {
+                    Err(e) => e,
+                    Ok(k) => self.modem.as_mut().map_or(NOT_READY, |m| {
+                        m.change_pin(&mut Hal, &old[..n], &new[..k], epoch, generation)
+                            .err()
+                            .unwrap_or(0)
+                    }),
+                },
+            };
+            hub_ipc::wipe(&mut old);
+            hub_ipc::wipe(&mut new);
+            r
+        };
+        dprintln!("[modemd] SIM PIN request {} -> {}", msg.function(), r);
+        if r == 0 {
+            self.pin_msg = Some((session, msg));
+        } else {
             msg.complete(r);
         }
     }
 
     fn cancel_notify(&mut self, id: u32) {
-        if let Some(i) = self.subscribers.iter().position(|(s, _)| *s == id) {
+        if let Some(i) = self.subscribers.iter().position(|(s, ..)| *s == id) {
             self.subscribers.remove(i).1.complete(-3);
         }
     }
@@ -678,6 +756,11 @@ impl Service for Daemon {
             }
             _ => None,
         };
+        // (D11) the SIM PIN's protection and a new PIN: NEOSET only, checked before either PIN is read
+        let bulk = match msg.function() {
+            op::SET_PIN_PROTECTION | op::CHANGE_PIN => Some(&[NEOSET_SID][..]),
+            _ => bulk,
+        };
         if let Some(allowed) = bulk
             && !allowed.contains(&msg.client_sid())
         {
@@ -690,17 +773,23 @@ impl Service for Daemon {
             return;
         }
         if msg.function() == op::NOTIFY {
-            if self.subscribers.iter().any(|(s, _)| s == session) || self.subscribers.len() >= 16 {
+            if self.subscribers.iter().any(|(s, ..)| s == session) || self.subscribers.len() >= 16 {
                 msg.complete(err::KERR_IN_USE);
                 return;
             }
+            let ext = match Self::extended(&msg) {
+                Ok(ext) => ext,
+                Err(e) => {
+                    msg.complete(e);
+                    return;
+                }
+            };
             if msg.int(1) as u32 == self.published.revision {
-                self.subscribers.push((*session, msg));
+                self.subscribers.push((*session, msg, ext));
                 return;
             }
-            let r = msg
-                .write8(0, &self.published.to_bytes(), 0)
-                .map_or_else(|e| e, |_| 0);
+            let published = self.published;
+            let r = self.write_status(*session, &msg, &published, ext);
             msg.complete(r);
             return;
         }
@@ -731,6 +820,10 @@ impl Service for Daemon {
             msg.complete(NOT_READY);
             return;
         }
+        if matches!(msg.function(), op::SET_PIN_PROTECTION | op::CHANGE_PIN) {
+            self.pin_request(*session, msg);
+            return;
+        }
         let target = msg.int(0);
         if matches!(msg.function(), op::ANSWER | op::HANGUP | op::SILENCE)
             && !(0..=255).contains(&target)
@@ -740,9 +833,13 @@ impl Service for Daemon {
         }
 
         let r = match msg.function() {
-            op::STATUS => msg
-                .write8(0, &self.status().to_bytes(), 0)
-                .map_or_else(|e| e, |_| err::KERR_NONE),
+            op::STATUS => match Self::extended(&msg) {
+                Ok(ext) => {
+                    let s = self.status();
+                    self.write_status(*session, &msg, &s, ext)
+                }
+                Err(e) => e,
+            },
             op::DIAL => {
                 let read = msg.des_len(0).and_then(|n| {
                     if n <= 32 {
@@ -1087,7 +1184,22 @@ impl Service for Daemon {
 
     fn disconnect(&mut self, session: u32) -> ControlFlow<()> {
         self.cancel_notify(session);
+        self.seen.retain(|(id, ..)| *id != session);
+        // the card may still answer; until then no other PIN request starts (Cellular keeps it)
+        if self.pin_msg.as_ref().is_some_and(|(id, _)| *id == session)
+            && let Some((_, msg)) = self.pin_msg.take()
+        {
+            msg.complete(err::KERR_CANCEL);
+        }
         ControlFlow::Continue(())
+    }
+}
+
+/// A PIN from descriptor `slot` into `buf`: 4-8 bytes (the digits are checked by Cellular), nothing else read.
+fn read_pin(msg: &Message, slot: usize, buf: &mut [u8; 8]) -> Result<usize, i32> {
+    match msg.des_len(slot)? {
+        n @ 4..=8 => msg.read8(slot, &mut buf[..n], 0),
+        _ => Err(err::KERR_ARGUMENT),
     }
 }
 
@@ -1156,6 +1268,8 @@ fn main() -> i32 {
         audio: audio::Link::new(),
         dtmf_stop: None,
         subscribers: Vec::new(),
+        pin_msg: None,
+        seen: Vec::new(),
         next_session: 0,
         published: Status::default(),
         haptic_at: 0,

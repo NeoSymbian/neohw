@@ -13,6 +13,21 @@ pub use queue::SessionQueue;
 #[cfg(test)]
 mod tests;
 
+/// Zero a buffer that held a secret (a SIM PIN in a QMI request) so the write isn't optimised away before it is
+/// freed. Every copy MODEMD, HWHUB and QRTR make of an outbound packet is wiped this way after sending.
+pub fn wipe(b: &mut [u8]) {
+    for x in b.iter_mut() {
+        // SAFETY: `x` is a valid, aligned, exclusive reference.
+        unsafe { core::ptr::write_volatile(x, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// QMI UIM requests that carry a PIN (Set PIN Protection, Verify, Unblock, Change): never dumped in a trace.
+pub fn secret_request(qmi_id: u16) -> bool {
+    matches!(qmi_id, 0x25..=0x28)
+}
+
 /// A discovered QRTR server; instance packs version in the low byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Server {
