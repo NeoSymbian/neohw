@@ -654,7 +654,8 @@ impl Cellular {
             let pdus = self.sms.retry(id).ok_or(KERR_NOT_READY)?;
             self.sms_out.push((id, pdus, 0));
             self.send_next_sms(p);
-        } else if !self.sms.edit(action, id) {
+        } else if !self.sms.edit(action, id) && action != modem_ipc::sms::EDIT_DELETE_ALL {
+            // (deleting everything from an empty store is done, not refused: Settings' Clear data twice)
             return Err(KERR_NOT_READY);
         }
         self.sms_status();

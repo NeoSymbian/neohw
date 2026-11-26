@@ -277,4 +277,11 @@ mod tests {
         assert_eq!(s.names().collect::<Vec<_>>(), [&b"b"[..]]);
         assert_eq!(s.pmk(b"a"), None);
     }
+
+    #[test]
+    fn no_networks_is_a_valid_empty_file() {
+        // RESET writes this: an empty but present wifi.dat, which loads as no networks (and so never migrates)
+        assert!(Saved::default().encode().is_empty());
+        assert_eq!(Saved::decode(&[]), Saved::default());
+    }
 }

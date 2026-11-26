@@ -37,6 +37,9 @@ const SAVED: &str = "C:\\private\\e0004002\\wifi.dat";
 const LEFT: &str = "C:\\private\\e0004002\\left.dat";
 /// where SYSSTART kept them before S5 (read once, if ours is missing)
 const OLD_SAVED: &str = "C:\\private\\e0002001\\wifi.dat";
+/// SYSSTART (the shell) and NEOSET (the Settings app): the only ones that may forget networks.
+const SYSSTART_SID: u32 = 0xE000_2001;
+const NEOSET_SID: u32 = 0xE000_2007;
 /// A remembered network seen while nothing is joined is tried again after this long; and the background scan's period
 const RETRY_MS: u64 = 60_000;
 /// A 4-way handshake takes well under a second; give up after this. An AP that keeps resending message 1 without a
@@ -210,6 +213,38 @@ impl Daemon {
         }
     }
 
+    /// RESET: leave whatever is joined, then forget every network and the left one. `wifi.dat` is written empty (not
+    /// deleted) and SYSSTART's old file goes, so no move can bring a network back; RAM changes only once both files
+    /// are saved, and an error is returned (the shell doesn't restart then).
+    fn reset(&mut self) -> i32 {
+        self.stop();
+        let _ = hal::leave(); // the networks go even when there is no radio to leave
+        self.next_link = 0;
+        let none = Saved::default();
+        if let Err(e) = store(&none) {
+            return e;
+        }
+        self.saved = none;
+        // left.dat is written even when RAM already has none: an earlier failed write may have left a name there
+        if let Err(e) = sys::save_private("C:\\private\\e0004002\\", "left.dat", &[]) {
+            dprintln!("[wifid] reset: clearing the left network failed ({})", e);
+            return e;
+        }
+        self.left = None;
+        match Fs::connect().and_then(|fs| fs.delete(OLD_SAVED)) {
+            Ok(()) | Err(err::KERR_NOT_FOUND) | Err(err::KERR_PATH_NOT_FOUND) => {}
+            Err(e) => {
+                dprintln!(
+                    "[wifid] reset: removing SYSSTART's old networks failed ({})",
+                    e
+                );
+                return e;
+            }
+        }
+        dprintln!("[wifid] reset: every network forgotten");
+        err::KERR_NONE
+    }
+
     /// The joined network's SSID: the join's, else the scan entry of the linked BSSID.
     fn joined_ssid(&self) -> Option<Vec<u8>> {
         if let Some((_, ssid, ..)) = &self.join {
@@ -335,6 +370,17 @@ impl Service for Daemon {
 
     fn message(&mut self, _session: &mut u32, msg: Message) {
         let now = time::millis();
+        // forgetting networks is the shell's (Reset network settings) and the Settings app's (Saved networks) only
+        if matches!(msg.function(), op::RESET | op::FORGET)
+            && !matches!(msg.client_sid(), SYSSTART_SID | NEOSET_SID)
+        {
+            dprintln!(
+                "[wifid] {} refused to {:08x}",
+                msg.function(),
+                msg.client_sid()
+            );
+            return msg.complete(err::KERR_PERMISSION_DENIED);
+        }
         let r = match msg.function() {
             op::SCAN => {
                 let mut b = vec![0u8; wifi::kernel::SCAN_SIZE];
@@ -403,6 +449,7 @@ impl Service for Daemon {
                     Err(e) => e,
                 }
             }
+            op::RESET => self.reset(),
             op::RADIO => {
                 self.radio_on = msg.int(0) != 0;
                 if !self.radio_on {
@@ -548,6 +595,14 @@ fn main() -> i32 {
     // the networks SYSSTART remembered before S5 move here once
     let saved = match sys::load_private(SAVED, 1024) {
         Ok(b) => Saved::decode(&b),
+        // only when there is no file at all: a read error must not bring back networks a reset forgot
+        Err(e) if e != err::KERR_NOT_FOUND && e != err::KERR_PATH_NOT_FOUND => {
+            dprintln!(
+                "[wifid] the saved networks can't be read ({}): none for now",
+                e
+            );
+            Saved::default()
+        }
         Err(_) => {
             let old = read(OLD_SAVED)
                 .map(|b| Saved::decode(&b))
