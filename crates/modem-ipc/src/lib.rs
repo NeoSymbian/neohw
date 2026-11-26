@@ -31,7 +31,7 @@
 
 pub const NAME: &str = "NeoModem";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (2, 6, 0);
+pub const VERSION: (i8, i8, i16) = (2, 7, 0);
 
 pub mod op {
     pub const STATUS: i32 = 1;
@@ -52,7 +52,8 @@ pub mod op {
     pub const AIRPLANE: i32 = 13;
     /// arg0 ASCII PIN descriptor. Never persisted or logged.
     pub const VERIFY_PIN: i32 = 14;
-    /// arg0 volume 0..10, arg1 silent, arg2 vibration.
+    /// arg0 volume 0..10, arg1 silent, arg2 vibration; (2.7) arg3 the tones ([`super::tone::pack`]): only when
+    /// [`super::tone::PRESENT`] is set, so a caller that sends three arguments leaves the tones as they are.
     pub const RING_SETTINGS: i32 = 15;
     pub const RETRY: i32 = 16;
     /// arg0 writable des8 for up to MAX_LOG LogEntry records, newest first.
@@ -416,6 +417,113 @@ impl Calls {
     }
 }
 
+/// (2.7, Settings SE2b) The ring's tones, NeoAudio's `tones` ids: a call's ringtone and a message's tone.
+pub mod tone {
+    pub const BUILT_IN: u8 = 0;
+    pub const BEEP: u8 = 1;
+    pub const TWO_BEEPS: u8 = 2;
+    /// no sound: the call vibrates (if vibrate is on), a message buzzes
+    pub const NONE: u8 = 3;
+    /// [`super::op::RING_SETTINGS`]' arg3 carries tones (bit 8); without it MODEMD keeps the ones it has.
+    pub const PRESENT: i32 = 0x100;
+
+    /// arg3 for these tones.
+    #[must_use]
+    pub fn pack(ring: u8, message: u8) -> i32 {
+        PRESENT | i32::from(ring & 0xf) | i32::from(message & 0xf) << 4
+    }
+
+    /// The tones after a [`super::op::RING_SETTINGS`] with this arg3: the new ones, or `current` when it carries none.
+    ///
+    /// # Errors
+    /// [`Unknown`] as [`unpack`].
+    pub fn apply(current: (u8, u8), arg: i32) -> Result<(u8, u8), Unknown> {
+        Ok(unpack(arg)?.unwrap_or(current))
+    }
+
+    /// An arg3 with a tone this MODEMD doesn't know.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Unknown;
+
+    /// The tones in arg3: `Ok(None)` when it carries none (an older caller).
+    ///
+    /// # Errors
+    /// [`Unknown`] for a tone above [`NONE`] or stray bits.
+    pub fn unpack(arg: i32) -> Result<Option<(u8, u8)>, Unknown> {
+        if arg & PRESENT == 0 {
+            return Ok(None);
+        }
+        let (ring, message) = ((arg & 0xf) as u8, (arg >> 4 & 0xf) as u8);
+        if ring > NONE || message > NONE || arg & !0x1ff != 0 {
+            return Err(Unknown);
+        }
+        Ok(Some((ring, message)))
+    }
+}
+
+/// MODEMD's `settings.bin`: C7 (airplane, the ring), C8 (+ caller ID, the log's days), C9 (+ the tones, SE2b).
+pub mod saved {
+    use super::Ring;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Saved {
+        pub airplane: bool,
+        pub ring: Ring,
+        /// C8 on: caller ID (0..=2) and the call log's days; `None` from a C7 file
+        pub c8: Option<(u8, u8)>,
+        /// C9 on: the ringtone and the message tone; `None` before
+        pub tones: Option<(u8, u8)>,
+    }
+
+    /// The C9 record.
+    #[must_use]
+    pub fn encode(s: &Saved) -> [u8; 10] {
+        let (clir, days) = s.c8.unwrap_or((0, 30));
+        let (ring, message) = s.tones.unwrap_or((0, 0));
+        [
+            b'C',
+            b'9',
+            1,
+            u8::from(s.airplane),
+            s.ring.volume,
+            u8::from(s.ring.silent),
+            u8::from(s.ring.vibrate),
+            clir,
+            days,
+            ring | message << 4,
+        ]
+    }
+
+    /// A C7, C8 or C9 record; `None` if it is none of them, or damaged.
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Saved> {
+        let (kind, n) = match b.get(..3)? {
+            [b'C', b'7', 1] => (7, 7),
+            [b'C', b'8', 1] => (8, 9),
+            [b'C', b'9', 1] => (9, 10),
+            _ => return None,
+        };
+        if b.len() != n || b[4] > 10 || (kind >= 8 && b[7] > 2) {
+            return None;
+        }
+        let tones = if kind == 9 {
+            Some(super::tone::unpack(super::tone::PRESENT | i32::from(b[9])).ok()??)
+        } else {
+            None
+        };
+        Some(Saved {
+            airplane: b[3] != 0,
+            ring: Ring {
+                volume: b[4],
+                silent: b[5] != 0,
+                vibrate: b[6] != 0,
+            },
+            c8: (kind >= 8).then(|| (b[7], b[8])),
+            tones,
+        })
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Ring {
     pub volume: u8,
@@ -739,6 +847,59 @@ impl Status {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn settings_bin_reads_c7_c8_and_c9() {
+        use super::saved::*;
+        let s = Saved {
+            airplane: true,
+            ring: super::Ring {
+                volume: 4,
+                silent: false,
+                vibrate: true,
+            },
+            c8: Some((2, 90)),
+            tones: Some((super::tone::TWO_BEEPS, super::tone::NONE)),
+        };
+        assert_eq!(decode(&encode(&s)), Some(s));
+        // an older file: C8 and C7 still load, without the tones
+        let c8 = [b'C', b'8', 1, 0, 7, 1, 0, 1, 30];
+        let d = decode(&c8).unwrap();
+        assert_eq!((d.tones, d.c8, d.ring.silent), (None, Some((1, 30)), true));
+        let c7 = [b'C', b'7', 1, 1, 10, 0, 1];
+        assert_eq!(decode(&c7).unwrap().c8, None);
+        // damaged: a tone over NONE, a volume over 10, a wrong length
+        let mut bad = encode(&s);
+        bad[9] = 4;
+        assert_eq!(decode(&bad), None);
+        assert_eq!(decode(&[b'C', b'9', 1, 0, 11, 0, 0, 0, 30, 0]), None);
+        assert_eq!(decode(&encode(&s)[..9]), None);
+    }
+
+    #[test]
+    fn a_three_argument_call_keeps_the_tones() {
+        use super::tone::*;
+        let set = apply((BUILT_IN, BUILT_IN), pack(BEEP, TWO_BEEPS)).unwrap();
+        assert_eq!(set, (BEEP, TWO_BEEPS));
+        // NEOPHONE's and an older shell's RING_SETTINGS: arg3 = 0
+        assert_eq!(apply(set, 0), Ok(set));
+        assert_eq!(apply(set, PRESENT | 9), Err(Unknown));
+    }
+
+    #[test]
+    fn tones_only_when_present() {
+        use super::tone::*;
+        // a three-argument caller (arg3 = 0) carries no tones: MODEMD keeps its own
+        assert_eq!(unpack(0), Ok(None));
+        assert_eq!(unpack(pack(TWO_BEEPS, NONE)), Ok(Some((TWO_BEEPS, NONE))));
+        assert_eq!(
+            unpack(pack(BUILT_IN, BUILT_IN)),
+            Ok(Some((BUILT_IN, BUILT_IN)))
+        );
+        assert_eq!(unpack(PRESENT | 4), Err(Unknown));
+        assert_eq!(unpack(PRESENT | 4 << 4), Err(Unknown));
+        assert_eq!(unpack(PRESENT | 0x200), Err(Unknown));
+    }
+
     use super::*;
 
     #[test]

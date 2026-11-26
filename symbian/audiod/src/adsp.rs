@@ -6,6 +6,9 @@ use apr::Mode;
 use e32::{dprintln, time};
 use sys::{AUDIO, AUDIO_MEM, CHAN_RECV, CHAN_SEND, Io, hal_io};
 
+// the ring's PCM fills exactly the ADSP's ring buffer
+const _: () = assert!(neoaudio::tones::BYTES == apr::RING_BYTES);
+
 pub const RING_APR: u32 = 2;
 
 /// One message from kernel ring `ring` into `buf`: its length, or None when the ring is empty.
@@ -82,6 +85,8 @@ pub struct CallAudio {
     pub volume: u8,
     pub test: Option<bool>,
     pub ring: modem_ipc::Ring,
+    /// (SE2b) the tone the next ring prepares (`neoaudio::tones`)
+    pub ring_tone: u8,
     ring_loaded: bool,
     /// NeoAudio's media: the kernel route (0 earpiece, 1 both amps, 2 bottom) and amp volume 0..=10
     pub media_route: u32,
@@ -103,6 +108,7 @@ impl CallAudio {
             volume: 10,
             test: None,
             ring: Default::default(),
+            ring_tone: neoaudio::tones::BUILT_IN,
             ring_loaded: false,
             media_route: 1,
             media_volume: 7,
@@ -204,7 +210,7 @@ impl CallAudio {
         if r < 0 {
             return Err(r);
         }
-        let pcm = apr::ring_pcm(self.ring.volume);
+        let pcm = neoaudio::tones::pcm(self.ring_tone, self.ring.volume);
         // SAFETY: AUDIO_MEM copy-in reads the live PCM buffer for its stated byte length.
         let (r, _) = unsafe {
             hal_io(

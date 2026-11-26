@@ -79,6 +79,7 @@ impl Daemon {
         }
         a.test = test;
         a.ring.volume = i.ring_volume;
+        a.ring_tone = i.ring_tone;
         self.intent = i;
     }
 

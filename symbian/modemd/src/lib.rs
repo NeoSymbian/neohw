@@ -39,6 +39,9 @@ enum Phase {
 
 struct Daemon {
     phase: Phase,
+    /// (SE2b) the ringtone and the message tone (`modem_ipc::tone`); RING_SETTINGS changes them only when it carries
+    /// them, saved with the ring settings
+    tones: (u8, u8),
     modem: Option<Modem>,
     /// before the modem exists (booting / failed)
     status: Status,
@@ -303,21 +306,14 @@ impl Daemon {
             .modem
             .as_ref()
             .map_or((0, 30), |m| (m.clir as u8, m.log.days));
-        save_private(
-            "C:\\private\\e0003001\\",
-            "settings.bin",
-            &[
-                b'C',
-                b'8',
-                1,
-                s.airplane as u8,
-                s.ring.volume,
-                s.ring.silent as u8,
-                s.ring.vibrate as u8,
-                clir,
-                days,
-            ],
-        )
+        // C9 (SE2b): C8 and the tones; written aside and renamed, so a cut mid-save keeps the last good file
+        let record = modem_ipc::saved::encode(&modem_ipc::saved::Saved {
+            airplane: s.airplane,
+            ring: s.ring,
+            c8: Some((clir, days)),
+            tones: Some(self.tones),
+        });
+        sys::replace_private("C:\\private\\e0003001\\", "settings.bin", &record)
     }
 
     /// calls.db, when the log changed (C8).
@@ -559,16 +555,21 @@ impl Daemon {
         if talking {
             self.audio.intent.test = 0;
         }
-        // the message tone is the start of the ringtone, cut short; AUDIOD prepares and plays it
-        let i = &mut self.audio.intent;
-        i.hold = false;
-        i.call = talking;
-        i.ring = (ringing
+        // the message tone is a tone's start, cut short; AUDIOD prepares and plays it. A tone of NONE: no sound (a
+        // call still vibrates, a message still buzzes)
+        let (ring_tone, message_tone) = self.tones;
+        let ring_sound = ringing
             && !talking
             && !modem.status.airplane
             && !modem.status.ring.silent
-            && modem.status.ring.volume > 0)
-            || chime;
+            && modem.status.ring.volume > 0
+            && ring_tone != modem_ipc::tone::NONE;
+        let chime = chime && message_tone != modem_ipc::tone::NONE;
+        let i = &mut self.audio.intent;
+        i.hold = false;
+        i.call = talking;
+        i.ring = ring_sound || chime;
+        i.ring_tone = if ring_sound { ring_tone } else { message_tone };
         i.ring_volume = modem.status.ring.volume;
         let e = self.audio.report.ring_error;
         if e != self.ring_error {
@@ -785,11 +786,18 @@ impl Service for Daemon {
                         silent: msg.int(1) != 0,
                         vibrate: msg.int(2) != 0,
                     };
-                    self.status.ring = ring;
-                    if let Some(m) = &mut self.modem {
-                        m.status.ring = ring;
+                    // an older caller (three arguments: NEOPHONE, a 1.x shell) leaves the tones as they are
+                    match modem_ipc::tone::apply(self.tones, msg.int(3)) {
+                        Err(_) => err::KERR_ARGUMENT,
+                        Ok(tones) => {
+                            self.tones = tones;
+                            self.status.ring = ring;
+                            if let Some(m) = &mut self.modem {
+                                m.status.ring = ring;
+                            }
+                            self.save_settings().err().unwrap_or(0)
+                        }
                     }
-                    self.save_settings().err().unwrap_or(0)
                 }
             }
             op::RETRY => {
@@ -1066,31 +1074,25 @@ fn main() -> i32 {
         waiting_alert: None,
         haptic_error: 0,
         sms_tone_until: 0,
+        tones: (modem_ipc::tone::BUILT_IN, modem_ipc::tone::BUILT_IN),
         sms_buzz_at: 0,
         ring_error: 0,
     };
     // Ordinary C: settings only; modem EFS remains RAM-backed (G4).
     if let Ok(fs) = e32::fs::Fs::connect() {
-        if let Ok(f) = e32::fs::File::open(
-            &fs,
-            "C:\\private\\e0003001\\settings.bin",
-            e32::fs::mode::READ | e32::fs::mode::SHARE_READERS_ONLY,
-        ) {
-            let mut b = [0; 9];
-            let n = f.read_at(0, &mut b).unwrap_or(0);
-            let c7 = n == 7 && b[..3] == [b'C', b'7', 1];
-            let c8 = n == 9 && b[..3] == [b'C', b'8', 1] && b[7] <= 2;
-            if (c7 || c8) && b[4] <= 10 {
-                d.status.airplane = b[3] != 0;
-                d.status.ring = modem_ipc::Ring {
-                    volume: b[4],
-                    silent: b[5] != 0,
-                    vibrate: b[6] != 0,
-                };
+        // C7, C8 or C9 (and the `.new` a cut mid-save left, sys::load_private)
+        if let Some(saved) = sys::load_private("C:\\private\\e0003001\\settings.bin", 16)
+            .ok()
+            .and_then(|v| modem_ipc::saved::decode(&v))
+        {
+            d.status.airplane = saved.airplane;
+            d.status.ring = saved.ring;
+            if let Some(t) = saved.tones {
+                d.tones = t;
             }
-            if c8 && let Some(m) = &mut d.modem {
-                m.clir = i32::from(b[7]);
-                m.log.days = b[8];
+            if let (Some((clir, days)), Some(m)) = (saved.c8, &mut d.modem) {
+                m.clir = i32::from(clir);
+                m.log.days = days;
             }
         }
         // the call log (C8): a missing or unreadable calls.db starts an empty one

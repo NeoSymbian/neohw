@@ -73,6 +73,9 @@ pub mod control {
         pub hold: bool,
         /// counts MODEMD's resets (recovery, a lost hub): a new value stops everything first
         pub epoch: u32,
+        /// (SE2b) which tone the ring plays ([`crate::tones`]): a call's ringtone, or a message's tone. Byte 8, once a
+        /// spare that was always 0, so an older sender means [`crate::tones::BUILT_IN`].
+        pub ring_tone: u8,
     }
 
     impl Intent {
@@ -94,7 +97,7 @@ pub mod control {
                 e[1],
                 e[2],
                 e[3],
-                0,
+                self.ring_tone,
                 0,
                 0,
                 0,
@@ -102,7 +105,7 @@ pub mod control {
         }
         pub fn from_bytes(b: &[u8]) -> Option<Self> {
             let b: &[u8; Self::SIZE] = b.try_into().ok()?;
-            if b[0] & !63 != 0 || b[1] > 10 || b[2] > 2 || b[3] > 10 {
+            if b[0] & !63 != 0 || b[1] > 10 || b[2] > 2 || b[3] > 10 || b[8] > crate::tones::NONE {
                 return None;
             }
             Some(Self {
@@ -116,6 +119,7 @@ pub mod control {
                 test: b[2],
                 volume: b[3],
                 epoch: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                ring_tone: b[8],
             })
         }
     }
@@ -160,6 +164,182 @@ pub mod control {
                 ring_error: i32::from_le_bytes([b[4], b[5], b[6], b[7]]),
                 epoch: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
             })
+        }
+    }
+}
+
+/// The ring's tones (SE2b, docs neoui-shell/settings.md "SE2 plan"): the PCM AUDIOD loops while a call rings (and
+/// plays cut short for a message), and what Settings previews. 48 kHz mono s16le, [`BYTES`] long: the loop's period.
+pub mod tones {
+    use alloc::vec::Vec;
+
+    /// The arpeggio the phone has always rung with.
+    pub const BUILT_IN: u8 = 0;
+    /// One short beep each period.
+    pub const BEEP: u8 = 1;
+    /// Two short beeps each period.
+    pub const TWO_BEEPS: u8 = 2;
+    /// No sound (the ring vibrates only, if vibrate is on).
+    pub const NONE: u8 = 3;
+    /// One period of the loop: 2 s at 48 kHz, 16-bit mono (AUDIOD's ring buffer, `apr::RING_BYTES`).
+    pub const BYTES: usize = 192_000;
+    pub const RATE: u32 = 48_000;
+    const RATE_F: f32 = 48_000.0;
+
+    /// One period of `tone` at `volume` (0..=10): silence for [`NONE`] or volume 0.
+    #[must_use]
+    pub fn pcm(tone: u8, volume: u8) -> Vec<u8> {
+        // (start s, Hz, level) per note
+        const ARPEGGIO: [(f32, f32, f32); 6] = [
+            (0.00, 659.26, 1.0),
+            (0.16, 830.61, 0.9),
+            (0.32, 987.77, 0.85),
+            (0.48, 1318.51, 0.8),
+            (0.80, 987.77, 0.55),
+            (0.96, 830.61, 0.45),
+        ];
+        const BEEP_ONE: [(f32, f32, f32); 1] = [(0.0, 880.0, 1.0)];
+        const BEEP_TWO: [(f32, f32, f32); 2] = [(0.0, 880.0, 1.0), (0.22, 880.0, 1.0)];
+        // the notes and how long each rings (s)
+        let (notes, ring_s): (&[(f32, f32, f32)], f32) = match tone {
+            BUILT_IN => (&ARPEGGIO, 0.32),
+            BEEP => (&BEEP_ONE, 0.06),
+            TWO_BEEPS => (&BEEP_TWO, 0.05),
+            _ => (&[], 0.0),
+        };
+        let n = BYTES / 2;
+        let mut mix = alloc::vec![0f32; n];
+        for &(start, hz, level) in notes {
+            for (harmonic, part) in [(1.0f32, 1.0f32), (2.0, 0.22), (3.0, 0.07)] {
+                let w = 2.0 * core::f32::consts::PI * hz * harmonic / RATE_F;
+                // sin(n w) by the recurrence s[n] = 2 cos(w) s[n-1] - s[n-2]; cos from its series (w < 0.6)
+                let w2 = w * w;
+                let k = 2.0 * (1.0 - w2 / 2.0 + w2 * w2 / 24.0 - w2 * w2 * w2 / 720.0);
+                let (mut s1, mut s2) = (0.0f32, -sin_small(w));
+                let first = (start * RATE_F) as usize;
+                // decay: higher partials die sooner, like a struck bar
+                let decay = 1.0 - 1.0 / (RATE_F * ring_s / harmonic);
+                let mut env = level * part;
+                for (i, out) in mix.iter_mut().enumerate().skip(first) {
+                    let s0 = k * s1 - s2;
+                    s2 = s1;
+                    s1 = s0;
+                    let attack = ((i - first) as f32 / (0.004 * RATE_F)).min(1.0);
+                    *out += s0 * env * attack;
+                    env *= decay;
+                    if env < 1e-4 {
+                        break;
+                    }
+                }
+            }
+        }
+        // a 20 ms fade at the loop's end so the repeat never clicks
+        let fade = (0.02 * RATE_F) as usize;
+        let peak = 11_000.0 * f32::from(volume.min(10)) / 10.0;
+        let mut b = Vec::with_capacity(BYTES);
+        for (i, v) in mix.iter().enumerate() {
+            let tail = ((n - i) as f32 / fade as f32).min(1.0);
+            // the arpeggio's overlaps reach about 1.6: keep the sum under `peak`
+            let x = (v / 1.7).clamp(-1.0, 1.0) * peak * tail;
+            b.extend_from_slice(&(x as i16).to_le_bytes());
+        }
+        b
+    }
+
+    /// sin(x) for |x| < 1 (Taylor to x^7).
+    fn sin_small(x: f32) -> f32 {
+        let x2 = x * x;
+        x * (1.0 - x2 / 6.0 * (1.0 - x2 / 20.0 * (1.0 - x2 / 42.0)))
+    }
+
+    /// The tone's name, as Settings lists it.
+    #[must_use]
+    pub fn name(tone: u8) -> &'static str {
+        match tone {
+            BUILT_IN => "Built-in ringtone",
+            BEEP => "Beep",
+            TWO_BEEPS => "Two beeps",
+            _ => "None",
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn samples(b: &[u8]) -> Vec<i16> {
+            b.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| i16::from_le_bytes(*c))
+                .collect()
+        }
+
+        #[test]
+        fn every_tone_fills_one_period_and_scales_with_volume() {
+            for tone in [BUILT_IN, BEEP, TWO_BEEPS, NONE] {
+                let loud = samples(&pcm(tone, 10));
+                assert_eq!(loud.len() * 2, BYTES);
+                assert!(samples(&pcm(tone, 0)).iter().all(|&x| x == 0));
+                let peak = loud.iter().map(|x| x.unsigned_abs()).max().unwrap();
+                let quiet = samples(&pcm(tone, 3))
+                    .iter()
+                    .map(|x| x.unsigned_abs())
+                    .max()
+                    .unwrap();
+                if tone == NONE {
+                    assert_eq!(peak, 0);
+                } else {
+                    assert!(peak > 2000 && peak <= 11_000, "{tone}: {peak}");
+                    assert!(quiet < peak);
+                }
+                // the loop's ends are quiet: no click on the repeat
+                assert!(loud[0].abs() < 200 && loud[loud.len() - 1].abs() < 200);
+            }
+        }
+
+        #[test]
+        fn builtin_pcm_is_bounded_and_silent_at_zero() {
+            assert_eq!(pcm(BUILT_IN, 0), alloc::vec![0; BYTES]);
+            let b = pcm(BUILT_IN, 10);
+            assert_eq!(b.len(), BYTES);
+            assert!(
+                b.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|s| i16::from_le_bytes(*s))
+                    .all(|s| s.abs() <= 12_000)
+            );
+            let pcm: Vec<i16> = b
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|s| i16::from_le_bytes(*s))
+                .collect();
+            // loud enough to hear, clickless at both ends of the loop
+            assert!(pcm.iter().map(|s| s.abs()).max().unwrap() > 6_000);
+            assert!(pcm[0].abs() < 200 && pcm[BYTES / 2 - 1].abs() < 200);
+            // the first note is E5: about 2 * 659 zero crossings a second (in its first 0.1 s, before G#5)
+            let crossings = pcm[..4_800]
+                .windows(2)
+                .filter(|w| (w[0] < 0) != (w[1] < 0))
+                .count();
+            assert!((120..=145).contains(&crossings), "{crossings}");
+        }
+
+        #[test]
+        fn beeps_are_short_and_two_is_two() {
+            // sound in 10 ms windows: the beeps leave most of the period silent
+            let active = |tone| {
+                samples(&pcm(tone, 10))
+                    .chunks(480)
+                    .filter(|w| w.iter().any(|x| x.unsigned_abs() > 300))
+                    .count()
+            };
+            let (one, two) = (active(BEEP), active(TWO_BEEPS));
+            assert!(one > 3 && one < 40, "{one}");
+            assert!(two > one && two < 60, "{two}");
+            assert!(active(BUILT_IN) > two);
         }
     }
 }
@@ -528,12 +708,22 @@ mod tests {
             volume: 10,
             hold: true,
             epoch: 0x0102_0304,
+            ring_tone: crate::tones::TWO_BEEPS,
         };
         assert_eq!(Intent::from_bytes(&i.to_bytes()), Some(i));
         assert_eq!(Intent::from_bytes(&i.to_bytes()[..11]), None);
         let mut bad = i.to_bytes();
         bad[2] = 3;
         assert_eq!(Intent::from_bytes(&bad), None);
+        // byte 8 was a spare: an older sender's 0 is the built-in tone, more than NONE is refused
+        let mut old = i.to_bytes();
+        old[8] = 0;
+        assert_eq!(
+            Intent::from_bytes(&old).unwrap().ring_tone,
+            crate::tones::BUILT_IN
+        );
+        old[8] = crate::tones::NONE + 1;
+        assert_eq!(Intent::from_bytes(&old), None);
         let r = Report {
             call: true,
             call_running: false,
