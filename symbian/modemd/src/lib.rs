@@ -25,6 +25,11 @@ use modem_ipc::{self, Status, op};
 use sys::{HAPTIC, Io, hal_io, save_private};
 
 const NOT_READY: i32 = -18;
+/// NEOPHONE, NEOCONT, NEOMSG (NeoSymbian/phone) and NEOSET (neoui's Settings): who may clear the call log or every SMS.
+const PHONE_SID: u32 = 0xE000_5001;
+const CONTACTS_SID: u32 = 0xE000_5002;
+const MESSAGES_SID: u32 = 0xE000_5003;
+const NEOSET_SID: u32 = 0xE000_2007;
 const LOOP_US: i32 = 10_000;
 
 #[derive(Clone, Copy)]
@@ -613,6 +618,25 @@ impl Service for Daemon {
     }
 
     fn message(&mut self, session: &mut u32, msg: Message) {
+        // the bulk deletes only for the apps whose data it is, and the Settings app's Clear data (SE4a)
+        let bulk = match msg.function() {
+            op::CLEAR_LOG => Some(&[PHONE_SID, CONTACTS_SID, MESSAGES_SID, NEOSET_SID][..]),
+            op::SMS_EDIT if msg.int(0) == modem_ipc::sms::EDIT_DELETE_ALL => {
+                Some(&[MESSAGES_SID, NEOSET_SID][..])
+            }
+            _ => None,
+        };
+        if let Some(allowed) = bulk
+            && !allowed.contains(&msg.client_sid())
+        {
+            dprintln!(
+                "[modemd] {} refused to {:08x}",
+                msg.function(),
+                msg.client_sid()
+            );
+            msg.complete(err::KERR_PERMISSION_DENIED);
+            return;
+        }
         if msg.function() == op::NOTIFY {
             if self.subscribers.iter().any(|(s, _)| s == session) || self.subscribers.len() >= 16 {
                 msg.complete(err::KERR_IN_USE);
