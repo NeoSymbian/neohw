@@ -306,7 +306,8 @@ impl Daemon {
             .modem
             .as_ref()
             .map_or((0, 30), |m| (m.clir as u8, m.log.days));
-        // C8, or C9 (SE2b: + the tones) once a tone isn't the built-in one, so an older MODEMD keeps reading the file;
+        // C8, plus the tones' byte (SE2b) once a tone isn't the built-in one: an older MODEMD reads 9 bytes, so it
+        // keeps reading the file;
         // written aside and renamed, so a cut mid-save keeps the last good file
         let record = modem_ipc::saved::encode(&modem_ipc::saved::Saved {
             airplane: s.airplane,
@@ -1085,7 +1086,7 @@ fn main() -> i32 {
     };
     // Ordinary C: settings only; modem EFS remains RAM-backed (G4).
     if let Ok(fs) = e32::fs::Fs::connect() {
-        // C7, C8 or C9 (and the `.new` a cut mid-save left, sys::load_private)
+        // C7 or C8, with or without the tones' byte (and the `.new` a cut mid-save left, sys::load_private)
         if let Some(saved) = sys::load_private("C:\\private\\e0003001\\settings.bin", 16)
             .ok()
             .and_then(|v| modem_ipc::saved::decode(&v))

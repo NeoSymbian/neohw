@@ -461,7 +461,9 @@ pub mod tone {
     }
 }
 
-/// MODEMD's `settings.bin`: C7 (airplane, the ring), C8 (+ caller ID, the log's days), C9 (+ the tones, SE2b).
+/// MODEMD's `settings.bin`: C7 (airplane, the ring), C8 (+ caller ID, the log's days); since 2.7 (SE2b) a C8 record
+/// may carry a 10th byte, the tones. An older MODEMD reads the file into 9 bytes and checks only those, so it keeps
+/// reading it (and loses only the tones).
 pub mod saved {
     use super::Ring;
 
@@ -471,12 +473,12 @@ pub mod saved {
         pub ring: Ring,
         /// C8 on: caller ID (0..=2) and the call log's days; `None` from a C7 file
         pub c8: Option<(u8, u8)>,
-        /// C9 on: the ringtone and the message tone; `None` before
+        /// the ringtone and the message tone, when the record carries them
         pub tones: Option<(u8, u8)>,
     }
 
-    /// The record to save: C8 while the tones are the built-in ones (any MODEMD reads it, an older build after a
-    /// rollback too), C9 only once a tone was chosen. The bytes are `.0[..len]`, `len` the `.1`.
+    /// The record to save: C8's nine bytes, then the tones' byte when a tone isn't the built-in one (any MODEMD reads
+    /// it, an older build after a rollback too). The bytes are `.0[..len]`, `len` the `.1`.
     #[must_use]
     pub fn encode(s: &Saved) -> ([u8; 10], usize) {
         let (clir, days) = s.c8.unwrap_or((0, 30));
@@ -496,21 +498,20 @@ pub mod saved {
         if (ring, message) == (super::tone::BUILT_IN, super::tone::BUILT_IN) {
             return (b, 9);
         }
-        b[1] = b'9';
         b[9] = ring | message << 4;
         (b, 10)
     }
 
-    /// A C7, C8 or C9 record; `None` if it is none of them, or damaged.
+    /// A C7 or C8 record (with or without the tones' byte); `None` if it is neither, or damaged.
     #[must_use]
     pub fn decode(b: &[u8]) -> Option<Saved> {
-        let (kind, n) = match b.get(..3)? {
-            [b'C', b'7', 1] => (7, 7),
-            [b'C', b'8', 1] => (8, 9),
-            [b'C', b'9', 1] => (9, 10),
+        let kind = match b.get(..3)? {
+            [b'C', b'7', 1] if b.len() == 7 => 7,
+            [b'C', b'8', 1] if b.len() == 9 => 8,
+            [b'C', b'8', 1] if b.len() == 10 => 9,
             _ => return None,
         };
-        if b.len() != n || b[4] > 10 || (kind >= 8 && b[7] > 2) {
+        if b[4] > 10 || (kind >= 8 && b[7] > 2) {
             return None;
         }
         let tones = if kind == 9 {
@@ -855,7 +856,7 @@ impl Status {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn settings_bin_reads_c7_c8_and_c9() {
+    fn settings_bin_reads_c7_c8_and_the_tones_byte() {
         use super::saved::*;
         let s = Saved {
             airplane: true,
@@ -872,8 +873,8 @@ mod tests {
             b[..n].to_vec()
         };
         assert_eq!(decode(&bytes(&s)), Some(s));
-        // the built-in tones save as C8, byte for byte what the C8 writer wrote: an older MODEMD (a rollback) still
-        // reads the file
+        // a chosen tone: C8's nine bytes and the tones' byte, so an older MODEMD (it reads 9 bytes) still takes the
+        // rest; the built-in tones save as C8, byte for byte what the C8 writer wrote
         let plain = Saved {
             tones: Some((super::tone::BUILT_IN, super::tone::BUILT_IN)),
             ..s
@@ -889,10 +890,12 @@ mod tests {
         // damaged: a tone over NONE, a volume over 10, a wrong length
         let mut bad = bytes(&s);
         assert_eq!(bad.len(), 10);
+        assert_eq!(&bad[..2], b"C8");
+        assert_eq!(decode(&bad[..9]).unwrap().tones, None); // what an older MODEMD sees
         bad[9] = 4;
         assert_eq!(decode(&bad), None);
         assert_eq!(decode(&[b'C', b'9', 1, 0, 11, 0, 0, 0, 30, 0]), None);
-        assert_eq!(decode(&bytes(&s)[..9]), None);
+        assert_eq!(decode(&bytes(&s)[..8]), None);
     }
 
     #[test]
