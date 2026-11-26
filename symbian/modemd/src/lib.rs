@@ -306,14 +306,19 @@ impl Daemon {
             .modem
             .as_ref()
             .map_or((0, 30), |m| (m.clir as u8, m.log.days));
-        // C9 (SE2b): C8 and the tones; written aside and renamed, so a cut mid-save keeps the last good file
+        // C8, or C9 (SE2b: + the tones) once a tone isn't the built-in one, so an older MODEMD keeps reading the file;
+        // written aside and renamed, so a cut mid-save keeps the last good file
         let record = modem_ipc::saved::encode(&modem_ipc::saved::Saved {
             airplane: s.airplane,
             ring: s.ring,
             c8: Some((clir, days)),
             tones: Some(self.tones),
         });
-        sys::replace_private("C:\\private\\e0003001\\", "settings.bin", &record)
+        sys::replace_private(
+            "C:\\private\\e0003001\\",
+            "settings.bin",
+            &record.0[..record.1],
+        )
     }
 
     /// calls.db, when the log changed (C8).

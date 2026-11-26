@@ -475,14 +475,15 @@ pub mod saved {
         pub tones: Option<(u8, u8)>,
     }
 
-    /// The C9 record.
+    /// The record to save: C8 while the tones are the built-in ones (any MODEMD reads it, an older build after a
+    /// rollback too), C9 only once a tone was chosen. The bytes are `.0[..len]`, `len` the `.1`.
     #[must_use]
-    pub fn encode(s: &Saved) -> [u8; 10] {
+    pub fn encode(s: &Saved) -> ([u8; 10], usize) {
         let (clir, days) = s.c8.unwrap_or((0, 30));
         let (ring, message) = s.tones.unwrap_or((0, 0));
-        [
+        let mut b = [
             b'C',
-            b'9',
+            b'8',
             1,
             u8::from(s.airplane),
             s.ring.volume,
@@ -490,8 +491,14 @@ pub mod saved {
             u8::from(s.ring.vibrate),
             clir,
             days,
-            ring | message << 4,
-        ]
+            0,
+        ];
+        if (ring, message) == (super::tone::BUILT_IN, super::tone::BUILT_IN) {
+            return (b, 9);
+        }
+        b[1] = b'9';
+        b[9] = ring | message << 4;
+        (b, 10)
     }
 
     /// A C7, C8 or C9 record; `None` if it is none of them, or damaged.
@@ -860,7 +867,19 @@ mod tests {
             c8: Some((2, 90)),
             tones: Some((super::tone::TWO_BEEPS, super::tone::NONE)),
         };
-        assert_eq!(decode(&encode(&s)), Some(s));
+        let bytes = |s: &Saved| {
+            let (b, n) = encode(s);
+            b[..n].to_vec()
+        };
+        assert_eq!(decode(&bytes(&s)), Some(s));
+        // the built-in tones save as C8, byte for byte what the C8 writer wrote: an older MODEMD (a rollback) still
+        // reads the file
+        let plain = Saved {
+            tones: Some((super::tone::BUILT_IN, super::tone::BUILT_IN)),
+            ..s
+        };
+        assert_eq!(bytes(&plain), [b'C', b'8', 1, 1, 4, 0, 1, 2, 90]);
+        assert_eq!(decode(&bytes(&plain)).unwrap().tones, None);
         // an older file: C8 and C7 still load, without the tones
         let c8 = [b'C', b'8', 1, 0, 7, 1, 0, 1, 30];
         let d = decode(&c8).unwrap();
@@ -868,11 +887,12 @@ mod tests {
         let c7 = [b'C', b'7', 1, 1, 10, 0, 1];
         assert_eq!(decode(&c7).unwrap().c8, None);
         // damaged: a tone over NONE, a volume over 10, a wrong length
-        let mut bad = encode(&s);
+        let mut bad = bytes(&s);
+        assert_eq!(bad.len(), 10);
         bad[9] = 4;
         assert_eq!(decode(&bad), None);
         assert_eq!(decode(&[b'C', b'9', 1, 0, 11, 0, 0, 0, 30, 0]), None);
-        assert_eq!(decode(&encode(&s)[..9]), None);
+        assert_eq!(decode(&bytes(&s)[..9]), None);
     }
 
     #[test]
