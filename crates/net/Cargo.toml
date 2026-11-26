@@ -21,4 +21,4 @@ smoltcp = { version = "0.14", default-features = false, features = [
 # kernel mutex, is only its fallback), as Slint's do in neoui.
 heapless = { version = "0.9", default-features = false, features = ["portable-atomic-critical-section"] }
 # NeoSymbian/e32-rs, the same revision as neoui (one e32 in SYSSTART)
-e32 = { git = "https://github.com/NeoSymbian/e32-rs", rev = "8084b94f9e8264384113e7ea6fa52adf70944cc5", optional = true }
+e32 = { git = "https://github.com/NeoSymbian/e32-rs", rev = "41e0af1b9c0c741cc9619ebd749905661d2bab4f", optional = true }
