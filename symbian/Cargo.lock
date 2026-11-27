@@ -164,7 +164,7 @@ dependencies = [
 [[package]]
 name = "e32"
 version = "0.1.0"
-source = "git+https://github.com/NeoSymbian/e32-rs?rev=41e0af1b9c0c741cc9619ebd749905661d2bab4f#41e0af1b9c0c741cc9619ebd749905661d2bab4f"
+source = "git+https://github.com/NeoSymbian/e32-rs?rev=7d6ab96f8bc7a062f750dac3a0c9fe3e640cc359#7d6ab96f8bc7a062f750dac3a0c9fe3e640cc359"
 dependencies = [
  "critical-section",
  "e32-sys",
@@ -174,7 +174,7 @@ dependencies = [
 [[package]]
 name = "e32-sys"
 version = "0.1.0"
-source = "git+https://github.com/NeoSymbian/e32-rs?rev=41e0af1b9c0c741cc9619ebd749905661d2bab4f#41e0af1b9c0c741cc9619ebd749905661d2bab4f"
+source = "git+https://github.com/NeoSymbian/e32-rs?rev=7d6ab96f8bc7a062f750dac3a0c9fe3e640cc359#7d6ab96f8bc7a062f750dac3a0c9fe3e640cc359"
 
 [[package]]
 name = "ext4ro"
