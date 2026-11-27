@@ -24,6 +24,9 @@ use hub_ipc::{Event, Snapshot};
 use modem_ipc::{self, Status, op};
 use sys::{HAPTIC, Io, hal_io, save_private};
 
+/// D11: SET_PIN_PROTECTION / CHANGE_PIN answer KErrNotSupported until the review's P1s are fixed.
+const PIN_CHANGES_ENABLED: bool = false;
+
 const NOT_READY: i32 = -18;
 /// NEOPHONE, NEOCONT, NEOMSG (NeoSymbian/phone) and NEOSET (neoui's Settings): who may clear the call log or every SMS.
 const PHONE_SID: u32 = 0xE000_5001;
@@ -821,6 +824,13 @@ impl Service for Daemon {
             return;
         }
         if matches!(msg.function(), op::SET_PIN_PROTECTION | op::CHANGE_PIN) {
+            // shortcut: the PIN changes are held back until the D11 review's P1s are fixed (the servers aren't
+            // authenticated, HWHUB doesn't check destinations, the target card isn't frozen, buffers aren't wiped);
+            // enable by removing this when they are
+            if !PIN_CHANGES_ENABLED {
+                msg.complete(err::KERR_NOT_SUPPORTED);
+                return;
+            }
             self.pin_request(*session, msg);
             return;
         }
