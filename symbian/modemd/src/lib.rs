@@ -26,7 +26,7 @@ use sys::{HAPTIC, Io, hal_io, save_private};
 
 /// D11: SET_PIN_PROTECTION / CHANGE_PIN answer KErrNotSupported until the spare-SIM run (docs settings-data.md D11)
 /// has passed on the phone. Turned on by its own commit, which can be dropped.
-const PIN_CHANGES_ENABLED: bool = false;
+const PIN_CHANGES_ENABLED: bool = true;
 
 const NOT_READY: i32 = -18;
 /// NEOPHONE, NEOCONT, NEOMSG (NeoSymbian/phone) and NEOSET (neoui's Settings): who may clear the call log or every SMS.
