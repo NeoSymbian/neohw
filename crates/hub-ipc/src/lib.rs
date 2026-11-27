@@ -9,6 +9,7 @@ mod wire;
 pub use wire::*;
 mod queue;
 pub use queue::SessionQueue;
+pub mod access;
 
 #[cfg(test)]
 mod tests;

@@ -14,7 +14,7 @@ use e32::sys::ipc::TVersion;
 use neoaudio::{self, Info, Stream, op, sink, state};
 
 /// MODEMD.EXE's UID3, the only client that may send [`op::CONTROL`].
-const MODEMD_SID: u32 = 0xE000_3001;
+const MODEMD_SID: u32 = modem_ipc::SERVER_SID;
 
 /// Media stays wanted this long after the last sound, so short gaps don't power the amps down and up.
 const LINGER_MS: u64 = 2_000;

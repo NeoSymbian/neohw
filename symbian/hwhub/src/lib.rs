@@ -12,7 +12,7 @@ use e32::sys::{err, ipc::TVersion};
 use e32::{dprintln, time};
 use hub::recovery::{self, StopProgress};
 use hub::{Platform, Router, ssctl};
-use hub_ipc::{Bus, Event, SessionQueue, Snapshot, op};
+use hub_ipc::{Bus, Event, SessionQueue, Snapshot, access, op};
 use sys::{
     BOOT, IPA_START, Io, PART_READ, RECV, RMTFS_MEM, RPROC_STATE, RPROC_STOP, SEND, STATE,
     TRY_SEND, ext4_err, fs_size, fw_read, hal, hal_io, ipa_firmware, vendor_file,
@@ -175,6 +175,8 @@ enum Phase {
 
 struct Client {
     id: u32,
+    /// the connecting process's secure ID (sessions per daemon, hub_ipc::access)
+    sid: u32,
     bindings: Vec<(u32, u32)>,
     queue: SessionQueue,
     receive: Option<Message>,
@@ -793,34 +795,28 @@ impl Daemon {
     }
 }
 
-impl Daemon {
-    /// Client `i` sends from a port it bound (BIND checked its SID owns that service) to a server of that service.
-    fn may_send(&self, i: usize, port: u32, dst: (u32, u32)) -> bool {
-        self.clients[i].bindings.iter().any(|&(service, p)| {
-            p == port
-                && self
-                    .router
-                    .servers
-                    .iter()
-                    .any(|s| s.service == service && (s.node, s.port) == dst)
-        })
-    }
-}
-
 impl Service for Daemon {
     type Session = u32;
     fn connect(&mut self, v: TVersion) -> Result<u32, i32> {
+        self.connect_from(v, 0)
+    }
+    fn connect_from(&mut self, v: TVersion, sid: u32) -> Result<u32, i32> {
         if v.major as i8 != hub_ipc::VERSION.0 {
             return Err(err::KERR_NOT_SUPPORTED);
         }
-        if self.clients.len() >= 16 {
-            return Err(err::KERR_IN_USE);
-        }
+        let of_sid = self.clients.iter().filter(|c| c.sid == sid).count();
+        let others = self
+            .clients
+            .iter()
+            .filter(|c| !access::daemon(c.sid))
+            .count();
+        access::connect(sid, of_sid, others)?;
         self.next_session = self.next_session.wrapping_add(1).max(1);
         let mut queue = SessionQueue::default();
         queue.push(Event::Status(self.snapshot()));
         self.clients.push(Client {
             id: self.next_session,
+            sid,
             bindings: Vec::new(),
             queue,
             receive: None,
@@ -836,14 +832,12 @@ impl Service for Daemon {
         let result = match msg.function() {
             op::BIND => {
                 let (service, port) = (msg.int(0) as u32, msg.int(1) as u32);
-                if hub_ipc::service_owner(service) != Some(msg.client_sid()) {
-                    err::KERR_PERMISSION_DENIED
-                } else if self
+                let taken = self
                     .clients
                     .iter()
-                    .any(|c| c.id != *id && c.bindings.iter().any(|b| b.1 == port))
-                {
-                    err::KERR_IN_USE
+                    .any(|c| c.id != *id && c.bindings.iter().any(|b| b.1 == port));
+                if let Err(e) = access::bind(msg.client_sid(), service, taken) {
+                    e
                 } else {
                     match self.router.bus(&mut Hal).bind(service, port) {
                         Err(e) => e,
@@ -877,15 +871,23 @@ impl Service for Daemon {
                 match data {
                     Ok(mut data) => {
                         let r = match hub_ipc::Send::decode(&data) {
-                            Some(send) if !self.may_send(i, send.port, send.dst) => {
-                                err::KERR_PERMISSION_DENIED
-                            }
-                            Some(send) if !matches!(self.phase, Phase::Recover { .. }) => self
-                                .router
-                                .bus(&mut Hal)
-                                .send(send.port, send.dst, send.payload, send.essential)
-                                as i32,
-                            Some(_) => err::KERR_NOT_READY,
+                            Some(send) => match access::send(
+                                &self.clients[i].bindings,
+                                &self.router.servers,
+                                send.port,
+                                send.dst,
+                            ) {
+                                Err(e) => e,
+                                Ok(()) if matches!(self.phase, Phase::Recover { .. }) => {
+                                    err::KERR_NOT_READY
+                                }
+                                Ok(()) => self.router.bus(&mut Hal).send(
+                                    send.port,
+                                    send.dst,
+                                    send.payload,
+                                    send.essential,
+                                ) as i32,
+                            },
                             None => err::KERR_ARGUMENT,
                         };
                         hub_ipc::wipe(&mut data); // it may carry a SIM PIN
@@ -915,7 +917,9 @@ impl Service for Daemon {
                 .map_or_else(|e| e, |_| 0),
             op::RECOVER => {
                 let mask = msg.int(0) as u32;
-                if mask == 0 || mask & !3 != 0 {
+                if !access::recover(msg.client_sid()) {
+                    err::KERR_PERMISSION_DENIED // it restarts the MSS: a call drops, a PIN request's result is lost
+                } else if mask == 0 || mask & !3 != 0 {
                     err::KERR_ARGUMENT
                 } else if matches!(self.phase, Phase::Failed)
                     && !matches!(processor_stop_state(), Ok([0 | 2 | 3, _, _, _]))
@@ -936,7 +940,9 @@ impl Service for Daemon {
                 }
             }
             op::QUIESCED => {
-                if msg.int(0) as u32 == self.router.generation() {
+                if !access::quiesced(msg.client_sid()) {
+                    err::KERR_PERMISSION_DENIED
+                } else if msg.int(0) as u32 == self.router.generation() {
                     self.clients[i].quiesced = msg.int(0) as u32;
                     0
                 } else {

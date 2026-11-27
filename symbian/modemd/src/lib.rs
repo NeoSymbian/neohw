@@ -24,6 +24,10 @@ use hub_ipc::{Event, Snapshot};
 use modem_ipc::{self, Status, op};
 use sys::{HAPTIC, Io, hal_io, save_private};
 
+/// D11: SET_PIN_PROTECTION / CHANGE_PIN answer KErrNotSupported until the spare-SIM run (docs settings-data.md D11)
+/// has passed on the phone. Turned on by its own commit, which can be dropped.
+const PIN_CHANGES_ENABLED: bool = false;
+
 const NOT_READY: i32 = -18;
 /// NEOPHONE, NEOCONT, NEOMSG (NeoSymbian/phone) and NEOSET (neoui's Settings): who may clear the call log or every SMS.
 const PHONE_SID: u32 = 0xE000_5001;
@@ -828,6 +832,12 @@ impl Service for Daemon {
             return;
         }
         if matches!(msg.function(), op::SET_PIN_PROTECTION | op::CHANGE_PIN) {
+            // shortcut: held back until the D11 spare-SIM run (on, change, reboot, unlock, restore) passed on the
+            // Pixel; enable with PIN_CHANGES_ENABLED
+            if !PIN_CHANGES_ENABLED {
+                msg.complete(err::KERR_NOT_SUPPORTED);
+                return;
+            }
             self.pin_request(*session, msg);
             return;
         }

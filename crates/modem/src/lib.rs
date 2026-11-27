@@ -83,7 +83,7 @@ pub struct Cellular {
     /// refused Set Operating Mode requests for the current intent (bounded by RADIO_REFUSALS)
     radio_refusals: u8,
     pin_id: u8,
-    /// (D11) the card slot and application a PIN change goes to; any change of it is a new epoch
+    /// (D11) the card slot and application the card status names; any change of it is a new epoch
     pin_target: Option<uim::Target>,
     /// (D11) the one SET_PIN_PROTECTION / CHANGE_PIN with the card; never sent twice
     pin_op: Option<PinOp>,
@@ -552,9 +552,8 @@ impl Cellular {
         info: &[u8],
         on: Option<bool>,
     ) -> Result<(), i32> {
-        // the slot and application the epoch names (pin_ready checked there is one)
-        let session = self.pin_target.map(|t| t.session()).unwrap_or_default();
-        if !self.request(p, UIM, id, &[(1, &session), (2, info)]) {
+        // card slot 1 session, no AID, as VERIFY (the epoch, not these bytes, pins the slot and application)
+        if !self.request(p, UIM, id, &[(1, &[6, 0]), (2, info)]) {
             return Err(KERR_NOT_READY);
         }
         let txn = self

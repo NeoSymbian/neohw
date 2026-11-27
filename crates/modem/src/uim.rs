@@ -8,26 +8,19 @@ pub const REGISTER: u16 = 0x2e;
 pub const GET_STATUS: u16 = 0x2f;
 pub const STATUS_IND: u16 = 0x32;
 pub const VERIFY_PIN: u16 = 0x26;
-/// (D11) TLV 1 the card's session ([`Target::session`]), TLV 2 [pin id, on, n, pin[n]]
+/// (D11) TLV 1 session [6, 0] (card slot 1, no AID, as VERIFY and ModemManager: UIM ignores an AID for a card
+/// session), TLV 2 [pin id, on, n, pin[n]]
 pub const SET_PIN_PROTECTION: u16 = 0x25;
 /// (D11) TLV 1 as above, TLV 2 [pin id, n, old[n], m, new[m]]
 pub const CHANGE_PIN: u16 = 0x28;
 
-/// (D11) The application a PIN change is for: its card slot (1-based) and AID, as the card status named them.
+/// (D11) The application the card status names: its card slot (1-based) and AID. Not sent (the request's session is
+/// card slot 1's, [6, 0]); any change of it is a new epoch, so a request is only for the card the requester read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Target {
     pub slot: u8,
     pub aid_len: u8,
     pub aid: [u8; 16],
-}
-
-impl Target {
-    /// QMI UIM session TLV: card slot n's session (type 5 + n), the AID length, the AID.
-    pub fn session(&self) -> alloc::vec::Vec<u8> {
-        let mut v = alloc::vec![5 + self.slot, self.aid_len];
-        v.extend_from_slice(&self.aid[..usize::from(self.aid_len)]);
-        v
-    }
 }
 
 pub struct Card {

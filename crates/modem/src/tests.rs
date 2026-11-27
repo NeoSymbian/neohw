@@ -1382,6 +1382,8 @@ fn success_the_card_doesnt_show_is_unknown() {
 
 #[test]
 fn hwhub_lets_modemd_bind_its_services() {
+    // hub-ipc can't depend on modem-ipc: the one place both SIDs meet
+    assert_eq!(hub_ipc::sid::MODEMD, modem_ipc::SERVER_SID);
     for (service, _) in CLIENTS {
         assert_eq!(hub_ipc::service_owner(service), Some(hub_ipc::sid::MODEMD));
     }
@@ -1403,7 +1405,7 @@ fn card_ind_aid(m: &mut Cellular, f: &mut Fake, state: u8, aid: &[u8]) {
 }
 
 #[test]
-fn a_pin_request_goes_to_the_slot_and_application_its_epoch_names() {
+fn another_application_is_a_new_epoch_and_the_request_keeps_the_card_slot_1_session() {
     const USIM: [u8; 7] = [0xa0, 0, 0, 0, 0x87, 0x10, 0x02];
     let (mut m, mut f) = (modem(), fake());
     m.handle(&mut f, &ns(UIM, 55));
@@ -1419,9 +1421,9 @@ fn a_pin_request_goes_to_the_slot_and_application_its_epoch_names() {
     card_ind_aid(&mut m, &mut f, pin::DISABLED, &USIM);
     let (e, g, t) = ids(&m);
     m.pin_protection(&mut f, b"1234", true, e, g, t).unwrap();
-    let mut session = std::vec![6, 7]; // card slot 1, the 7-byte AID
-    session.extend_from_slice(&USIM);
-    assert_eq!(last_req(&f).2, session);
+    // card slot 1's session without the AID, as VERIFY and ModemManager send it: UIM ignores an AID for this
+    // session type, and a real card's AID must not change the bytes
+    assert_eq!(last_req(&f).2, [6, 0]);
 }
 
 #[test]
