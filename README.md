@@ -6,7 +6,7 @@ Bluetooth, on the 2010 Symbian user side (ARMv8-A AArch32 softfp, `targets/armv8
 merged in with its history.
 
 Every driver's status, the processes and their IPC are in
-[docs/hardware.md](https://github.com/NeoSymbian/docs/blob/main/hardware.md); the details per area in
+[docs/hardware.md](https://github.com/NeoSymbian/docs/blob/main/hardware/README.md); the details per area in
 [docs/hardware/](https://github.com/NeoSymbian/docs/tree/main/hardware) (modem.md, audio.md, wifi.md, bluetooth.md).
 The kernel side (SCM, SMEM, SMP2P, GLINK, remote-processor boot, the audio codecs, the WCN3990 copy engines) is C++
 in [kernel](https://github.com/NeoSymbian/kernel) under `baseport/arm64`.
