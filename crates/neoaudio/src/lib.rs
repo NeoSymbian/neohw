@@ -17,15 +17,20 @@
 //! Everything is mixed to [`RATE`] mono, the ADSP's stream format: a linear resampler per stream, volume, and a
 //! saturating sum. Recording is the reverse: the 48 kHz mono mic resampled to each stream's rate and channels.
 //! During a call (or a ringtone) the media keeps being consumed in real time and is not heard.
+//!
+//! 1.1 (Settings D6, SE2c-1): [`op::CONTROL`]'s ring tone may be the user's own sound ([`tones::FIRST_YOURS`]..=
+//! [`tones::LAST`], [`tones::file`]); [`wav`] converts a WAV into one.
 #![no_std]
 extern crate alloc;
+
+pub mod wav;
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 pub const NAME: &str = "NeoAudio";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (1, 0, 0);
+pub const VERSION: (i8, i8, i16) = (1, 1, 0);
 /// The device's rate: every stream is mixed to 48 kHz mono S16.
 pub const RATE: u32 = 48_000;
 /// How much audio a stream's queue holds before WRITE waits.
@@ -105,7 +110,7 @@ pub mod control {
         }
         pub fn from_bytes(b: &[u8]) -> Option<Self> {
             let b: &[u8; Self::SIZE] = b.try_into().ok()?;
-            if b[0] & !63 != 0 || b[1] > 10 || b[2] > 2 || b[3] > 10 || b[8] > crate::tones::NONE {
+            if b[0] & !63 != 0 || b[1] > 10 || b[2] > 2 || b[3] > 10 || b[8] > crate::tones::LAST {
                 return None;
             }
             Some(Self {
@@ -181,6 +186,29 @@ pub mod tones {
     pub const TWO_BEEPS: u8 = 2;
     /// No sound (the ring vibrates only, if vibrate is on).
     pub const NONE: u8 = 3;
+    /// (1.1) The user's own sounds: Settings converts a WAV ([`crate::wav`]) into [`file`]`(id)`, [`BYTES`] long.
+    pub const FIRST_YOURS: u8 = 4;
+    pub const LAST: u8 = 15;
+    /// Where NEOSET keeps them.
+    pub const DIR: &str = "C:\\private\\e0002007\\tones\\";
+
+    /// A sound of the user's: its file (`C:\private\e0002007\tones\<id>.pcm`), `None` for another id.
+    #[must_use]
+    pub fn file(id: u8) -> Option<alloc::string::String> {
+        (FIRST_YOURS..=LAST)
+            .contains(&id)
+            .then(|| alloc::format!("{DIR}{id}.pcm"))
+    }
+
+    /// A user's sound at the ring's `volume` (0..=10): the file's full scale to the built-in tones' peak, so a
+    /// sound of the user's rings as loud as theirs at the same volume.
+    pub fn scale(pcm: &mut [u8], volume: u8) {
+        let k = i64::from(volume.min(10)) * 11_000;
+        for s in pcm.as_chunks_mut::<2>().0 {
+            let v = i64::from(i16::from_le_bytes(*s)) * k / (10 * 32_767);
+            *s = (v as i16).to_le_bytes();
+        }
+    }
     /// One period of the loop: 2 s at 48 kHz, 16-bit mono (AUDIOD's ring buffer, `apr::RING_BYTES`).
     pub const BYTES: usize = 192_000;
     pub const RATE: u32 = 48_000;
@@ -328,6 +356,22 @@ pub mod tones {
         }
 
         #[test]
+        fn yours_live_in_settings_private_folder_and_ring_like_the_built_in() {
+            assert_eq!(file(3), None);
+            assert_eq!(file(16), None);
+            assert_eq!(file(4).unwrap(), "C:\\private\\e0002007\\tones\\4.pcm");
+            assert_eq!(file(15).unwrap(), "C:\\private\\e0002007\\tones\\15.pcm");
+            let mut b = [0u8; 6];
+            b[..2].copy_from_slice(&32_767i16.to_le_bytes());
+            b[2..4].copy_from_slice(&(-32_767i16).to_le_bytes());
+            b[4..].copy_from_slice(&1000i16.to_le_bytes());
+            scale(&mut b, 10);
+            assert_eq!(samples(&b), [11_000, -11_000, 335]);
+            scale(&mut b, 0);
+            assert_eq!(samples(&b), [0, 0, 0]);
+        }
+
+        #[test]
         fn beeps_are_short_and_two_is_two() {
             // sound in 10 ms windows: the beeps leave most of the period silent
             let active = |tone| {
@@ -429,7 +473,7 @@ const ONE: u32 = 1 << 16;
 /// Linear interpolation from one rate to another, one output sample per call. The output trails the input by one
 /// sample.
 #[derive(Clone, Debug)]
-struct Resampler {
+pub(crate) struct Resampler {
     step: u32,
     phase: u32,
     prev: i32,
@@ -437,7 +481,7 @@ struct Resampler {
 }
 
 impl Resampler {
-    fn new(from: u32, to: u32) -> Self {
+    pub(crate) fn new(from: u32, to: u32) -> Self {
         Resampler {
             step: ((u64::from(from) << 16) / u64::from(to)) as u32,
             phase: ONE,
@@ -447,7 +491,7 @@ impl Resampler {
     }
 
     /// The next output sample, or None when `src` runs dry (the state stays as it was: call again later).
-    fn next(&mut self, mut src: impl FnMut() -> Option<i32>) -> Option<i32> {
+    pub(crate) fn next(&mut self, mut src: impl FnMut() -> Option<i32>) -> Option<i32> {
         while self.phase >= ONE {
             let s = src()?;
             self.prev = self.cur;
@@ -722,7 +766,10 @@ mod tests {
             Intent::from_bytes(&old).unwrap().ring_tone,
             crate::tones::BUILT_IN
         );
-        old[8] = crate::tones::NONE + 1;
+        // 1.1: the user's own sounds (4..=15); more is refused
+        old[8] = crate::tones::FIRST_YOURS;
+        assert_eq!(Intent::from_bytes(&old).unwrap().ring_tone, 4);
+        old[8] = crate::tones::LAST + 1;
         assert_eq!(Intent::from_bytes(&old), None);
         let r = Report {
             call: true,

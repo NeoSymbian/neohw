@@ -83,6 +83,10 @@ pub struct Cellular {
     /// refused Set Operating Mode requests for the current intent (bounded by RADIO_REFUSALS)
     radio_refusals: u8,
     pin_id: u8,
+    /// (D11) the one SET_PIN_PROTECTION / CHANGE_PIN with the card; never sent twice
+    pin_op: Option<PinOp>,
+    /// its outcome for MODEMD to complete the request with ([`Cellular::take_pin_done`])
+    pin_done: Option<i32>,
     answered: Vec<u8>,
     /// The call log (C8); MODEMD saves it when `log.dirty`.
     pub log: calllog::CallLog,
@@ -122,6 +126,19 @@ enum AfterSave {
 }
 
 const RADIO_REFUSALS: u8 = 3;
+/// A PIN change the card hasn't answered (and been read again) in this long: its result is unknown.
+const PIN_MS: u64 = 15_000;
+
+/// (D11) A PIN change with the card: the request (UIM id, txn), when, what protection it asks for (None = a new
+/// PIN), and once answered its result and the card read that confirms it.
+#[derive(Clone, Copy, Debug)]
+struct PinOp {
+    id: u16,
+    txn: u16,
+    since: u64,
+    on: Option<bool>,
+    answer: Option<(i32, u16)>,
+}
 /// "350000000000012" -> "35xxxxxxxxxxx12": never log a whole IMEI.
 pub fn mask(id: &str) -> String {
     id.char_indices()
@@ -143,6 +160,10 @@ impl Cellular {
             // 255: unknown until UIM reports it (0 would read as "no tries left")
             status: Status {
                 pin_attempts: 255,
+                protection: modem_ipc::Protection {
+                    epoch: 1,
+                    ..Default::default()
+                },
                 ..Status::default()
             },
             clients: Vec::new(),
@@ -163,6 +184,8 @@ impl Cellular {
             radio_at: 0,
             radio_refusals: 0,
             pin_id: 1,
+            pin_op: None,
+            pin_done: None,
             answered: Vec::new(),
             log: calllog::CallLog::default(),
             clir: modem_ipc::clir::NETWORK,
@@ -265,11 +288,10 @@ impl Cellular {
         }
         c.pending.push((c.txn, id));
         let (port, dst) = (c.port, c.dst);
-        if must {
-            p.send(port, dst, &b.finish(), true);
-            return true;
-        }
-        p.send(port, dst, &b.finish(), false)
+        let mut packet = b.finish();
+        let sent = p.send(port, dst, &packet, must);
+        hub_ipc::wipe(&mut packet); // it may carry a SIM PIN
+        must || sent
     }
 
     /// The first requests once the modem announces a service we are a client of.
@@ -393,7 +415,7 @@ impl Cellular {
         id: u16,
         tlvs: &[(u8, &[u8])],
     ) -> Result<(), i32> {
-        if self.command.is_some() || self.radio_request.is_some() {
+        if self.command.is_some() || self.radio_request.is_some() || self.pin_op.is_some() {
             return Err(KERR_IN_USE);
         }
         if !self.request(p, service, id, tlvs) {
@@ -423,6 +445,188 @@ impl Cellular {
         let result = self.user_request(p, UIM, uim::VERIFY_PIN, &[(1, &[6, 0]), (2, &info)]);
         info.fill(0);
         result
+    }
+
+    /// (D11, NEOSET) Turn the SIM PIN on or off, with the current PIN: refused unless the PIN is entered (to turn it
+    /// off) or off (to turn it on), the card says how many tries are left, and `epoch`/`generation` are the
+    /// card's and the modem's now. The result comes once, through [`Cellular::take_pin_done`].
+    pub fn pin_protection(
+        &mut self,
+        p: &mut dyn Bus,
+        pin: &[u8],
+        on: bool,
+        epoch: u32,
+        generation: u32,
+    ) -> Result<(), i32> {
+        let want = if on {
+            modem_ipc::pin::DISABLED
+        } else {
+            modem_ipc::pin::VERIFIED
+        };
+        self.pin_ready(pin, want, epoch, generation)?;
+        // [pin id, on, n, pin[n]]
+        let mut info = [0u8; 3 + 8];
+        info[..3].copy_from_slice(&[self.status.protection.pin_id, on as u8, pin.len() as u8]);
+        info[3..3 + pin.len()].copy_from_slice(pin);
+        let n = 3 + pin.len();
+        let r = self.pin_send(p, uim::SET_PIN_PROTECTION, &info[..n], Some(on));
+        hub_ipc::wipe(&mut info);
+        r
+    }
+
+    /// (D11, NEOSET) A new SIM PIN: the PIN must be on and entered; as [`Cellular::pin_protection`] otherwise.
+    pub fn change_pin(
+        &mut self,
+        p: &mut dyn Bus,
+        old: &[u8],
+        new: &[u8],
+        epoch: u32,
+        generation: u32,
+    ) -> Result<(), i32> {
+        if !modem_ipc::pin::valid(new) {
+            return Err(KERR_ARGUMENT);
+        }
+        self.pin_ready(old, modem_ipc::pin::VERIFIED, epoch, generation)?;
+        // [pin id, n, old[n], m, new[m]]
+        let mut info = [0u8; 3 + 16];
+        info[0] = self.status.protection.pin_id;
+        info[1] = old.len() as u8;
+        info[2..2 + old.len()].copy_from_slice(old);
+        let at = 2 + old.len();
+        info[at] = new.len() as u8;
+        info[at + 1..at + 1 + new.len()].copy_from_slice(new);
+        let n = at + 1 + new.len();
+        let r = self.pin_send(p, uim::CHANGE_PIN, &info[..n], None);
+        hub_ipc::wipe(&mut info);
+        r
+    }
+
+    /// The outcome of the last PIN request (0, a QMI refusal as -1000 - error, or a `modem_ipc::pin` result), once.
+    pub fn take_pin_done(&mut self) -> Option<i32> {
+        self.pin_done.take()
+    }
+
+    fn pin_ready(&self, pin: &[u8], state: u8, epoch: u32, generation: u32) -> Result<(), i32> {
+        if self.command.is_some() || self.radio_request.is_some() || self.pin_op.is_some() {
+            return Err(KERR_IN_USE);
+        }
+        if epoch != self.status.protection.epoch || generation != self.status.generation {
+            return Err(modem_ipc::pin::STALE);
+        }
+        if !modem_ipc::pin::valid(pin) {
+            return Err(KERR_ARGUMENT);
+        }
+        // the card must say how many tries are left, and that it is a real PIN application in that state
+        let pr = self.status.protection;
+        if pr.state != state
+            || pr.pin_id == modem_ipc::pin::ID_UNKNOWN
+            || !(1..255).contains(&self.status.pin_attempts)
+        {
+            return Err(KERR_NOT_READY);
+        }
+        Ok(())
+    }
+
+    fn pin_send(
+        &mut self,
+        p: &mut dyn Bus,
+        id: u16,
+        info: &[u8],
+        on: Option<bool>,
+    ) -> Result<(), i32> {
+        // card slot 1 session, no AID, as VERIFY
+        if !self.request(p, UIM, id, &[(1, &[6, 0]), (2, info)]) {
+            return Err(KERR_NOT_READY);
+        }
+        let txn = self
+            .clients
+            .iter()
+            .find(|c| c.service == UIM)
+            .map_or(0, |c| c.txn);
+        self.pin_op = Some(PinOp {
+            id,
+            txn,
+            since: self.now,
+            on,
+            answer: None,
+        });
+        Ok(())
+    }
+
+    /// The card answered a PIN request: keep its tries, then read the card; only that read finishes it.
+    fn pin_answer(&mut self, p: &mut dyn Bus, m: &qmi::Msg) {
+        // failure TLV 0x10: [verify tries left, unblock tries left]
+        if let Some(n) = m.u8(0x10) {
+            self.status.pin_attempts = n;
+        }
+        let Some(op) = self
+            .pin_op
+            .filter(|o| o.id == m.id && o.txn == m.txn && o.answer.is_none())
+        else {
+            // late (timed out, or not this request): it changes nothing but what the card says
+            p.log(format_args!(
+                "uim: PIN answer {:#x} txn {} not awaited",
+                m.id, m.txn
+            ));
+            self.request(p, UIM, UIM_GET_CARD_STATUS, &[]);
+            return;
+        };
+        let result = match m.result() {
+            Some(Ok(())) => 0,
+            Some(Err(e)) => -1000 - i32::from(e),
+            None => modem_ipc::pin::RESULT_UNKNOWN,
+        };
+        p.log(format_args!(
+            "uim: PIN request {:#x} answered {result}",
+            m.id
+        ));
+        if !self.request(p, UIM, UIM_GET_CARD_STATUS, &[]) {
+            self.pin_op = None;
+            self.pin_done = Some(if result == 0 {
+                modem_ipc::pin::RESULT_UNKNOWN
+            } else {
+                result
+            });
+            return;
+        }
+        let read = self
+            .clients
+            .iter()
+            .find(|c| c.service == UIM)
+            .map_or(0, |c| c.txn);
+        self.pin_op = Some(PinOp {
+            answer: Some((result, read)),
+            ..op
+        });
+    }
+
+    /// The card read after a PIN request's answer: success only if the card read and, for protection, shows it.
+    fn pin_card_read(&mut self, p: &mut dyn Bus, m: &qmi::Msg) -> bool {
+        let Some(op) = self.pin_op else { return false };
+        let Some((result, read)) = op.answer else {
+            return false;
+        };
+        if read != m.txn {
+            return false;
+        }
+        let ok = m.result() == Some(Ok(()));
+        if ok {
+            self.card_status(p, m);
+        }
+        if self.pin_op.take().is_none() {
+            return true; // the card changed: already unknown
+        }
+        let shown = match op.on {
+            Some(true) => self.status.protection.state == modem_ipc::pin::VERIFIED,
+            Some(false) => self.status.protection.state == modem_ipc::pin::DISABLED,
+            None => true,
+        };
+        self.pin_done = Some(match (result, ok && shown) {
+            (0, true) => 0,
+            (0, false) => modem_ipc::pin::RESULT_UNKNOWN,
+            (e, _) => e,
+        });
+        true
     }
 
     fn target(&self, id: u8) -> Option<Call> {
@@ -776,9 +980,26 @@ impl Cellular {
 
     fn card_status(&mut self, p: &mut dyn Bus, m: &qmi::Msg) {
         if let Some(c) = uim::card(m) {
+            // (D11) a card that went, came or changed its PIN application is a new card: a new epoch, and a PIN
+            // change in flight can no longer be confirmed
+            use modem_ipc::sim::{BLOCKED, PIN_REQUIRED, PRESENT};
+            let was = matches!(self.status.sim, PRESENT | PIN_REQUIRED | BLOCKED);
+            let is = matches!(c.state, PRESENT | PIN_REQUIRED | BLOCKED);
+            let pr = &mut self.status.protection;
+            if was != is || (is && pr.pin_id != c.pin_id) {
+                pr.epoch = pr.epoch.wrapping_add(1).max(1);
+                if self.pin_op.take().is_some() {
+                    p.log(format_args!("uim: the card changed during a PIN request"));
+                    self.pin_done = Some(modem_ipc::pin::RESULT_UNKNOWN);
+                }
+            }
+            pr.state = c.pin;
+            pr.pin_id = c.pin_id;
             self.status.sim = c.state;
             self.status.pin_attempts = c.attempts;
-            self.pin_id = c.pin_id;
+            if c.pin_id != modem_ipc::pin::ID_UNKNOWN {
+                self.pin_id = c.pin_id;
+            }
             self.card = Some(match c.state {
                 modem_ipc::sim::ABSENT => 0,
                 modem_ipc::sim::ERROR => 2,
@@ -943,6 +1164,13 @@ impl Cellular {
     }
 
     fn response(&mut self, p: &mut dyn Bus, service: u32, m: &qmi::Msg) {
+        if service == UIM && matches!(m.id, uim::SET_PIN_PROTECTION | uim::CHANGE_PIN) {
+            self.pin_answer(p, m);
+            return;
+        }
+        if service == UIM && m.id == UIM_GET_CARD_STATUS && self.pin_card_read(p, m) {
+            return;
+        }
         if self
             .command
             .is_some_and(|(s, id, txn, _)| s == service && id == m.id && txn == m.txn)
@@ -1362,6 +1590,16 @@ impl Cellular {
             self.status.result = -33;
         }
         if self
+            .pin_op
+            .is_some_and(|o| now_ms.saturating_sub(o.since) >= PIN_MS)
+        {
+            // no answer: unknown, and only a read-only look at the card (never VERIFY, never the request again)
+            self.pin_op = None;
+            self.pin_done = Some(modem_ipc::pin::RESULT_UNKNOWN);
+            p.log(format_args!("uim: PIN request unanswered"));
+            self.request(p, UIM, UIM_GET_CARD_STATUS, &[]);
+        }
+        if self
             .command
             .is_some_and(|(_, _, _, t)| now_ms.saturating_sub(t) >= 15_000)
         {
@@ -1432,7 +1670,13 @@ impl Cellular {
             core::mem::take(&mut self.sms_out),
         );
         let state = self.state;
+        // (D11) a restart loses the card's answer to a PIN request; the card is read anew, under a new epoch
+        let pin_done = self
+            .pin_done
+            .or(self.pin_op.map(|_| modem_ipc::pin::RESULT_UNKNOWN));
         *self = Self::new();
+        self.pin_done = pin_done;
+        self.status.protection.epoch = old.protection.epoch.wrapping_add(1).max(1);
         self.state = state;
         self.sms = sms;
         self.sms_out = sms_out;

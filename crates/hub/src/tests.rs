@@ -832,3 +832,46 @@ fn acknowledged_recovery_reopens_without_a_second_reset_generation() {
         assert!(!matches!(event, Event::Reset { .. }));
     }
 }
+
+#[test]
+fn a_traced_pin_request_never_shows_its_digits() {
+    let (mut r, mut f) = (modem(), fake());
+    r.trace = true;
+    // synthetic sentinel PINs, as VERIFY (0x26), SET PIN PROTECTION (0x25) and CHANGE PIN (0x28) carry them
+    let verify = qmi::Builder::new(qmi::REQUEST, 7, 0x26)
+        .tlv(1, &[6, 0])
+        .tlv(2, &[1, 4, b'9', b'7', b'5', b'3'])
+        .finish();
+    let change = qmi::Builder::new(qmi::REQUEST, 8, 0x28)
+        .tlv(1, &[6, 0])
+        .tlv(
+            2,
+            &[1, 4, b'9', b'7', b'5', b'3', 4, b'8', b'6', b'4', b'2'],
+        )
+        .finish();
+    let set = qmi::Builder::new(qmi::REQUEST, 9, 0x25)
+        .tlv(1, &[6, 0])
+        .tlv(2, &[1, 1, 4, b'9', b'7', b'5', b'3'])
+        .finish();
+    {
+        let mut bus = r.bus(&mut f);
+        hub_ipc::Bus::bind(&mut bus, 11, 0x21).unwrap();
+        for p in [&verify, &change, &set] {
+            assert!(hub_ipc::Bus::send(&mut bus, 0x21, (0, 55), p, false));
+        }
+    }
+    assert_eq!(f.sent.len(), 3, "sent unchanged");
+    let traced: Vec<&String> = f.logs.iter().filter(|l| l.contains("qmi type 0")).collect();
+    assert_eq!(traced.len(), 3);
+    for l in &f.logs {
+        for secret in ["9753", "39373533", "8642", "38363432"] {
+            assert!(!l.contains(secret), "{l}");
+        }
+    }
+    assert!(traced.iter().all(|l| l.contains("(redacted)")));
+    // other requests still dump their bytes
+    let status = qmi::Builder::new(qmi::REQUEST, 10, 0x2f).finish();
+    hub_ipc::Bus::send(&mut r.bus(&mut f), 0x21, (0, 55), &status, false);
+    assert!(f.logs.last().unwrap().contains("00"));
+    assert!(!f.logs.last().unwrap().contains("redacted"));
+}

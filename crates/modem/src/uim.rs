@@ -2,17 +2,24 @@
 //! UIM card/PIN facts from libqmi data/qmi-service-uim.json and qmi-enums-uim.h.
 //! Only the primary GW application on slot 1 is used; no PIN value is retained.
 use crate::qmi::Msg;
-use modem_ipc::sim;
+use modem_ipc::{pin, sim};
 
 pub const REGISTER: u16 = 0x2e;
 pub const GET_STATUS: u16 = 0x2f;
 pub const STATUS_IND: u16 = 0x32;
 pub const VERIFY_PIN: u16 = 0x26;
+/// (D11) TLV 1 session [6, 0] (card slot 1, no AID, as VERIFY), TLV 2 [pin id, on, n, pin[n]]
+pub const SET_PIN_PROTECTION: u16 = 0x25;
+/// (D11) TLV 1 as above, TLV 2 [pin id, n, old[n], m, new[m]]
+pub const CHANGE_PIN: u16 = 0x28;
 
 pub struct Card {
     pub state: u8,
     pub attempts: u8,
+    /// PIN1 or UPIN for the selected application; [`pin::ID_UNKNOWN`] when no application was found
     pub pin_id: u8,
+    /// the raw UIM PIN state ([`modem_ipc::pin`]: 0 unknown .. 5 permanently blocked)
+    pub pin: u8,
 }
 
 pub fn card(m: &Msg) -> Option<Card> {
@@ -22,7 +29,8 @@ pub fn card(m: &Msg) -> Option<Card> {
         return Some(Card {
             state: sim::ABSENT,
             attempts: 255,
-            pin_id: 1,
+            pin_id: pin::ID_UNKNOWN,
+            pin: pin::UNKNOWN,
         });
     }
     let mut card = Card {
@@ -33,7 +41,8 @@ pub fn card(m: &Msg) -> Option<Card> {
             _ => sim::UNKNOWN,
         },
         attempts: 255,
-        pin_id: 1,
+        pin_id: pin::ID_UNKNOWN,
+        pin: pin::UNKNOWN,
     };
     if card.state != sim::PRESENT {
         return Some(card);
@@ -58,17 +67,20 @@ pub fn card(m: &Msg) -> Option<Card> {
             } else {
                 (info[1], info[2])
             };
-            card.pin_id = if upin { 3 } else { 1 };
+            card.pin_id = if upin { pin::ID_UPIN } else { pin::ID_PIN1 };
             card.attempts = attempts;
-            card.state = match pin {
-                1 => sim::PIN_REQUIRED,
-                4 | 5 => sim::BLOCKED,
-                2 | 3 => sim::PRESENT,
+            // UIM's PIN states are modem-ipc's pin::* (1 required, 2 verified, 3 disabled, 4 blocked, 5 for good);
+            // without one, the application state says what it can (2 PIN needed, 3 PUK needed, 5 PIN1 blocked)
+            (card.state, card.pin) = match pin {
+                1 => (sim::PIN_REQUIRED, pin),
+                4 | 5 => (sim::BLOCKED, pin),
+                2 | 3 => (sim::PRESENT, pin),
                 _ => match *b.get(at + 1)? {
-                    2 => sim::PIN_REQUIRED,
-                    3 | 5 => sim::BLOCKED,
-                    7 => sim::PRESENT,
-                    _ => sim::UNKNOWN,
+                    2 => (sim::PIN_REQUIRED, pin::REQUIRED),
+                    3 => (sim::BLOCKED, pin::BLOCKED),
+                    5 => (sim::BLOCKED, pin::PERM_BLOCKED),
+                    7 => (sim::PRESENT, pin::UNKNOWN),
+                    _ => (sim::UNKNOWN, pin::UNKNOWN),
                 },
             };
             return Some(card);
@@ -95,12 +107,39 @@ mod tests {
     fn pin_state_before_provisioning_and_upin_replacement() {
         let c = status(1, false);
         assert_eq!((c.state, c.attempts, c.pin_id), (sim::PIN_REQUIRED, 3, 1));
+        assert_eq!(c.pin, pin::REQUIRED);
         let c = status(4, false);
-        assert_eq!(c.state, sim::BLOCKED);
+        assert_eq!((c.state, c.pin), (sim::BLOCKED, pin::BLOCKED));
+        let c = status(5, false);
+        assert_eq!((c.state, c.pin), (sim::BLOCKED, pin::PERM_BLOCKED));
         let c = status(2, false);
-        assert_eq!(c.state, sim::PRESENT);
+        assert_eq!((c.state, c.pin), (sim::PRESENT, pin::VERIFIED));
+        let c = status(3, false);
+        assert_eq!(
+            (c.state, c.pin, c.attempts),
+            (sim::PRESENT, pin::DISABLED, 3)
+        );
+        // UPIN replaces PIN1: its state (byte 10) and attempts (byte 11) count
         let c = status(2, true);
         assert_eq!((c.state, c.attempts, c.pin_id), (sim::PIN_REQUIRED, 2, 3));
+        assert_eq!(c.pin, pin::REQUIRED);
+    }
+    #[test]
+    fn no_card_or_no_application_says_nothing_about_the_pin() {
+        for tlv in [
+            &[0u8, 0, 0, 0, 0, 0, 0, 0, 0][..],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 1, 1],
+        ] {
+            let bytes = Builder::new(RESPONSE, 1, GET_STATUS)
+                .result(0)
+                .tlv(0x10, tlv)
+                .finish();
+            let c = card(&Msg::parse(&bytes).unwrap()).unwrap();
+            assert_eq!(
+                (c.pin, c.pin_id, c.attempts),
+                (pin::UNKNOWN, pin::ID_UNKNOWN, 255)
+            );
+        }
     }
     #[test]
     fn truncated_app_is_rejected() {

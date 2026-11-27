@@ -24,6 +24,15 @@
 //! - v2.6: each [`Call`] says whether it is part of a conference ([`Call::multiparty`]) and when it connected
 //!   ([`Call::since`], MODEMD's tick clock, so every app shows the same timer); [`Status::imei`]; [`op::SILENCE`]
 //!   quietens one ringing call without touching the ring settings.
+//! - v2.8 (Settings D6, SE2c-1): [`op::RING_SETTINGS`]' tones may be the user's own sounds, ids
+//!   [`tone::FIRST_YOURS`]..=[`tone::LAST`] (AUDIOD plays their files, the built-in ringtone when one is missing). A
+//!   2.7 MODEMD refuses them: the shell sends the built-in tone instead. `settings.bin` keeps the built-in tone in
+//!   their place (a 2.7 MODEMD refuses the whole record otherwise); the shell sends them again after a restart.
+//! - v2.9 (Settings D11): the SIM PIN's protection. [`op::STATUS`] and [`op::NOTIFY`] with arg 2 = [`pin::EXTENDED`]
+//!   write [`Status::EXT_SIZE`] bytes: the 533 of before, then [`Protection`] (the raw PIN state, which PIN, the card's
+//!   epoch); arg 2 = 0 keeps the 533-byte reply. A 2.8 MODEMD writes 533 bytes into the bigger buffer: decode what
+//!   was written ([`Status::decode`]) and offer no PIN change then. [`op::SET_PIN_PROTECTION`] and
+//!   [`op::CHANGE_PIN`] (NEOSET only) complete when the card answered and was read again ([`pin`] results).
 //!
 //! Each op completes with KErrNone or an error: KErrNotReady (-18) without a modem/call to act on, KErrArgument (-6)
 //! for a number it refuses.
@@ -31,7 +40,7 @@
 
 pub const NAME: &str = "NeoModem";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (2, 7, 0);
+pub const VERSION: (i8, i8, i16) = (2, 9, 0);
 
 pub mod op {
     pub const STATUS: i32 = 1;
@@ -86,6 +95,14 @@ pub mod op {
     /// (2.6) arg0 call ID (0 = primary): stop ringing and vibrating for that call only (Silence). The ring settings
     /// stay as they are.
     pub const SILENCE: i32 = 28;
+    // 29-30 are kept for D9's ALERT_POLICY and D4's OWNER_USAGE.
+    /// (2.9, NEOSET only) arg0 des8 the current PIN, arg1 1 = ask for it at start, 0 = don't, arg2 the card epoch and
+    /// arg3 the modem generation of the extended status this session read. Completes once the card answered and was
+    /// read again: 0, or a [`super::pin`] result. Never retried.
+    pub const SET_PIN_PROTECTION: i32 = 31;
+    /// (2.9, NEOSET only) arg0 des8 the current PIN, arg1 des8 the new one (each 4-8 ASCII digits), arg2/arg3 as
+    /// [`SET_PIN_PROTECTION`]. Needs the PIN on and verified.
+    pub const CHANGE_PIN: i32 = 32;
 }
 
 /// SMS (C9): [`SmsEntry::state`], the [`op::SMS_READ`] modes, the [`op::SMS_EDIT`] actions, [`SmsSettings::alert`].
@@ -390,6 +407,69 @@ pub mod sim {
     pub const BLOCKED: u8 = 5;
 }
 
+/// (2.9) The SIM PIN: [`Protection::state`] and [`Protection::pin_id`] (UIM's own numbers), the opt-in, the results
+/// of [`op::SET_PIN_PROTECTION`] and [`op::CHANGE_PIN`].
+pub mod pin {
+    /// not known (no card, no application, or the card doesn't say)
+    pub const UNKNOWN: u8 = 0;
+    /// on, not entered yet (the start-up prompt)
+    pub const REQUIRED: u8 = 1;
+    /// on and entered
+    pub const VERIFIED: u8 = 2;
+    pub const DISABLED: u8 = 3;
+    /// the PUK is needed
+    pub const BLOCKED: u8 = 4;
+    pub const PERM_BLOCKED: u8 = 5;
+    pub const ID_UNKNOWN: u8 = 0;
+    pub const ID_PIN1: u8 = 1;
+    pub const ID_UPIN: u8 = 3;
+    /// arg 2 of STATUS/NOTIFY for the extended reply
+    pub const EXTENDED: i32 = 1;
+    /// KErrTimedOut: the card's answer was lost (timeout, restart, removal). Read the status; never send it again.
+    pub const RESULT_UNKNOWN: i32 = -33;
+    /// KErrAbort: the card or the modem changed since the status the request names.
+    pub const STALE: i32 = -39;
+    /// The card refused the PIN (QMI 12, -1000 - error as every QMI refusal); 35 blocked, 36 blocked for good.
+    pub const WRONG: i32 = -1012;
+    pub const NOW_BLOCKED: i32 = -1035;
+    pub const NOW_PERM_BLOCKED: i32 = -1036;
+    /// 4 to 8 ASCII digits (leading zeroes count).
+    pub fn valid(pin: &[u8]) -> bool {
+        (4..=8).contains(&pin.len()) && pin.iter().all(u8::is_ascii_digit)
+    }
+}
+
+/// (2.9) The tail of the extended status: schema 1, [`pin`] state, [`pin`] id, a zero byte, the card's epoch (u32
+/// LE, never 0 from a 2.9 MODEMD: it changes whenever the card or its application may have changed).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Protection {
+    pub state: u8,
+    pub pin_id: u8,
+    pub epoch: u32,
+}
+
+impl Protection {
+    pub const SIZE: usize = 8;
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let e = self.epoch.to_le_bytes();
+        [1, self.state, self.pin_id, 0, e[0], e[1], e[2], e[3]]
+    }
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        let b: &[u8; Self::SIZE] = b.try_into().ok()?;
+        let p = Self {
+            state: b[1],
+            pin_id: b[2],
+            epoch: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+        };
+        (b[0] == 1
+            && b[3] == 0
+            && p.state <= pin::PERM_BLOCKED
+            && matches!(p.pin_id, pin::ID_UNKNOWN | pin::ID_PIN1 | pin::ID_UPIN)
+            && p.epoch != 0)
+            .then_some(p)
+    }
+}
+
 /// Manage-calls actions. Answer/end additionally accept arg0 call ID (0 selects primary).
 pub mod manage {
     pub const HOLD: i32 = 1;
@@ -424,8 +504,34 @@ pub mod tone {
     pub const TWO_BEEPS: u8 = 2;
     /// no sound: the call vibrates (if vibrate is on), a message buzzes
     pub const NONE: u8 = 3;
+    /// (2.8) the user's own sounds (NeoAudio `tones::file`): the first and the last id
+    pub const FIRST_YOURS: u8 = 4;
+    pub const LAST: u8 = 15;
+
+    /// (2.8) The tones as `settings.bin` keeps them: the user's own sounds as the built-in tone, so a 2.7 MODEMD still
+    /// reads the record (the shell sends the real ones again after a restart).
+    #[must_use]
+    pub fn persisted(t: (u8, u8)) -> (u8, u8) {
+        let keep = |x: u8| if x > NONE { BUILT_IN } else { x };
+        (keep(t.0), keep(t.1))
+    }
     /// [`super::op::RING_SETTINGS`]' arg3 carries tones (bit 8); without it MODEMD keeps the ones it has.
     pub const PRESENT: i32 = 0x100;
+
+    /// SYSSTART (neoui's shell): it owns the ring settings and replays them.
+    pub const SYSSTART_SID: u32 = 0xE000_2001;
+    /// NEOPHONE (NeoSymbian/phone), the legacy caller: the three-argument form only (arg3 = 0, no tones).
+    pub const PHONE_SID: u32 = 0xE000_5001;
+
+    /// Who may change the persisted ring settings, in which form ([`super::op::RING_SETTINGS`]).
+    #[must_use]
+    pub fn caller_allowed(sid: u32, arg3: i32) -> bool {
+        match sid {
+            SYSSTART_SID => true,
+            PHONE_SID => arg3 == 0,
+            _ => false,
+        }
+    }
 
     /// arg3 for these tones.
     #[must_use]
@@ -448,13 +554,13 @@ pub mod tone {
     /// The tones in arg3: `Ok(None)` when it carries none (an older caller).
     ///
     /// # Errors
-    /// [`Unknown`] for a tone above [`NONE`] or stray bits.
+    /// [`Unknown`] for stray bits (since 2.8 every 4-bit id is a tone: 0..=3 built in, 4..=15 the user's own).
     pub fn unpack(arg: i32) -> Result<Option<(u8, u8)>, Unknown> {
         if arg & PRESENT == 0 {
             return Ok(None);
         }
         let (ring, message) = ((arg & 0xf) as u8, (arg >> 4 & 0xf) as u8);
-        if ring > NONE || message > NONE || arg & !0x1ff != 0 {
+        if arg & !0x1ff != 0 {
             return Err(Unknown);
         }
         Ok(Some((ring, message)))
@@ -466,6 +572,20 @@ pub mod tone {
 /// reading it (and loses only the tones).
 pub mod saved {
     use super::Ring;
+
+    /// What MODEMD may do with `settings.bin` after reading it at boot: `Ok(Some)` its settings, `Ok(None)` none
+    /// (absent, or damaged: the defaults may replace it), `Err` it couldn't be read (an I/O error), so it must not be
+    /// overwritten until a later read resolves it. `read` is `sys::load_private`'s answer.
+    ///
+    /// # Errors
+    /// The read's error, other than not found (-1) and path not found (-12).
+    pub fn resolve(read: Result<&[u8], i32>) -> Result<Option<Saved>, i32> {
+        match read {
+            Ok(b) => Ok(decode(b)),
+            Err(-1 | -12) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Saved {
@@ -515,7 +635,12 @@ pub mod saved {
             return None;
         }
         let tones = if kind == 9 {
-            Some(super::tone::unpack(super::tone::PRESENT | i32::from(b[9])).ok()??)
+            // the file never keeps the user's own sounds (`tone::persisted`): a record with one is damaged
+            let t = super::tone::unpack(super::tone::PRESENT | i32::from(b[9])).ok()??;
+            if super::tone::persisted(t) != t {
+                return None;
+            }
+            Some(t)
         } else {
             None
         };
@@ -682,6 +807,8 @@ pub struct Status {
     pub sms_senders: u8,
     /// (2.6) the IMEI (empty until the modem reports it); `*#06#` shows it. Never log it whole.
     pub imei: Text,
+    /// (2.9) only in the extended reply ([`Status::to_ext_bytes`])
+    pub protection: Protection,
 }
 
 /// v2.1's tail: the calls' presentations, the log revision, call waiting, the selected call's presentation.
@@ -694,6 +821,29 @@ const V26: usize = (MAX_CALLS + 1) * 9 + 1 + TEXT;
 
 impl Status {
     pub const SIZE: usize = 110 + MAX_CALLS * 36 + V21 + V23 + V26;
+    /// (2.9) [`Status::SIZE`] then [`Protection`]
+    pub const EXT_SIZE: usize = Self::SIZE + Protection::SIZE;
+
+    pub fn to_ext_bytes(&self) -> [u8; Self::EXT_SIZE] {
+        let mut b = [0u8; Self::EXT_SIZE];
+        b[..Self::SIZE].copy_from_slice(&self.to_bytes());
+        b[Self::SIZE..].copy_from_slice(&self.protection.to_bytes());
+        b
+    }
+
+    /// What a server wrote, by its length: [`Status::SIZE`] bytes (a 2.8 MODEMD, or no opt-in) has no protection;
+    /// [`Status::EXT_SIZE`] has it (or is refused whole). Any other length is refused.
+    pub fn decode(b: &[u8]) -> Option<(Self, Option<Protection>)> {
+        let mut s = Self::from_bytes(b)?;
+        match b.len() {
+            Self::SIZE => Some((s, None)),
+            Self::EXT_SIZE => {
+                s.protection = Protection::from_bytes(&b[Self::SIZE..])?;
+                Some((s, Some(s.protection)))
+            }
+            _ => None,
+        }
+    }
 
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
@@ -849,6 +999,7 @@ impl Status {
             sms_unread: u16::from_le_bytes([b[TAIL + V21 + 4], b[TAIL + V21 + 5]]),
             sms_senders: b[TAIL + V21 + 6],
             imei: text(v26 + (MAX_CALLS + 1) * 9)?,
+            protection: Protection::default(),
         })
     }
 }
@@ -873,6 +1024,13 @@ mod tests {
             b[..n].to_vec()
         };
         assert_eq!(decode(&bytes(&s)), Some(s));
+        // a boot read: absent may become the defaults, an I/O error must not be overwritten
+        assert_eq!(resolve(Ok(&bytes(&s))), Ok(Some(s)));
+        assert_eq!(resolve(Err(-1)), Ok(None));
+        assert_eq!(resolve(Err(-12)), Ok(None));
+        assert_eq!(resolve(Ok(&[1, 2, 3])), Ok(None));
+        assert_eq!(resolve(Err(-18)), Err(-18));
+        assert_eq!(resolve(Err(-20)), Err(-20));
         // a chosen tone: C8's nine bytes and the tones' byte, so an older MODEMD (it reads 9 bytes) still takes the
         // rest; the built-in tones save as C8, byte for byte what the C8 writer wrote
         let plain = Saved {
@@ -905,7 +1063,9 @@ mod tests {
         assert_eq!(set, (BEEP, TWO_BEEPS));
         // NEOPHONE's and an older shell's RING_SETTINGS: arg3 = 0
         assert_eq!(apply(set, 0), Ok(set));
-        assert_eq!(apply(set, PRESENT | 9), Err(Unknown));
+        // 2.8: the user's own sounds pass through; stray bits don't
+        assert_eq!(apply(set, PRESENT | 9), Ok((9, BUILT_IN)));
+        assert_eq!(apply(set, PRESENT | 0x400), Err(Unknown));
     }
 
     #[test]
@@ -918,9 +1078,20 @@ mod tests {
             unpack(pack(BUILT_IN, BUILT_IN)),
             Ok(Some((BUILT_IN, BUILT_IN)))
         );
-        assert_eq!(unpack(PRESENT | 4), Err(Unknown));
-        assert_eq!(unpack(PRESENT | 4 << 4), Err(Unknown));
+        assert_eq!(unpack(PRESENT | 4), Ok(Some((FIRST_YOURS, BUILT_IN))));
+        assert_eq!(unpack(pack(LAST, 7)), Ok(Some((LAST, 7))));
         assert_eq!(unpack(PRESENT | 0x200), Err(Unknown));
+        assert_eq!(unpack(-1), Err(Unknown));
+        // only the shell, and NEOPHONE without tones
+        assert!(caller_allowed(SYSSTART_SID, pack(5, BUILT_IN)));
+        assert!(caller_allowed(SYSSTART_SID, 0));
+        assert!(caller_allowed(PHONE_SID, 0));
+        assert!(!caller_allowed(PHONE_SID, pack(BEEP, BUILT_IN)));
+        assert!(!caller_allowed(0xE000_2007, 0)); // Settings goes through the shell
+        assert!(!caller_allowed(0, 0));
+        // settings.bin keeps the built-in tone in their place
+        assert_eq!(persisted((5, TWO_BEEPS)), (BUILT_IN, TWO_BEEPS));
+        assert_eq!(persisted((NONE, 15)), (NONE, BUILT_IN));
     }
 
     use super::*;
@@ -954,6 +1125,46 @@ mod tests {
         assert_eq!(Status::from_bytes(&b), Some(s));
         assert_eq!(Status::from_bytes(&b[..10]), None);
         assert_eq!(Status::from_bytes(&b[..78]), None);
+    }
+
+    #[test]
+    fn extended_status_keeps_the_old_bytes_and_decodes_by_length() {
+        let s = Status {
+            sim: sim::PRESENT,
+            generation: 7,
+            pin_attempts: 3,
+            protection: Protection {
+                state: pin::VERIFIED,
+                pin_id: pin::ID_UPIN,
+                epoch: 0x0102_0304,
+            },
+            ..Status::default()
+        };
+        let ext = s.to_ext_bytes();
+        assert_eq!(Status::SIZE, 533);
+        assert_eq!(Status::EXT_SIZE, 541);
+        // the old bytes stay where they were: SIM at 1, generation at 82, attempts at 93
+        assert_eq!(&ext[..Status::SIZE], &s.to_bytes()[..]);
+        assert_eq!((ext[1], ext[82], ext[93]), (sim::PRESENT, 7, 3));
+        assert_eq!(&ext[533..], &[1, 2, 3, 0, 4, 3, 2, 1]);
+        assert_eq!(Status::decode(&ext), Some((s, Some(s.protection))));
+        // a 2.8 server's 533 bytes: no protection, so no PIN change
+        let old = Status::decode(&ext[..Status::SIZE]).unwrap();
+        assert_eq!(old.1, None);
+        assert_eq!(old.0.protection, Protection::default());
+        // the legacy decoder ignores the tail; other lengths and bad tails are refused
+        assert_eq!(Status::from_bytes(&ext).map(|s| s.pin_attempts), Some(3));
+        assert!(Status::decode(&ext[..540]).is_none());
+        for (at, v) in [(533, 2), (534, 6), (535, 2), (536, 1)] {
+            let mut bad = ext;
+            bad[at] = v;
+            assert!(Status::decode(&bad).is_none(), "byte {at} = {v}");
+        }
+        let mut zero = ext;
+        zero[537..].fill(0);
+        assert!(Status::decode(&zero).is_none());
+        assert!(pin::valid(b"0000") && pin::valid(b"01234567"));
+        assert!(!pin::valid(b"123") && !pin::valid(b"123456789") && !pin::valid(b"12a4"));
     }
 
     #[test]

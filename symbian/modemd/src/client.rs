@@ -97,6 +97,38 @@ impl Modem {
         self.cellular
             .verify_pin(&mut RemoteBus(self.session.as_deref()), pin)
     }
+    pub fn pin_protection(
+        &mut self,
+        _p: &mut Hal,
+        pin: &[u8],
+        on: bool,
+        epoch: u32,
+        generation: u32,
+    ) -> Result<(), i32> {
+        self.cellular.pin_protection(
+            &mut RemoteBus(self.session.as_deref()),
+            pin,
+            on,
+            epoch,
+            generation,
+        )
+    }
+    pub fn change_pin(
+        &mut self,
+        _p: &mut Hal,
+        old: &[u8],
+        new: &[u8],
+        epoch: u32,
+        generation: u32,
+    ) -> Result<(), i32> {
+        self.cellular.change_pin(
+            &mut RemoteBus(self.session.as_deref()),
+            old,
+            new,
+            epoch,
+            generation,
+        )
+    }
     pub fn answer_call(&mut self, _p: &mut Hal, id: u8) -> Result<(), i32> {
         self.cellular
             .answer_call(&mut RemoteBus(self.session.as_deref()), id)
@@ -172,17 +204,21 @@ impl Bus for RemoteBus<'_> {
     }
     fn send(&mut self, port: u32, dst: (u32, u32), payload: &[u8], essential: bool) -> bool {
         let Some(s) = self.0 else { return false };
-        let bytes = hub_ipc::Send {
+        let mut bytes = hub_ipc::Send {
             port,
             dst,
             essential,
             payload,
         }
         .encode();
-        let des = TPtrC8::new(&bytes);
-        let mut args = TIpcArgs::new();
-        args.desc8(0, &des);
-        matches!(s.send_receive(hub_ipc::op::SEND, &args), Ok(n) if n != 0)
+        let sent = {
+            let des = TPtrC8::new(&bytes);
+            let mut args = TIpcArgs::new();
+            args.desc8(0, &des);
+            matches!(s.send_receive(hub_ipc::op::SEND, &args), Ok(n) if n != 0)
+        };
+        hub_ipc::wipe(&mut bytes); // it may carry a SIM PIN
+        sent
     }
     fn log(&mut self, args: fmt::Arguments) {
         dprintln!("[modemd] t={}ms {}", time::millis(), args);

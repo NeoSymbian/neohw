@@ -24,6 +24,9 @@ use hub_ipc::{Event, Snapshot};
 use modem_ipc::{self, Status, op};
 use sys::{HAPTIC, Io, hal_io, save_private};
 
+/// D11: SET_PIN_PROTECTION / CHANGE_PIN answer KErrNotSupported until the review's P1s are fixed.
+const PIN_CHANGES_ENABLED: bool = false;
+
 const NOT_READY: i32 = -18;
 /// NEOPHONE, NEOCONT, NEOMSG (NeoSymbian/phone) and NEOSET (neoui's Settings): who may clear the call log or every SMS.
 const PHONE_SID: u32 = 0xE000_5001;
@@ -59,7 +62,12 @@ struct Daemon {
     audio: audio::Link,
     /// a keypad tone ends here (ms): one tap = one 200 ms tone
     dtmf_stop: Option<u64>,
-    subscribers: Vec<(u32, Message)>,
+    /// NOTIFY requests: session, message, (2.9) extended reply
+    subscribers: Vec<(u32, Message, bool)>,
+    /// (D11) the one SET_PIN_PROTECTION / CHANGE_PIN waiting for the card: its session and message
+    pin_msg: Option<(u32, Message)>,
+    /// (D11) the card epoch and modem generation of the last extended status each session was given
+    seen: Vec<(u32, u32, u32)>,
     next_session: u32,
     published: Status,
     haptic_at: u64,
@@ -73,7 +81,21 @@ struct Daemon {
     sms_buzz_at: u64,
     /// the last ringtone error AUDIOD reported (NeoModem's result once)
     ring_error: i32,
+    /// settings.bin couldn't be read at boot (an I/O error, not its absence): it isn't overwritten until a read
+    /// resolves it, tried again here (ms); what changed meanwhile (airplane, ring and tones, C8) wins over the file
+    settings_unread: Option<u64>,
+    changed: Changed,
 }
+
+/// What a request changed since boot (only consulted while settings.bin is still unread).
+#[derive(Clone, Copy, Default)]
+struct Changed {
+    airplane: bool,
+    ring: bool,
+    c8: bool,
+}
+
+const SETTINGS_PATH: &str = "C:\\private\\e0003001\\settings.bin";
 
 impl Daemon {
     fn status(&self) -> Status {
@@ -98,20 +120,93 @@ impl Daemon {
     }
 
     fn publish(&mut self) {
+        // (D11) a PIN request the card answered (and was read again), or whose answer was lost
+        if let Some(r) = self.modem.as_mut().and_then(|m| m.take_pin_done()) {
+            dprintln!("[modemd] SIM PIN request finished ({})", r);
+            if let Some((_, msg)) = self.pin_msg.take() {
+                msg.complete(r);
+            }
+        }
         let mut next = self.status();
         if next == self.published {
             return;
         }
         next.revision = self.published.revision.wrapping_add(1);
         self.published = next;
-        for (_, msg) in self.subscribers.drain(..) {
-            let r = msg.write8(0, &next.to_bytes(), 0).map_or_else(|e| e, |_| 0);
+        for (session, msg, ext) in core::mem::take(&mut self.subscribers) {
+            let r = self.write_status(session, &msg, &next, ext);
+            msg.complete(r);
+        }
+    }
+
+    /// STATUS/NOTIFY's reply: 533 bytes, or (2.9) with the protection, remembered as seen by that session.
+    fn write_status(&mut self, session: u32, msg: &Message, s: &Status, ext: bool) -> i32 {
+        if !ext {
+            return msg.write8(0, &s.to_bytes(), 0).map_or_else(|e| e, |_| 0);
+        }
+        match msg.write8(0, &s.to_ext_bytes(), 0) {
+            Ok(()) => {
+                self.seen.retain(|(id, ..)| *id != session);
+                self.seen.push((session, s.protection.epoch, s.generation));
+                0
+            }
+            Err(e) => e,
+        }
+    }
+
+    /// (2.9) NOTIFY/STATUS arg 2 asks for the extended reply; its buffer must hold it before anything is queued.
+    fn extended(msg: &Message) -> Result<bool, i32> {
+        if msg.int(2) != modem_ipc::pin::EXTENDED {
+            return Ok(false);
+        }
+        match msg.des_max_len(0) {
+            Ok(n) if n >= Status::EXT_SIZE => Ok(true),
+            Ok(_) => Err(err::KERR_OVERFLOW),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// (D11) SET_PIN_PROTECTION / CHANGE_PIN from NEOSET (checked before this): only against the card and modem
+    /// this session last saw, one at a time, completed when the card has answered. The PINs live in fixed buffers
+    /// that are wiped whatever happens, and are never logged.
+    fn pin_request(&mut self, session: u32, msg: Message) {
+        let (epoch, generation) = (msg.int(2) as u32, msg.int(3) as u32);
+        let r = if self.pin_msg.is_some() {
+            err::KERR_IN_USE
+        } else if !self.seen.contains(&(session, epoch, generation)) {
+            modem_ipc::pin::STALE
+        } else {
+            let (mut old, mut new) = ([0u8; 8], [0u8; 8]);
+            let r = match (msg.function(), read_pin(&msg, 0, &mut old)) {
+                (_, Err(e)) => e,
+                (op::SET_PIN_PROTECTION, Ok(n)) => self.modem.as_mut().map_or(NOT_READY, |m| {
+                    m.pin_protection(&mut Hal, &old[..n], msg.int(1) != 0, epoch, generation)
+                        .err()
+                        .unwrap_or(0)
+                }),
+                (_, Ok(n)) => match read_pin(&msg, 1, &mut new) {
+                    Err(e) => e,
+                    Ok(k) => self.modem.as_mut().map_or(NOT_READY, |m| {
+                        m.change_pin(&mut Hal, &old[..n], &new[..k], epoch, generation)
+                            .err()
+                            .unwrap_or(0)
+                    }),
+                },
+            };
+            hub_ipc::wipe(&mut old);
+            hub_ipc::wipe(&mut new);
+            r
+        };
+        dprintln!("[modemd] SIM PIN request {} -> {}", msg.function(), r);
+        if r == 0 {
+            self.pin_msg = Some((session, msg));
+        } else {
             msg.complete(r);
         }
     }
 
     fn cancel_notify(&mut self, id: u32) {
-        if let Some(i) = self.subscribers.iter().position(|(s, _)| *s == id) {
+        if let Some(i) = self.subscribers.iter().position(|(s, ..)| *s == id) {
             self.subscribers.remove(i).1.complete(-3);
         }
     }
@@ -305,7 +400,11 @@ impl Daemon {
     }
 
     /// settings.bin: the C8 record (C7's plus caller ID and the log's days); C7 files still load.
-    fn save_settings(&self) -> Result<(), i32> {
+    fn save_settings(&mut self) -> Result<(), i32> {
+        // never over a file that couldn't be read: the request stays in memory, the caller tries again
+        if self.settings_unread.is_some() {
+            self.load_settings()?;
+        }
         let s = self.status();
         let (clir, days) = self
             .modem
@@ -318,7 +417,9 @@ impl Daemon {
             airplane: s.airplane,
             ring: s.ring,
             c8: Some((clir, days)),
-            tones: Some(self.tones),
+            // (2.8) the user's own sounds as the built-in tone: a 2.7 MODEMD refuses the record otherwise; the shell
+            // sends them again after a restart
+            tones: Some(modem_ipc::tone::persisted(self.tones)),
         });
         sys::replace_private(
             "C:\\private\\e0003001\\",
@@ -364,7 +465,39 @@ impl Daemon {
             .unwrap_or(0)
     }
 
+    /// settings.bin onto what is in memory, but what a request already changed. `Err`: unreadable still.
+    fn load_settings(&mut self) -> Result<(), i32> {
+        let read = sys::load_private(SETTINGS_PATH, 16);
+        let saved = modem_ipc::saved::resolve(read.as_deref().map_err(|e| *e))?;
+        self.settings_unread = None;
+        let Some(saved) = saved else { return Ok(()) };
+        let c = self.changed;
+        if !c.airplane {
+            self.status.airplane = saved.airplane;
+        }
+        if !c.ring {
+            self.status.ring = saved.ring;
+            if let Some(t) = saved.tones {
+                self.tones = t;
+            }
+            if let Some(m) = &mut self.modem {
+                m.status.ring = saved.ring;
+            }
+        }
+        if let (false, Some((clir, days)), Some(m)) = (c.c8, saved.c8, &mut self.modem) {
+            m.clir = i32::from(clir);
+            m.log.days = days;
+        }
+        Ok(())
+    }
+
     fn step(&mut self) {
+        if self.settings_unread.is_some_and(|at| time::millis() >= at) {
+            match self.load_settings() {
+                Ok(()) => dprintln!("[modemd] settings.bin read"),
+                Err(_) => self.settings_unread = Some(time::millis() + 2_000),
+            }
+        }
         self.connect_hub();
         self.run();
         // AUDIOD runs on every machine (NeoAudio's clock sink without an ADSP), so it is started and fed always
@@ -626,6 +759,11 @@ impl Service for Daemon {
             }
             _ => None,
         };
+        // (D11) the SIM PIN's protection and a new PIN: NEOSET only, checked before either PIN is read
+        let bulk = match msg.function() {
+            op::SET_PIN_PROTECTION | op::CHANGE_PIN => Some(&[NEOSET_SID][..]),
+            _ => bulk,
+        };
         if let Some(allowed) = bulk
             && !allowed.contains(&msg.client_sid())
         {
@@ -638,17 +776,23 @@ impl Service for Daemon {
             return;
         }
         if msg.function() == op::NOTIFY {
-            if self.subscribers.iter().any(|(s, _)| s == session) || self.subscribers.len() >= 16 {
+            if self.subscribers.iter().any(|(s, ..)| s == session) || self.subscribers.len() >= 16 {
                 msg.complete(err::KERR_IN_USE);
                 return;
             }
+            let ext = match Self::extended(&msg) {
+                Ok(ext) => ext,
+                Err(e) => {
+                    msg.complete(e);
+                    return;
+                }
+            };
             if msg.int(1) as u32 == self.published.revision {
-                self.subscribers.push((*session, msg));
+                self.subscribers.push((*session, msg, ext));
                 return;
             }
-            let r = msg
-                .write8(0, &self.published.to_bytes(), 0)
-                .map_or_else(|e| e, |_| 0);
+            let published = self.published;
+            let r = self.write_status(*session, &msg, &published, ext);
             msg.complete(r);
             return;
         }
@@ -679,6 +823,17 @@ impl Service for Daemon {
             msg.complete(NOT_READY);
             return;
         }
+        if matches!(msg.function(), op::SET_PIN_PROTECTION | op::CHANGE_PIN) {
+            // shortcut: the PIN changes are held back until the D11 review's P1s are fixed (the servers aren't
+            // authenticated, HWHUB doesn't check destinations, the target card isn't frozen, buffers aren't wiped);
+            // enable by removing this when they are
+            if !PIN_CHANGES_ENABLED {
+                msg.complete(err::KERR_NOT_SUPPORTED);
+                return;
+            }
+            self.pin_request(*session, msg);
+            return;
+        }
         let target = msg.int(0);
         if matches!(msg.function(), op::ANSWER | op::HANGUP | op::SILENCE)
             && !(0..=255).contains(&target)
@@ -688,9 +843,13 @@ impl Service for Daemon {
         }
 
         let r = match msg.function() {
-            op::STATUS => msg
-                .write8(0, &self.status().to_bytes(), 0)
-                .map_or_else(|e| e, |_| err::KERR_NONE),
+            op::STATUS => match Self::extended(&msg) {
+                Ok(ext) => {
+                    let s = self.status();
+                    self.write_status(*session, &msg, &s, ext)
+                }
+                Err(e) => e,
+            },
             op::DIAL => {
                 let read = msg.des_len(0).and_then(|n| {
                     if n <= 32 {
@@ -786,6 +945,7 @@ impl Service for Daemon {
                     m.airplane(&mut Hal, msg.int(0) != 0).err().unwrap_or(0)
                 });
                 if r == 0 {
+                    self.changed.airplane = true;
                     self.save_settings().err().unwrap_or(0)
                 } else {
                     r
@@ -807,6 +967,11 @@ impl Service for Daemon {
                 }
                 Err(e) => e,
             },
+            // only the shell (any form) and NEOPHONE (without tones): they persist in settings.bin
+            op::RING_SETTINGS if !modem_ipc::tone::caller_allowed(msg.client_sid(), msg.int(3)) => {
+                dprintln!("[modemd] ring settings refused to {:08x}", msg.client_sid());
+                err::KERR_PERMISSION_DENIED
+            }
             op::RING_SETTINGS => {
                 if !(0..=10).contains(&msg.int(0)) {
                     err::KERR_ARGUMENT
@@ -820,6 +985,7 @@ impl Service for Daemon {
                     match modem_ipc::tone::apply(self.tones, msg.int(3)) {
                         Err(_) => err::KERR_ARGUMENT,
                         Ok(tones) => {
+                            self.changed.ring = true;
                             self.tones = tones;
                             self.status.ring = ring;
                             if let Some(m) = &mut self.modem {
@@ -862,6 +1028,7 @@ impl Service for Daemon {
                     if m.log.set_days(days as u8, Hal.utc_ms()) {
                         m.status.log_revision = m.status.log_revision.wrapping_add(1);
                     }
+                    self.changed.c8 = true;
                     self.save_settings().err().unwrap_or(0)
                 } else {
                     NOT_READY
@@ -1027,7 +1194,22 @@ impl Service for Daemon {
 
     fn disconnect(&mut self, session: u32) -> ControlFlow<()> {
         self.cancel_notify(session);
+        self.seen.retain(|(id, ..)| *id != session);
+        // the card may still answer; until then no other PIN request starts (Cellular keeps it)
+        if self.pin_msg.as_ref().is_some_and(|(id, _)| *id == session)
+            && let Some((_, msg)) = self.pin_msg.take()
+        {
+            msg.complete(err::KERR_CANCEL);
+        }
         ControlFlow::Continue(())
+    }
+}
+
+/// A PIN from descriptor `slot` into `buf`: 4-8 bytes (the digits are checked by Cellular), nothing else read.
+fn read_pin(msg: &Message, slot: usize, buf: &mut [u8; 8]) -> Result<usize, i32> {
+    match msg.des_len(slot)? {
+        n @ 4..=8 => msg.read8(slot, &mut buf[..n], 0),
+        _ => Err(err::KERR_ARGUMENT),
     }
 }
 
@@ -1096,6 +1278,8 @@ fn main() -> i32 {
         audio: audio::Link::new(),
         dtmf_stop: None,
         subscribers: Vec::new(),
+        pin_msg: None,
+        seen: Vec::new(),
         next_session: 0,
         published: Status::default(),
         haptic_at: 0,
@@ -1107,23 +1291,19 @@ fn main() -> i32 {
         tones: (modem_ipc::tone::BUILT_IN, modem_ipc::tone::BUILT_IN),
         sms_buzz_at: 0,
         ring_error: 0,
+        settings_unread: None,
+        changed: Changed::default(),
     };
     // Ordinary C: settings only; modem EFS remains RAM-backed (G4).
     if let Ok(fs) = e32::fs::Fs::connect() {
-        // C7 or C8, with or without the tones' byte (and the `.new` a cut mid-save left, sys::load_private)
-        if let Some(saved) = sys::load_private("C:\\private\\e0003001\\settings.bin", 16)
-            .ok()
-            .and_then(|v| modem_ipc::saved::decode(&v))
-        {
-            d.status.airplane = saved.airplane;
-            d.status.ring = saved.ring;
-            if let Some(t) = saved.tones {
-                d.tones = t;
-            }
-            if let (Some((clir, days)), Some(m)) = (saved.c8, &mut d.modem) {
-                m.clir = i32::from(clir);
-                m.log.days = days;
-            }
+        // C7 or C8, with or without the tones' byte (and the `.new` a cut mid-save left, sys::load_private); an
+        // unreadable one is tried again and never overwritten meanwhile
+        if let Err(e) = d.load_settings() {
+            dprintln!(
+                "[modemd] settings.bin unreadable ({}): kept, read again later",
+                e
+            );
+            d.settings_unread = Some(0);
         }
         // the call log (C8): a missing or unreadable calls.db starts an empty one
         if let Some(m) = &mut d.modem

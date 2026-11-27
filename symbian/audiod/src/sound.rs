@@ -13,6 +13,9 @@ use e32::sys::err;
 use e32::sys::ipc::TVersion;
 use neoaudio::{self, Info, Stream, op, sink, state};
 
+/// MODEMD.EXE's UID3, the only client that may send [`op::CONTROL`].
+const MODEMD_SID: u32 = 0xE000_3001;
+
 /// Media stays wanted this long after the last sound, so short gaps don't power the amps down and up.
 const LINGER_MS: u64 = 2_000;
 /// A media start that has not reached the ADSP by then plays on the clock sink instead.
@@ -213,7 +216,12 @@ impl Service for Sound {
 
     fn message(&mut self, session: &mut u32, msg: Message) {
         if msg.function() == op::CONTROL {
-            // shortcut: any client may send it; check MODEMD's SID once e32 exposes the client's secure id
+            // MODEMD's alone: the call's audio path and the ring
+            if msg.client_sid() != MODEMD_SID {
+                dprintln!("[audiod] control refused to {:08x}", msg.client_sid());
+                msg.complete(err::KERR_PERMISSION_DENIED);
+                return;
+            }
             let mut b = [0u8; neoaudio::control::Intent::SIZE];
             let r = match msg.read8(0, &mut b, 0) {
                 Ok(n) => match neoaudio::control::Intent::from_bytes(&b[..n]) {
