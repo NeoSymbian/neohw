@@ -10,9 +10,11 @@ pub const MAX_PAYLOAD: usize = 8192;
 pub const MAX_EVENTS: usize = 64;
 
 pub mod op {
-    /// arg0 service, arg1 local port. The session owns the binding.
+    /// arg0 service, arg1 local port. The session owns the binding. KErrPermissionDenied unless the client's SID is
+    /// the service's owner ([`crate::service_owner`]).
     pub const BIND: i32 = 0;
-    /// arg0 Send descriptor; completion is physically sent (0 or 1), or a negative error.
+    /// arg0 Send descriptor; completion is physically sent (0 or 1), or a negative error. KErrPermissionDenied unless
+    /// it goes from a port this session bound to a server of that port's service.
     pub const SEND: i32 = 1;
     /// arg0 writable batch descriptor. Held when no events are available.
     pub const RECV: i32 = 2;

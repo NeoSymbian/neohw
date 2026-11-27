@@ -97,8 +97,9 @@ pub mod op {
     pub const SILENCE: i32 = 28;
     // 29-30 are kept for D9's ALERT_POLICY and D4's OWNER_USAGE.
     /// (2.9, NEOSET only) arg0 des8 the current PIN, arg1 1 = ask for it at start, 0 = don't, arg2 the card epoch and
-    /// arg3 the modem generation of the extended status this session read. Completes once the card answered and was
-    /// read again: 0, or a [`super::pin`] result. Never retried.
+    /// arg3 the modem generation of the extended status this session read; the card's tries in that status must still
+    /// be the card's (else [`super::pin::STALE`]). The request goes to the card slot and application that epoch names.
+    /// Completes once the card answered and was read again: 0, or a [`super::pin`] result. Never retried.
     pub const SET_PIN_PROTECTION: i32 = 31;
     /// (2.9, NEOSET only) arg0 des8 the current PIN, arg1 des8 the new one (each 4-8 ASCII digits), arg2/arg3 as
     /// [`SET_PIN_PROTECTION`]. Needs the PIN on and verified.

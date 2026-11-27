@@ -8,10 +8,27 @@ pub const REGISTER: u16 = 0x2e;
 pub const GET_STATUS: u16 = 0x2f;
 pub const STATUS_IND: u16 = 0x32;
 pub const VERIFY_PIN: u16 = 0x26;
-/// (D11) TLV 1 session [6, 0] (card slot 1, no AID, as VERIFY), TLV 2 [pin id, on, n, pin[n]]
+/// (D11) TLV 1 the card's session ([`Target::session`]), TLV 2 [pin id, on, n, pin[n]]
 pub const SET_PIN_PROTECTION: u16 = 0x25;
 /// (D11) TLV 1 as above, TLV 2 [pin id, n, old[n], m, new[m]]
 pub const CHANGE_PIN: u16 = 0x28;
+
+/// (D11) The application a PIN change is for: its card slot (1-based) and AID, as the card status named them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Target {
+    pub slot: u8,
+    pub aid_len: u8,
+    pub aid: [u8; 16],
+}
+
+impl Target {
+    /// QMI UIM session TLV: card slot n's session (type 5 + n), the AID length, the AID.
+    pub fn session(&self) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec![5 + self.slot, self.aid_len];
+        v.extend_from_slice(&self.aid[..usize::from(self.aid_len)]);
+        v
+    }
+}
 
 pub struct Card {
     pub state: u8,
@@ -20,6 +37,8 @@ pub struct Card {
     pub pin_id: u8,
     /// the raw UIM PIN state ([`modem_ipc::pin`]: 0 unknown .. 5 permanently blocked)
     pub pin: u8,
+    /// the selected application; `None` without one (or with an AID over 16 bytes)
+    pub target: Option<Target>,
 }
 
 pub fn card(m: &Msg) -> Option<Card> {
@@ -31,6 +50,7 @@ pub fn card(m: &Msg) -> Option<Card> {
             attempts: 255,
             pin_id: pin::ID_UNKNOWN,
             pin: pin::UNKNOWN,
+            target: None,
         });
     }
     let mut card = Card {
@@ -43,6 +63,7 @@ pub fn card(m: &Msg) -> Option<Card> {
         attempts: 255,
         pin_id: pin::ID_UNKNOWN,
         pin: pin::UNKNOWN,
+        target: None,
     };
     if card.state != sim::PRESENT {
         return Some(card);
@@ -68,6 +89,16 @@ pub fn card(m: &Msg) -> Option<Card> {
                 (info[1], info[2])
             };
             card.pin_id = if upin { pin::ID_UPIN } else { pin::ID_PIN1 };
+            // this loop reads the first card only: slot 1
+            card.target = b.get(at + 7..tail).filter(|a| a.len() <= 16).map(|a| {
+                let mut aid = [0; 16];
+                aid[..a.len()].copy_from_slice(a);
+                Target {
+                    slot: 1,
+                    aid_len: a.len() as u8,
+                    aid,
+                }
+            });
             card.attempts = attempts;
             // UIM's PIN states are modem-ipc's pin::* (1 required, 2 verified, 3 disabled, 4 blocked, 5 for good);
             // without one, the application state says what it can (2 PIN needed, 3 PUK needed, 5 PIN1 blocked)

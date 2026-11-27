@@ -793,6 +793,20 @@ impl Daemon {
     }
 }
 
+impl Daemon {
+    /// Client `i` sends from a port it bound (BIND checked its SID owns that service) to a server of that service.
+    fn may_send(&self, i: usize, port: u32, dst: (u32, u32)) -> bool {
+        self.clients[i].bindings.iter().any(|&(service, p)| {
+            p == port
+                && self
+                    .router
+                    .servers
+                    .iter()
+                    .any(|s| s.service == service && (s.node, s.port) == dst)
+        })
+    }
+}
+
 impl Service for Daemon {
     type Session = u32;
     fn connect(&mut self, v: TVersion) -> Result<u32, i32> {
@@ -822,7 +836,9 @@ impl Service for Daemon {
         let result = match msg.function() {
             op::BIND => {
                 let (service, port) = (msg.int(0) as u32, msg.int(1) as u32);
-                if self
+                if hub_ipc::service_owner(service) != Some(msg.client_sid()) {
+                    err::KERR_PERMISSION_DENIED
+                } else if self
                     .clients
                     .iter()
                     .any(|c| c.id != *id && c.bindings.iter().any(|b| b.1 == port))
@@ -861,17 +877,14 @@ impl Service for Daemon {
                 match data {
                     Ok(mut data) => {
                         let r = match hub_ipc::Send::decode(&data) {
-                            Some(send)
-                                if self.clients[i].bindings.iter().any(|b| b.1 == send.port)
-                                    && !matches!(self.phase, Phase::Recover { .. }) =>
-                            {
-                                self.router.bus(&mut Hal).send(
-                                    send.port,
-                                    send.dst,
-                                    send.payload,
-                                    send.essential,
-                                ) as i32
+                            Some(send) if !self.may_send(i, send.port, send.dst) => {
+                                err::KERR_PERMISSION_DENIED
                             }
+                            Some(send) if !matches!(self.phase, Phase::Recover { .. }) => self
+                                .router
+                                .bus(&mut Hal)
+                                .send(send.port, send.dst, send.payload, send.essential)
+                                as i32,
                             Some(_) => err::KERR_NOT_READY,
                             None => err::KERR_ARGUMENT,
                         };

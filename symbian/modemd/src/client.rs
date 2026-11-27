@@ -104,6 +104,7 @@ impl Modem {
         on: bool,
         epoch: u32,
         generation: u32,
+        tries: u8,
     ) -> Result<(), i32> {
         self.cellular.pin_protection(
             &mut RemoteBus(self.session.as_deref()),
@@ -111,6 +112,7 @@ impl Modem {
             on,
             epoch,
             generation,
+            tries,
         )
     }
     pub fn change_pin(
@@ -120,6 +122,7 @@ impl Modem {
         new: &[u8],
         epoch: u32,
         generation: u32,
+        tries: u8,
     ) -> Result<(), i32> {
         self.cellular.change_pin(
             &mut RemoteBus(self.session.as_deref()),
@@ -127,6 +130,7 @@ impl Modem {
             new,
             epoch,
             generation,
+            tries,
         )
     }
     pub fn answer_call(&mut self, _p: &mut Hal, id: u8) -> Result<(), i32> {
@@ -236,15 +240,17 @@ fn snapshot(session: &Session) -> Result<Snapshot, i32> {
     Snapshot::from_bytes(bytes.get(..des.len()).ok_or(-20)?).ok_or(-20)
 }
 
+/// HWHUB, authenticated by its SID: the PIN requests go through it.
 pub fn connect() -> Result<Session, i32> {
     let (major, minor, build) = hub_ipc::VERSION;
-    Session::connect(
+    Session::connect_checked(
         hub_ipc::NAME,
         TVersion {
             major: major as u8,
             minor: minor as u8,
             build: build as u16,
         },
+        hub_ipc::sid::HWHUB,
     )
 }
 

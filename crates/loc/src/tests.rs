@@ -405,3 +405,11 @@ fn packets_from_elsewhere_are_ignored() {
     g.event(&mut f, &e, 100);
     assert_eq!(g.status(0).state, state::SEARCHING);
 }
+
+#[test]
+fn hwhub_lets_gnssd_bind_loc() {
+    assert_eq!(
+        hub_ipc::service_owner(proto::SERVICE),
+        Some(hub_ipc::sid::GNSSD)
+    );
+}

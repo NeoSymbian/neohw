@@ -208,3 +208,12 @@ fn queue_batch_limit_never_consumes_an_event_that_did_not_fit() {
     );
     assert!(q.is_empty());
 }
+
+#[test]
+fn only_the_owning_daemon_reaches_a_service() {
+    assert_eq!(service_owner(11), Some(sid::MODEMD)); // UIM: SIM PINs
+    assert_eq!(service_owner(2), Some(sid::MODEMD));
+    assert_eq!(service_owner(16), Some(sid::GNSSD));
+    assert_eq!(service_owner(69), Some(sid::WIFID));
+    assert_eq!(service_owner(0x1234), None);
+}
