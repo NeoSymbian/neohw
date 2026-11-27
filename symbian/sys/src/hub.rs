@@ -10,13 +10,14 @@ use hub_ipc::Bus;
 /// A session with HWHUB, or `None` while it isn't up (MODEMD starts it).
 pub fn connect() -> Option<Session> {
     let (major, minor, build) = hub_ipc::VERSION;
-    Session::connect(
+    Session::connect_checked(
         hub_ipc::NAME,
         TVersion {
             major: major as u8,
             minor: minor as u8,
             build: build as u16,
         },
+        hub_ipc::sid::HWHUB,
     )
     .ok()
 }

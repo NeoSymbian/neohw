@@ -208,3 +208,107 @@ fn queue_batch_limit_never_consumes_an_event_that_did_not_fit() {
     );
     assert!(q.is_empty());
 }
+
+#[test]
+fn only_the_owning_daemon_reaches_a_service() {
+    assert_eq!(service_owner(11), Some(sid::MODEMD)); // UIM: SIM PINs
+    assert_eq!(service_owner(2), Some(sid::MODEMD));
+    assert_eq!(service_owner(16), Some(sid::GNSSD));
+    assert_eq!(service_owner(69), Some(sid::WIFID));
+    assert_eq!(service_owner(0x1234), None);
+}
+
+// D11: what HWHUB lets each client do (access.rs)
+const UIM_SRV: Server = Server {
+    service: 11,
+    instance: 1,
+    node: 0,
+    port: 40,
+};
+const WLFW_SRV: Server = Server {
+    service: 69,
+    instance: 1,
+    node: 0,
+    port: 41,
+};
+
+#[test]
+fn only_the_owner_binds_and_a_taken_port_stays_taken() {
+    assert_eq!(access::bind(sid::MODEMD, 11, false), Ok(()));
+    assert_eq!(access::bind(0xE000_5001, 11, false), Err(access::DENIED)); // NEOPHONE: no UIM
+    assert_eq!(access::bind(sid::WIFID, 11, false), Err(access::DENIED)); // another daemon's service
+    assert_eq!(
+        access::bind(sid::MODEMD, 0x1234, false),
+        Err(access::DENIED)
+    ); // nobody's
+    assert_eq!(access::bind(sid::MODEMD, 11, true), Err(access::IN_USE));
+    assert_eq!(
+        access::bind(0xE000_5001, 11, true),
+        Err(access::DENIED),
+        "the SID first"
+    );
+}
+
+#[test]
+fn a_send_goes_from_a_bound_port_to_a_server_of_that_service_only() {
+    let servers = [UIM_SRV, WLFW_SRV];
+    let modemd = [(11, 0x4000)];
+    assert_eq!(access::send(&modemd, &servers, 0x4000, (0, 40)), Ok(()));
+    // a port it didn't bind
+    assert_eq!(
+        access::send(&modemd, &servers, 0x4001, (0, 40)),
+        Err(access::DENIED)
+    );
+    assert_eq!(
+        access::send(&[], &servers, 0x4000, (0, 40)),
+        Err(access::DENIED)
+    );
+    // MODEMD's UIM port to WLFW's server
+    assert_eq!(
+        access::send(&modemd, &servers, 0x4000, (0, 41)),
+        Err(access::DENIED)
+    );
+    // the server went down (recovery): not ready, not a refusal
+    assert_eq!(
+        access::send(&modemd, &[WLFW_SRV], 0x4000, (0, 40)),
+        Err(access::NOT_READY)
+    );
+    assert_eq!(
+        access::send(&modemd, &[], 0x4000, (0, 40)),
+        Err(access::NOT_READY)
+    );
+}
+
+#[test]
+fn only_modemd_recovers_and_only_daemons_quiesce() {
+    assert!(access::recover(sid::MODEMD));
+    for s in [sid::WIFID, sid::GNSSD, 0xE000_5001, 0] {
+        assert!(!access::recover(s), "{s:#x}");
+    }
+    for s in [sid::MODEMD, sid::WIFID, sid::GNSSD] {
+        assert!(access::quiesced(s));
+    }
+    assert!(!access::quiesced(0xE000_2007));
+}
+
+#[test]
+fn other_processes_cant_use_up_the_daemons_sessions() {
+    let other = 0xE000_5001;
+    assert_eq!(access::connect(other, 0, 0), Ok(()));
+    assert_eq!(
+        access::connect(other, 0, access::OTHERS),
+        Err(access::IN_USE)
+    );
+    // every slot others may have is taken: each daemon still connects
+    for s in [sid::MODEMD, sid::WIFID, sid::GNSSD] {
+        assert_eq!(access::connect(s, 0, access::OTHERS), Ok(()));
+        assert_eq!(
+            access::connect(s, access::PER_DAEMON - 1, access::OTHERS),
+            Ok(())
+        );
+        assert_eq!(
+            access::connect(s, access::PER_DAEMON, 0),
+            Err(access::IN_USE)
+        );
+    }
+}

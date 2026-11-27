@@ -1141,8 +1141,12 @@ fn sent_count(f: &Fake, id: u16) -> usize {
         .filter(|p| qmi::Msg::parse(qrtr::decode(p).unwrap().1).is_some_and(|q| q.id == id))
         .count()
 }
-fn ids(m: &Cellular) -> (u32, u32) {
-    (m.status.protection.epoch, m.status.generation)
+fn ids(m: &Cellular) -> (u32, u32, u8) {
+    (
+        m.status.protection.epoch,
+        m.status.generation,
+        m.status.pin_attempts,
+    )
 }
 
 #[test]
@@ -1156,8 +1160,8 @@ fn pin_on_sends_the_exact_request_once_and_finishes_after_a_fresh_read() {
         ),
         (modem_ipc::sim::PRESENT, pin::DISABLED, pin::ID_PIN1)
     );
-    let (e, g) = ids(&m);
-    m.pin_protection(&mut f, b"0123", true, e, g).unwrap();
+    let (e, g, t) = ids(&m);
+    m.pin_protection(&mut f, b"0123", true, e, g, t).unwrap();
     let (id, txn, session, info) = last_req(&f);
     assert_eq!(id, uim::SET_PIN_PROTECTION);
     assert_eq!(session, [6, 0]);
@@ -1185,12 +1189,12 @@ fn pin_on_sends_the_exact_request_once_and_finishes_after_a_fresh_read() {
 #[test]
 fn a_wrong_pin_reports_the_cards_tries_and_change_pin_bytes() {
     let (mut m, mut f) = sim_modem(pin::VERIFIED, false);
-    let (e, g) = ids(&m);
+    let (e, g, t) = ids(&m);
     assert_eq!(
-        m.change_pin(&mut f, b"9753", b"12", e, g),
+        m.change_pin(&mut f, b"9753", b"12", e, g, t),
         Err(KERR_ARGUMENT)
     );
-    m.change_pin(&mut f, b"9753", b"00864200", e, g).unwrap();
+    m.change_pin(&mut f, b"9753", b"00864200", e, g, t).unwrap();
     let (id, txn, session, info) = last_req(&f);
     assert_eq!((id, session), (uim::CHANGE_PIN, std::vec![6, 0]));
     assert_eq!(info, b"\x01\x049753\x0800864200");
@@ -1216,63 +1220,69 @@ fn a_wrong_pin_reports_the_cards_tries_and_change_pin_bytes() {
 fn upin_cards_use_the_upin_id() {
     let (mut m, mut f) = sim_modem(pin::VERIFIED, true);
     assert_eq!(m.status.protection.pin_id, pin::ID_UPIN);
-    let (e, g) = ids(&m);
-    m.pin_protection(&mut f, b"1234", false, e, g).unwrap();
+    let (e, g, t) = ids(&m);
+    m.pin_protection(&mut f, b"1234", false, e, g, t).unwrap();
     assert_eq!(last_req(&f).3, [3, 0, 4, b'1', b'2', b'3', b'4']);
 }
 
 #[test]
 fn pin_requests_are_refused_unless_the_card_and_modem_are_as_seen() {
     let (mut m, mut f) = sim_modem(pin::DISABLED, false);
-    let (e, g) = ids(&m);
+    let (e, g, t) = ids(&m);
     let before = f.sent.len();
     assert_eq!(
-        m.pin_protection(&mut f, b"1234", true, e + 1, g),
+        m.pin_protection(&mut f, b"1234", true, e + 1, g, t),
         Err(pin::STALE)
     );
     assert_eq!(
-        m.pin_protection(&mut f, b"1234", true, e, g + 1),
+        m.pin_protection(&mut f, b"1234", true, e, g + 1, t),
         Err(pin::STALE)
     );
     assert_eq!(
-        m.pin_protection(&mut f, b"12a4", true, e, g),
+        m.pin_protection(&mut f, b"12a4", true, e, g, t),
         Err(KERR_ARGUMENT)
     );
     assert_eq!(
-        m.pin_protection(&mut f, b"123456789", true, e, g),
+        m.pin_protection(&mut f, b"123456789", true, e, g, t),
         Err(KERR_ARGUMENT)
     );
     // already off: turning it off, or changing it, needs it on
     assert_eq!(
-        m.pin_protection(&mut f, b"1234", false, e, g),
+        m.pin_protection(&mut f, b"1234", false, e, g, t),
         Err(KERR_NOT_READY)
     );
     assert_eq!(
-        m.change_pin(&mut f, b"1234", b"5678", e, g),
+        m.change_pin(&mut f, b"1234", b"5678", e, g, t),
         Err(KERR_NOT_READY)
+    );
+    // tries changed since the requester read them (D11 fix 4): stale, the one-try warning was about another try
+    card_ind(&mut m, &mut f, pin::DISABLED, 2, false);
+    assert_eq!(
+        m.pin_protection(&mut f, b"1234", true, e, g, t),
+        Err(pin::STALE)
     );
     // tries unknown: nothing is sent
     card_ind(&mut m, &mut f, pin::DISABLED, 255, false);
     assert_eq!(
-        m.pin_protection(&mut f, b"1234", true, e, g),
+        m.pin_protection(&mut f, b"1234", true, e, g, 255),
         Err(KERR_NOT_READY)
     );
     // PIN required (the start-up prompt's job), blocked, or no card: refused
     for state in [pin::REQUIRED, pin::BLOCKED, pin::PERM_BLOCKED] {
         card_ind(&mut m, &mut f, state, 3, false);
-        let (e, g) = ids(&m);
+        let (e, g, t) = ids(&m);
         assert_eq!(
-            m.pin_protection(&mut f, b"1234", true, e, g),
+            m.pin_protection(&mut f, b"1234", true, e, g, t),
             Err(KERR_NOT_READY)
         );
     }
     assert_eq!(f.sent.len(), before, "nothing reached the card");
     // one at a time; VERIFY waits too
     card_ind(&mut m, &mut f, pin::DISABLED, 3, false);
-    let (e, g) = ids(&m);
-    m.pin_protection(&mut f, b"1234", true, e, g).unwrap();
+    let (e, g, t) = ids(&m);
+    m.pin_protection(&mut f, b"1234", true, e, g, t).unwrap();
     assert_eq!(
-        m.pin_protection(&mut f, b"1234", true, e, g),
+        m.pin_protection(&mut f, b"1234", true, e, g, t),
         Err(KERR_IN_USE)
     );
     m.status.sim = modem_ipc::sim::PIN_REQUIRED;
@@ -1282,8 +1292,8 @@ fn pin_requests_are_refused_unless_the_card_and_modem_are_as_seen() {
 #[test]
 fn a_lost_answer_is_unknown_never_retried_and_a_late_one_changes_nothing() {
     let (mut m, mut f) = sim_modem(pin::DISABLED, false);
-    let (e, g) = ids(&m);
-    m.pin_protection(&mut f, b"1234", true, e, g).unwrap();
+    let (e, g, t) = ids(&m);
+    m.pin_protection(&mut f, b"1234", true, e, g, t).unwrap();
     let (id, txn, ..) = last_req(&f);
     advance(&mut m, &mut f, PIN_MS - 1);
     assert_eq!(m.take_pin_done(), None);
@@ -1312,8 +1322,8 @@ fn a_lost_answer_is_unknown_never_retried_and_a_late_one_changes_nothing() {
 #[test]
 fn a_restart_or_a_card_swap_makes_the_result_unknown_under_a_new_epoch() {
     let (mut m, mut f) = sim_modem(pin::DISABLED, false);
-    let (e, g) = ids(&m);
-    m.pin_protection(&mut f, b"1234", true, e, g).unwrap();
+    let (e, g, t) = ids(&m);
+    m.pin_protection(&mut f, b"1234", true, e, g, t).unwrap();
     m.event(
         &mut f,
         Event::Reset {
@@ -1327,8 +1337,8 @@ fn a_restart_or_a_card_swap_makes_the_result_unknown_under_a_new_epoch() {
     assert_eq!(m.status.protection.state, pin::UNKNOWN);
 
     let (mut m, mut f) = sim_modem(pin::VERIFIED, false);
-    let (e, g) = ids(&m);
-    m.change_pin(&mut f, b"1234", b"4321", e, g).unwrap();
+    let (e, g, t) = ids(&m);
+    m.change_pin(&mut f, b"1234", b"4321", e, g, t).unwrap();
     let (id, txn, ..) = last_req(&f);
     let gone = qmi::Builder::new(qmi::INDICATION, 2, uim::STATUS_IND)
         .tlv(0x10, &[0, 0, 0, 0, 0, 0, 0, 0, 1, 0])
@@ -1349,8 +1359,8 @@ fn a_restart_or_a_card_swap_makes_the_result_unknown_under_a_new_epoch() {
 #[test]
 fn success_the_card_doesnt_show_is_unknown() {
     let (mut m, mut f) = sim_modem(pin::DISABLED, false);
-    let (e, g) = ids(&m);
-    m.pin_protection(&mut f, b"1234", true, e, g).unwrap();
+    let (e, g, t) = ids(&m);
+    m.pin_protection(&mut f, b"1234", true, e, g, t).unwrap();
     let (id, txn, ..) = last_req(&f);
     uim_reply(&mut m, &mut f, ok(txn, id).finish());
     let (read_id, read_txn, ..) = last_req(&f);
@@ -1359,7 +1369,7 @@ fn success_the_card_doesnt_show_is_unknown() {
     assert_eq!(m.take_pin_done(), Some(pin::RESULT_UNKNOWN));
     // a failed read after success is unknown too
     let (mut m, mut f) = sim_modem(pin::DISABLED, false);
-    m.pin_protection(&mut f, b"1234", true, e, g).unwrap();
+    m.pin_protection(&mut f, b"1234", true, e, g, t).unwrap();
     let (id, txn, ..) = last_req(&f);
     uim_reply(&mut m, &mut f, ok(txn, id).finish());
     let (read_id, read_txn, ..) = last_req(&f);
@@ -1368,4 +1378,65 @@ fn success_the_card_doesnt_show_is_unknown() {
         .finish();
     uim_reply(&mut m, &mut f, failed);
     assert_eq!(m.take_pin_done(), Some(pin::RESULT_UNKNOWN));
+}
+
+#[test]
+fn hwhub_lets_modemd_bind_its_services() {
+    // hub-ipc can't depend on modem-ipc: the one place both SIDs meet
+    assert_eq!(hub_ipc::sid::MODEMD, modem_ipc::SERVER_SID);
+    for (service, _) in CLIENTS {
+        assert_eq!(hub_ipc::service_owner(service), Some(hub_ipc::sid::MODEMD));
+    }
+}
+
+/// `card_tlv` whose USIM has the AID `aid`.
+fn card_tlv_aid(state: u8, tries: u8, aid: &[u8]) -> Vec<u8> {
+    let mut b = std::vec![255, 255, 0, 0, 0, 0, 0, 0, 1, 1, state, tries, 10, 0, 1];
+    b.extend_from_slice(&[2, 7, 0, 0, 0, 0, aid.len() as u8]);
+    b.extend_from_slice(aid);
+    b.extend_from_slice(&[0, state, tries, 10, 3, 3, 10]);
+    b
+}
+fn card_ind_aid(m: &mut Cellular, f: &mut Fake, state: u8, aid: &[u8]) {
+    let c = qmi::Builder::new(qmi::INDICATION, 1, uim::STATUS_IND)
+        .tlv(0x10, &card_tlv_aid(state, 3, aid))
+        .finish();
+    uim_reply(m, f, c);
+}
+
+#[test]
+fn another_application_is_a_new_epoch_and_the_request_keeps_the_card_slot_1_session() {
+    const USIM: [u8; 7] = [0xa0, 0, 0, 0, 0x87, 0x10, 0x02];
+    let (mut m, mut f) = (modem(), fake());
+    m.handle(&mut f, &ns(UIM, 55));
+    card_ind_aid(&mut m, &mut f, pin::DISABLED, &USIM);
+    let (e, g, t) = ids(&m);
+    // another application with the same PIN id on the same card is a new epoch: the old one is stale
+    card_ind_aid(&mut m, &mut f, pin::DISABLED, &USIM[..5]);
+    assert_ne!(ids(&m).0, e);
+    assert_eq!(
+        m.pin_protection(&mut f, b"1234", true, e, g, t),
+        Err(pin::STALE)
+    );
+    card_ind_aid(&mut m, &mut f, pin::DISABLED, &USIM);
+    let (e, g, t) = ids(&m);
+    m.pin_protection(&mut f, b"1234", true, e, g, t).unwrap();
+    // card slot 1's session without the AID, as VERIFY and ModemManager send it: UIM ignores an AID for this
+    // session type, and a real card's AID must not change the bytes
+    assert_eq!(last_req(&f).2, [6, 0]);
+}
+
+#[test]
+fn no_selected_application_sends_nothing() {
+    // an AID longer than 16 bytes isn't one we can name
+    let (mut m, mut f) = (modem(), fake());
+    m.handle(&mut f, &ns(UIM, 55));
+    card_ind_aid(&mut m, &mut f, pin::DISABLED, &[1; 17]);
+    let (e, g, t) = ids(&m);
+    let before = f.sent.len();
+    assert_eq!(
+        m.pin_protection(&mut f, b"1234", true, e, g, t),
+        Err(KERR_NOT_READY)
+    );
+    assert_eq!(f.sent.len(), before);
 }

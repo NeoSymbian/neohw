@@ -205,6 +205,14 @@ mod tests {
     use core::fmt;
     use hub_ipc::Server;
 
+    #[test]
+    fn hwhub_lets_wifid_bind_wlfw() {
+        assert_eq!(
+            hub_ipc::service_owner(wlfw::SERVICE),
+            Some(hub_ipc::sid::WIFID)
+        );
+    }
+
     /// (our port, destination, payload, essential)
     type Sent = (u32, (u32, u32), Vec<u8>, bool);
 

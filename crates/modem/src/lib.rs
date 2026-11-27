@@ -83,6 +83,8 @@ pub struct Cellular {
     /// refused Set Operating Mode requests for the current intent (bounded by RADIO_REFUSALS)
     radio_refusals: u8,
     pin_id: u8,
+    /// (D11) the card slot and application the card status names; any change of it is a new epoch
+    pin_target: Option<uim::Target>,
     /// (D11) the one SET_PIN_PROTECTION / CHANGE_PIN with the card; never sent twice
     pin_op: Option<PinOp>,
     /// its outcome for MODEMD to complete the request with ([`Cellular::take_pin_done`])
@@ -185,6 +187,7 @@ impl Cellular {
             radio_refusals: 0,
             pin_id: 1,
             pin_op: None,
+            pin_target: None,
             pin_done: None,
             answered: Vec::new(),
             log: calllog::CallLog::default(),
@@ -457,13 +460,14 @@ impl Cellular {
         on: bool,
         epoch: u32,
         generation: u32,
+        tries: u8,
     ) -> Result<(), i32> {
         let want = if on {
             modem_ipc::pin::DISABLED
         } else {
             modem_ipc::pin::VERIFIED
         };
-        self.pin_ready(pin, want, epoch, generation)?;
+        self.pin_ready(pin, want, epoch, generation, tries)?;
         // [pin id, on, n, pin[n]]
         let mut info = [0u8; 3 + 8];
         info[..3].copy_from_slice(&[self.status.protection.pin_id, on as u8, pin.len() as u8]);
@@ -482,11 +486,12 @@ impl Cellular {
         new: &[u8],
         epoch: u32,
         generation: u32,
+        tries: u8,
     ) -> Result<(), i32> {
         if !modem_ipc::pin::valid(new) {
             return Err(KERR_ARGUMENT);
         }
-        self.pin_ready(old, modem_ipc::pin::VERIFIED, epoch, generation)?;
+        self.pin_ready(old, modem_ipc::pin::VERIFIED, epoch, generation, tries)?;
         // [pin id, n, old[n], m, new[m]]
         let mut info = [0u8; 3 + 16];
         info[0] = self.status.protection.pin_id;
@@ -506,11 +511,23 @@ impl Cellular {
         self.pin_done.take()
     }
 
-    fn pin_ready(&self, pin: &[u8], state: u8, epoch: u32, generation: u32) -> Result<(), i32> {
+    /// `epoch`, `generation` and `tries` are what the requester last read: the card (slot and application, which the
+    /// epoch names) and its tries must still be those, so the user's one-try warning was about this very attempt.
+    fn pin_ready(
+        &self,
+        pin: &[u8],
+        state: u8,
+        epoch: u32,
+        generation: u32,
+        tries: u8,
+    ) -> Result<(), i32> {
         if self.command.is_some() || self.radio_request.is_some() || self.pin_op.is_some() {
             return Err(KERR_IN_USE);
         }
-        if epoch != self.status.protection.epoch || generation != self.status.generation {
+        if epoch != self.status.protection.epoch
+            || generation != self.status.generation
+            || tries != self.status.pin_attempts
+        {
             return Err(modem_ipc::pin::STALE);
         }
         if !modem_ipc::pin::valid(pin) {
@@ -521,6 +538,7 @@ impl Cellular {
         if pr.state != state
             || pr.pin_id == modem_ipc::pin::ID_UNKNOWN
             || !(1..255).contains(&self.status.pin_attempts)
+            || self.pin_target.is_none()
         {
             return Err(KERR_NOT_READY);
         }
@@ -534,7 +552,7 @@ impl Cellular {
         info: &[u8],
         on: Option<bool>,
     ) -> Result<(), i32> {
-        // card slot 1 session, no AID, as VERIFY
+        // card slot 1 session, no AID, as VERIFY (the epoch, not these bytes, pins the slot and application)
         if !self.request(p, UIM, id, &[(1, &[6, 0]), (2, info)]) {
             return Err(KERR_NOT_READY);
         }
@@ -986,7 +1004,7 @@ impl Cellular {
             let was = matches!(self.status.sim, PRESENT | PIN_REQUIRED | BLOCKED);
             let is = matches!(c.state, PRESENT | PIN_REQUIRED | BLOCKED);
             let pr = &mut self.status.protection;
-            if was != is || (is && pr.pin_id != c.pin_id) {
+            if was != is || (is && (pr.pin_id != c.pin_id || self.pin_target != c.target)) {
                 pr.epoch = pr.epoch.wrapping_add(1).max(1);
                 if self.pin_op.take().is_some() {
                     p.log(format_args!("uim: the card changed during a PIN request"));
@@ -995,6 +1013,7 @@ impl Cellular {
             }
             pr.state = c.pin;
             pr.pin_id = c.pin_id;
+            self.pin_target = c.target;
             self.status.sim = c.state;
             self.status.pin_attempts = c.attempts;
             if c.pin_id != modem_ipc::pin::ID_UNKNOWN {

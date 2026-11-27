@@ -9,6 +9,7 @@ mod wire;
 pub use wire::*;
 mod queue;
 pub use queue::SessionQueue;
+pub mod access;
 
 #[cfg(test)]
 mod tests;
@@ -26,6 +27,25 @@ pub fn wipe(b: &mut [u8]) {
 /// QMI UIM requests that carry a PIN (Set PIN Protection, Verify, Unblock, Change): never dumped in a trace.
 pub fn secret_request(qmi_id: u16) -> bool {
     matches!(qmi_id, 0x25..=0x28)
+}
+
+/// Secure IDs (= UID3, `exes.txt`) of the NeoHub clients and of HWHUB itself.
+pub mod sid {
+    pub const MODEMD: u32 = 0xE000_3001;
+    pub const HWHUB: u32 = 0xE000_3002;
+    pub const GNSSD: u32 = 0xE000_3004;
+    pub const WIFID: u32 = 0xE000_4002;
+}
+
+/// The daemon (by secure ID) that alone may bind, and so send to, a QRTR service through HWHUB: QMI UIM carries SIM
+/// PINs, so no other process may reach it (or any modem service) by binding it first.
+pub fn service_owner(service: u32) -> Option<u32> {
+    match service {
+        2 | 3 | 5 | 9 | 11 => Some(sid::MODEMD), // DMS, NAS, WMS, VOICE, UIM
+        16 => Some(sid::GNSSD),                  // LOC
+        69 => Some(sid::WIFID),                  // WLFW
+        _ => None,
+    }
 }
 
 /// A discovered QRTR server; instance packs version in the low byte.

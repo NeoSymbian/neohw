@@ -24,8 +24,9 @@ use hub_ipc::{Event, Snapshot};
 use modem_ipc::{self, Status, op};
 use sys::{HAPTIC, Io, hal_io, save_private};
 
-/// D11: SET_PIN_PROTECTION / CHANGE_PIN answer KErrNotSupported until the review's P1s are fixed.
-const PIN_CHANGES_ENABLED: bool = false;
+/// D11: SET_PIN_PROTECTION / CHANGE_PIN answer KErrNotSupported until the spare-SIM run (docs settings-data.md D11)
+/// has passed on the phone. Turned on by its own commit, which can be dropped.
+const PIN_CHANGES_ENABLED: bool = true;
 
 const NOT_READY: i32 = -18;
 /// NEOPHONE, NEOCONT, NEOMSG (NeoSymbian/phone) and NEOSET (neoui's Settings): who may clear the call log or every SMS.
@@ -66,8 +67,8 @@ struct Daemon {
     subscribers: Vec<(u32, Message, bool)>,
     /// (D11) the one SET_PIN_PROTECTION / CHANGE_PIN waiting for the card: its session and message
     pin_msg: Option<(u32, Message)>,
-    /// (D11) the card epoch and modem generation of the last extended status each session was given
-    seen: Vec<(u32, u32, u32)>,
+    /// (D11) the card epoch, modem generation and the card's tries of the last extended status each session was given
+    seen: Vec<(u32, u32, u32, u8)>,
     next_session: u32,
     published: Status,
     haptic_at: u64,
@@ -147,7 +148,8 @@ impl Daemon {
         match msg.write8(0, &s.to_ext_bytes(), 0) {
             Ok(()) => {
                 self.seen.retain(|(id, ..)| *id != session);
-                self.seen.push((session, s.protection.epoch, s.generation));
+                self.seen
+                    .push((session, s.protection.epoch, s.generation, s.pin_attempts));
                 0
             }
             Err(e) => e,
@@ -171,23 +173,27 @@ impl Daemon {
     /// that are wiped whatever happens, and are never logged.
     fn pin_request(&mut self, session: u32, msg: Message) {
         let (epoch, generation) = (msg.int(2) as u32, msg.int(3) as u32);
+        let seen = self
+            .seen
+            .iter()
+            .find(|v| (v.0, v.1, v.2) == (session, epoch, generation))
+            .map(|v| v.3);
         let r = if self.pin_msg.is_some() {
             err::KERR_IN_USE
-        } else if !self.seen.contains(&(session, epoch, generation)) {
-            modem_ipc::pin::STALE
-        } else {
+        } else if let Some(tries) = seen {
             let (mut old, mut new) = ([0u8; 8], [0u8; 8]);
             let r = match (msg.function(), read_pin(&msg, 0, &mut old)) {
                 (_, Err(e)) => e,
                 (op::SET_PIN_PROTECTION, Ok(n)) => self.modem.as_mut().map_or(NOT_READY, |m| {
-                    m.pin_protection(&mut Hal, &old[..n], msg.int(1) != 0, epoch, generation)
+                    let on = msg.int(1) != 0;
+                    m.pin_protection(&mut Hal, &old[..n], on, epoch, generation, tries)
                         .err()
                         .unwrap_or(0)
                 }),
                 (_, Ok(n)) => match read_pin(&msg, 1, &mut new) {
                     Err(e) => e,
                     Ok(k) => self.modem.as_mut().map_or(NOT_READY, |m| {
-                        m.change_pin(&mut Hal, &old[..n], &new[..k], epoch, generation)
+                        m.change_pin(&mut Hal, &old[..n], &new[..k], epoch, generation, tries)
                             .err()
                             .unwrap_or(0)
                     }),
@@ -196,6 +202,8 @@ impl Daemon {
             hub_ipc::wipe(&mut old);
             hub_ipc::wipe(&mut new);
             r
+        } else {
+            modem_ipc::pin::STALE
         };
         dprintln!("[modemd] SIM PIN request {} -> {}", msg.function(), r);
         if r == 0 {
@@ -824,9 +832,8 @@ impl Service for Daemon {
             return;
         }
         if matches!(msg.function(), op::SET_PIN_PROTECTION | op::CHANGE_PIN) {
-            // shortcut: the PIN changes are held back until the D11 review's P1s are fixed (the servers aren't
-            // authenticated, HWHUB doesn't check destinations, the target card isn't frozen, buffers aren't wiped);
-            // enable by removing this when they are
+            // shortcut: held back until the D11 spare-SIM run (on, change, reboot, unlock, restore) passed on the
+            // Pixel; enable with PIN_CHANGES_ENABLED
             if !PIN_CHANGES_ENABLED {
                 msg.complete(err::KERR_NOT_SUPPORTED);
                 return;
