@@ -442,6 +442,21 @@ pub mod tone {
     /// [`super::op::RING_SETTINGS`]' arg3 carries tones (bit 8); without it MODEMD keeps the ones it has.
     pub const PRESENT: i32 = 0x100;
 
+    /// SYSSTART (neoui's shell): it owns the ring settings and replays them.
+    pub const SYSSTART_SID: u32 = 0xE000_2001;
+    /// NEOPHONE (NeoSymbian/phone), the legacy caller: the three-argument form only (arg3 = 0, no tones).
+    pub const PHONE_SID: u32 = 0xE000_5001;
+
+    /// Who may change the persisted ring settings, in which form ([`super::op::RING_SETTINGS`]).
+    #[must_use]
+    pub fn caller_allowed(sid: u32, arg3: i32) -> bool {
+        match sid {
+            SYSSTART_SID => true,
+            PHONE_SID => arg3 == 0,
+            _ => false,
+        }
+    }
+
     /// arg3 for these tones.
     #[must_use]
     pub fn pack(ring: u8, message: u8) -> i32 {
@@ -481,6 +496,20 @@ pub mod tone {
 /// reading it (and loses only the tones).
 pub mod saved {
     use super::Ring;
+
+    /// What MODEMD may do with `settings.bin` after reading it at boot: `Ok(Some)` its settings, `Ok(None)` none
+    /// (absent, or damaged: the defaults may replace it), `Err` it couldn't be read (an I/O error), so it must not be
+    /// overwritten until a later read resolves it. `read` is `sys::load_private`'s answer.
+    ///
+    /// # Errors
+    /// The read's error, other than not found (-1) and path not found (-12).
+    pub fn resolve(read: Result<&[u8], i32>) -> Result<Option<Saved>, i32> {
+        match read {
+            Ok(b) => Ok(decode(b)),
+            Err(-1 | -12) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Saved {
@@ -893,6 +922,13 @@ mod tests {
             b[..n].to_vec()
         };
         assert_eq!(decode(&bytes(&s)), Some(s));
+        // a boot read: absent may become the defaults, an I/O error must not be overwritten
+        assert_eq!(resolve(Ok(&bytes(&s))), Ok(Some(s)));
+        assert_eq!(resolve(Err(-1)), Ok(None));
+        assert_eq!(resolve(Err(-12)), Ok(None));
+        assert_eq!(resolve(Ok(&[1, 2, 3])), Ok(None));
+        assert_eq!(resolve(Err(-18)), Err(-18));
+        assert_eq!(resolve(Err(-20)), Err(-20));
         // a chosen tone: C8's nine bytes and the tones' byte, so an older MODEMD (it reads 9 bytes) still takes the
         // rest; the built-in tones save as C8, byte for byte what the C8 writer wrote
         let plain = Saved {
@@ -944,6 +980,13 @@ mod tests {
         assert_eq!(unpack(pack(LAST, 7)), Ok(Some((LAST, 7))));
         assert_eq!(unpack(PRESENT | 0x200), Err(Unknown));
         assert_eq!(unpack(-1), Err(Unknown));
+        // only the shell, and NEOPHONE without tones
+        assert!(caller_allowed(SYSSTART_SID, pack(5, BUILT_IN)));
+        assert!(caller_allowed(SYSSTART_SID, 0));
+        assert!(caller_allowed(PHONE_SID, 0));
+        assert!(!caller_allowed(PHONE_SID, pack(BEEP, BUILT_IN)));
+        assert!(!caller_allowed(0xE000_2007, 0)); // Settings goes through the shell
+        assert!(!caller_allowed(0, 0));
         // settings.bin keeps the built-in tone in their place
         assert_eq!(persisted((5, TWO_BEEPS)), (BUILT_IN, TWO_BEEPS));
         assert_eq!(persisted((NONE, 15)), (NONE, BUILT_IN));

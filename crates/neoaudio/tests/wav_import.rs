@@ -223,3 +223,34 @@ fn extensible_pcm_is_pcm() {
     let f = wav(&[chunk(b"fmt ", &b), chunk(b"data", &square16(100, 1))]);
     assert!(convert(&f).is_ok());
 }
+
+#[test]
+fn unfinished_sizes_end_the_walk_without_overflow() {
+    // data's size never filled in (0xFFFFFFFF) and a chunk after it: the data is what is there, the walk ends
+    let mut data = b"data".to_vec();
+    data.extend_from_slice(&u32::MAX.to_le_bytes());
+    data.extend(square16(500, 1));
+    let mut f = wav(&[fmt(1, 1, 48_000, 16), data]);
+    f.extend_from_slice(b"LIST");
+    f.extend_from_slice(&u32::MAX.to_le_bytes());
+    assert!(convert(&f).is_ok());
+    // an INFO entry claiming 4 GiB: no name, still a sound
+    let mut list = b"INFO".to_vec();
+    list.extend_from_slice(b"INAM");
+    list.extend_from_slice(&u32::MAX.to_le_bytes());
+    let f = wav(&[
+        fmt(1, 1, 48_000, 16),
+        chunk(b"LIST", &list),
+        chunk(b"data", &square16(100, 1)),
+    ]);
+    assert_eq!(convert(&f).unwrap().name, None);
+    // a non-data chunk claiming 4 GiB: damaged, not a panic
+    let mut big = b"junk".to_vec();
+    big.extend_from_slice(&u32::MAX.to_le_bytes());
+    let f = wav(&[fmt(1, 1, 48_000, 16), big]);
+    assert_eq!(convert(&f), Err(WavError::Damaged));
+    // a header cut inside a chunk header: no fmt/data, damaged
+    let mut f = wav(&[fmt(1, 1, 48_000, 16)]);
+    f.extend_from_slice(b"da");
+    assert_eq!(convert(&f), Err(WavError::Damaged));
+}

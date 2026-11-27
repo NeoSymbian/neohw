@@ -73,7 +73,21 @@ struct Daemon {
     sms_buzz_at: u64,
     /// the last ringtone error AUDIOD reported (NeoModem's result once)
     ring_error: i32,
+    /// settings.bin couldn't be read at boot (an I/O error, not its absence): it isn't overwritten until a read
+    /// resolves it, tried again here (ms); what changed meanwhile (airplane, ring and tones, C8) wins over the file
+    settings_unread: Option<u64>,
+    changed: Changed,
 }
+
+/// What a request changed since boot (only consulted while settings.bin is still unread).
+#[derive(Clone, Copy, Default)]
+struct Changed {
+    airplane: bool,
+    ring: bool,
+    c8: bool,
+}
+
+const SETTINGS_PATH: &str = "C:\\private\\e0003001\\settings.bin";
 
 impl Daemon {
     fn status(&self) -> Status {
@@ -305,7 +319,11 @@ impl Daemon {
     }
 
     /// settings.bin: the C8 record (C7's plus caller ID and the log's days); C7 files still load.
-    fn save_settings(&self) -> Result<(), i32> {
+    fn save_settings(&mut self) -> Result<(), i32> {
+        // never over a file that couldn't be read: the request stays in memory, the caller tries again
+        if self.settings_unread.is_some() {
+            self.load_settings()?;
+        }
         let s = self.status();
         let (clir, days) = self
             .modem
@@ -366,7 +384,39 @@ impl Daemon {
             .unwrap_or(0)
     }
 
+    /// settings.bin onto what is in memory, but what a request already changed. `Err`: unreadable still.
+    fn load_settings(&mut self) -> Result<(), i32> {
+        let read = sys::load_private(SETTINGS_PATH, 16);
+        let saved = modem_ipc::saved::resolve(read.as_deref().map_err(|e| *e))?;
+        self.settings_unread = None;
+        let Some(saved) = saved else { return Ok(()) };
+        let c = self.changed;
+        if !c.airplane {
+            self.status.airplane = saved.airplane;
+        }
+        if !c.ring {
+            self.status.ring = saved.ring;
+            if let Some(t) = saved.tones {
+                self.tones = t;
+            }
+            if let Some(m) = &mut self.modem {
+                m.status.ring = saved.ring;
+            }
+        }
+        if let (false, Some((clir, days)), Some(m)) = (c.c8, saved.c8, &mut self.modem) {
+            m.clir = i32::from(clir);
+            m.log.days = days;
+        }
+        Ok(())
+    }
+
     fn step(&mut self) {
+        if self.settings_unread.is_some_and(|at| time::millis() >= at) {
+            match self.load_settings() {
+                Ok(()) => dprintln!("[modemd] settings.bin read"),
+                Err(_) => self.settings_unread = Some(time::millis() + 2_000),
+            }
+        }
         self.connect_hub();
         self.run();
         // AUDIOD runs on every machine (NeoAudio's clock sink without an ADSP), so it is started and fed always
@@ -788,6 +838,7 @@ impl Service for Daemon {
                     m.airplane(&mut Hal, msg.int(0) != 0).err().unwrap_or(0)
                 });
                 if r == 0 {
+                    self.changed.airplane = true;
                     self.save_settings().err().unwrap_or(0)
                 } else {
                     r
@@ -809,6 +860,11 @@ impl Service for Daemon {
                 }
                 Err(e) => e,
             },
+            // only the shell (any form) and NEOPHONE (without tones): they persist in settings.bin
+            op::RING_SETTINGS if !modem_ipc::tone::caller_allowed(msg.client_sid(), msg.int(3)) => {
+                dprintln!("[modemd] ring settings refused to {:08x}", msg.client_sid());
+                err::KERR_PERMISSION_DENIED
+            }
             op::RING_SETTINGS => {
                 if !(0..=10).contains(&msg.int(0)) {
                     err::KERR_ARGUMENT
@@ -822,6 +878,7 @@ impl Service for Daemon {
                     match modem_ipc::tone::apply(self.tones, msg.int(3)) {
                         Err(_) => err::KERR_ARGUMENT,
                         Ok(tones) => {
+                            self.changed.ring = true;
                             self.tones = tones;
                             self.status.ring = ring;
                             if let Some(m) = &mut self.modem {
@@ -864,6 +921,7 @@ impl Service for Daemon {
                     if m.log.set_days(days as u8, Hal.utc_ms()) {
                         m.status.log_revision = m.status.log_revision.wrapping_add(1);
                     }
+                    self.changed.c8 = true;
                     self.save_settings().err().unwrap_or(0)
                 } else {
                     NOT_READY
@@ -1109,23 +1167,19 @@ fn main() -> i32 {
         tones: (modem_ipc::tone::BUILT_IN, modem_ipc::tone::BUILT_IN),
         sms_buzz_at: 0,
         ring_error: 0,
+        settings_unread: None,
+        changed: Changed::default(),
     };
     // Ordinary C: settings only; modem EFS remains RAM-backed (G4).
     if let Ok(fs) = e32::fs::Fs::connect() {
-        // C7 or C8, with or without the tones' byte (and the `.new` a cut mid-save left, sys::load_private)
-        if let Some(saved) = sys::load_private("C:\\private\\e0003001\\settings.bin", 16)
-            .ok()
-            .and_then(|v| modem_ipc::saved::decode(&v))
-        {
-            d.status.airplane = saved.airplane;
-            d.status.ring = saved.ring;
-            if let Some(t) = saved.tones {
-                d.tones = t;
-            }
-            if let (Some((clir, days)), Some(m)) = (saved.c8, &mut d.modem) {
-                m.clir = i32::from(clir);
-                m.log.days = days;
-            }
+        // C7 or C8, with or without the tones' byte (and the `.new` a cut mid-save left, sys::load_private); an
+        // unreadable one is tried again and never overwritten meanwhile
+        if let Err(e) = d.load_settings() {
+            dprintln!(
+                "[modemd] settings.bin unreadable ({}): kept, read again later",
+                e
+            );
+            d.settings_unread = Some(0);
         }
         // the call log (C8): a missing or unreadable calls.db starts an empty one
         if let Some(m) = &mut d.modem

@@ -118,7 +118,7 @@ fn info_name(c: &[u8]) -> Option<String> {
     let mut rest = c.strip_prefix(b"INFO")?;
     while rest.len() >= 8 {
         let len = u32_at(rest, 4) as usize;
-        let body = rest.get(8..8 + len)?;
+        let body = rest[8..].get(..len)?;
         if &rest[..4] == b"INAM" {
             let text = String::from_utf8_lossy(body);
             let clean: String = text
@@ -150,23 +150,26 @@ pub fn convert(file: &[u8]) -> Result<Sound, WavError> {
         return Err(WavError::NotWav);
     }
     let (mut fmt, mut data, mut name) = (None, None, None);
-    let mut at = 12;
-    while at + 8 <= file.len() {
-        let (id, len) = (&file[at..at + 4], u32_at(file, at + 4) as usize);
-        let body = at + 8;
-        let have = file.len() - body;
+    // walk what is left of the file, never an offset: a 32-bit length can't overflow the cursor
+    let mut rest = &file[12..];
+    while let Some((head, body)) = rest.split_first_chunk::<8>() {
+        let id = &head[..4];
+        let len = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
         if id == b"data" {
-            // a writer that never went back to fill the size (or a cut file): what is there
-            data = Some(&file[body..body + len.min(have)]);
-        } else if len > have {
+            // a writer that never went back to fill the size (or a cut file): what is there, and nothing after it
+            data = Some(&body[..len.min(body.len())]);
+            if len >= body.len() {
+                break;
+            }
+        } else if len > body.len() {
             return Err(WavError::Damaged);
         } else if id == b"fmt " {
-            fmt = Some(format(&file[body..body + len])?);
+            fmt = Some(format(&body[..len])?);
         } else if id == b"LIST" {
-            name = info_name(&file[body..body + len]).or(name);
+            name = info_name(&body[..len]).or(name);
         }
-        // chunks are padded to an even length
-        at = body.saturating_add(len).saturating_add(len & 1);
+        // chunks are padded to an even length (len < body.len() here, so len + 1 can't overflow)
+        rest = body.get(len + (len & 1)..).unwrap_or(&[]);
     }
     let (Some(f), Some(data)) = (fmt, data) else {
         return Err(WavError::Damaged);
